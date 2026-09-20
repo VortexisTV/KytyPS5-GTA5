@@ -94,12 +94,19 @@ void NormalizeStaticParamsForDynamicState(PipelineStaticParameters& static_param
 	static_params.scissor_ltrb[3] = 1;
 }
 
+// Guest words and buffer ranges that resource materialization checked since the last shader lookup
+// reported them to PerfStats. Counting locally keeps atomics off the per-word path.
+thread_local uint64_t g_materialize_reads        = 0;
+thread_local uint64_t g_materialize_range_checks = 0;
+
 bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
+	g_materialize_reads++;
 	return value != nullptr &&
 	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value));
 }
 
 bool ValidateShaderGuestMemoryRange(void*, uint64_t address, uint64_t size) {
+	g_materialize_range_checks++;
 	return Libs::LibKernel::Memory::TryClampRangeSize(address, size) != 0;
 }
 
@@ -469,10 +476,17 @@ struct PipelineCache::ProgramCache {
 		key_span.Stop();
 		if (entry != programs.end()) {
 			auto& source = entry->second;
+			if (PerfStats::Enabled()) {
+				CountRepeatedInputs(source, params);
+			}
 			PerfStats::Span materialize_span(PerfStats::SpanId::ShaderMaterialize);
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(source.resource_plan, runtime,
 			                                                    resources, specialization));
 			materialize_span.Stop();
+			PerfStats::Add(PerfStats::CounterId::ShaderGuestReads,
+			               std::exchange(g_materialize_reads, 0));
+			PerfStats::Add(PerfStats::CounterId::ShaderRangeChecks,
+			               std::exchange(g_materialize_range_checks, 0));
 			PerfStats::Span permutation_span(PerfStats::SpanId::ShaderPermutation);
 			const auto specialization_hash = HashSpecialization(specialization);
 			if (const auto permutation = std::ranges::find_if(
@@ -541,6 +555,24 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
+	// Counts lookups whose program, shader base and user data match a recent lookup: the work a
+	// cache keyed on those inputs could skip, provided the guest memory behind them is unchanged.
+	// A direct-mapped table remembers roughly the last 64k input sets.
+	void CountRepeatedInputs(const SourceEntry& source, const ShaderParams& params) {
+		static constexpr size_t RecentInputsSize = size_t {1} << 16u;
+		if (recent_inputs.empty()) {
+			recent_inputs.resize(RecentInputsSize);
+		}
+		const auto seed = reinterpret_cast<uintptr_t>(&source) ^ params.Base();
+		const auto inputs =
+		    XXH3_64bits_withSeed(params.user_data.data(), params.user_data.size_bytes(), seed);
+		auto& slot = recent_inputs[inputs & (RecentInputsSize - 1u)];
+		if (slot == inputs) {
+			PerfStats::Add(PerfStats::CounterId::ShaderInputRepeats);
+		}
+		slot = inputs;
+	}
+
 	explicit ProgramCache(vk::Device device): device(device) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
@@ -558,6 +590,7 @@ struct PipelineCache::ProgramCache {
 	vk::Device                                                  device;
 	uint32_t                                                    num_compiled   = 0;
 	std::atomic<uint64_t>                                       next_shader_id = 0;
+	std::vector<uint64_t>                                       recent_inputs;
 
 	// Async translation: set by PipelineCache when workers are enabled.
 	std::function<void(std::function<void()>)>                             enqueue;

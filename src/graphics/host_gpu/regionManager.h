@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#include "common/perfStats.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
@@ -104,9 +105,10 @@ public:
 	}
 
 	// How an upload treats pages that the CPU rewrites every frame ("hot"). A hot page is left
-	// dirty and writable so it never faults again; instead it is re-uploaded at most once per
-	// submission. A GPU write to the page ends that regime because GPU-dirty and CPU-dirty are
-	// mutually exclusive states.
+	// dirty and writable so it stops faulting; instead it is re-uploaded at most once per
+	// submission, and only when its contents changed. A page whose contents stop changing leaves
+	// the regime again (see CoolDownGenerations), and a GPU write ends it because GPU-dirty and
+	// CPU-dirty are mutually exclusive states.
 	enum class HotPolicy { Preserve, ClearAll, ClearAndUnhot };
 
 	// Global submission generation; advanced once per completed GPU submission.
@@ -181,10 +183,37 @@ public:
 					// frame. Hash its contents and upload only when they actually changed.
 					const auto candidates = mask & hot_in_range;
 					if (candidates.Any()) {
+						PerfStats::Span hash_span(PerfStats::SpanId::HotPageHash);
+						const auto      generation = static_cast<uint32_t>(Generation());
+						uint64_t        hashed     = 0;
+						uint64_t        changed    = 0;
 						if (!m_hot_hash) {
 							m_hot_hash =
 							    std::make_unique<std::array<uint64_t, TRACKER_REGION_PAGES>>();
 							m_hot_hash->fill(0);
+							m_hot_changed =
+							    std::make_unique<std::array<uint32_t, TRACKER_REGION_PAGES>>();
+							m_hot_changed->fill(generation);
+						}
+						// Pages unchanged for CoolDownGenerations leave the hot set: clean and
+						// write-protected again, so their next write faults like any other. They
+						// are protected before the hash below, so a write that landed first is
+						// uploaded and a later one faults.
+						RegionBits cooled;
+						for (const auto [first, last]: candidates) {
+							for (auto page = first; page < last; page++) {
+								if (generation - (*m_hot_changed)[page] >= CoolDownGenerations) {
+									cooled.Set(page);
+								}
+							}
+						}
+						if (cooled.Any()) {
+							m_hot &= ~cooled;
+							m_hot_uploaded &= ~cooled;
+							m_hot_any = m_hot.Any();
+							m_cpu_dirty &= ~cooled;
+							UpdateCpuProtection<true>();
+							PerfStats::Add(PerfStats::CounterId::HotPagesCooled, cooled.Count());
 						}
 						for (const auto [first, last]: candidates) {
 							for (auto page = first; page < last; page++) {
@@ -192,13 +221,18 @@ public:
 								    reinterpret_cast<const void*>(m_cpu_addr +
 								                                  page * TRACKER_PAGE_SIZE),
 								    TRACKER_PAGE_SIZE);
+								hashed++;
 								if (hash == (*m_hot_hash)[page]) {
 									mask.Unset(page);
 								} else {
-									(*m_hot_hash)[page] = hash;
+									(*m_hot_hash)[page]    = hash;
+									(*m_hot_changed)[page] = generation;
+									changed++;
 								}
 							}
 						}
+						PerfStats::Add(PerfStats::CounterId::HotPagesHashed, hashed);
+						PerfStats::Add(PerfStats::CounterId::HotPagesChanged, changed);
 					}
 					auto to_clear = mask & ~m_hot;
 					m_cpu_dirty &= ~to_clear;
@@ -294,6 +328,10 @@ private:
 	// Wider windows (128) turned once-per-frame rewrites hot too, but hashing those pages every
 	// submission cost more than their faults did.
 	static constexpr uint64_t FaultWindow = 16;
+	// A hot page whose contents have not changed for this many submissions cools down. GTA V kept
+	// 55-83% of its hashed hot pages unchanged this long; hashing them twice per frame cost more
+	// than the occasional fault that re-heats one.
+	static constexpr uint32_t CoolDownGenerations = 64;
 
 	void NoteCpuFault(size_t start, size_t end) {
 		if (!Config::HotPageTrackingEnabled()) {
@@ -310,6 +348,17 @@ private:
 			if (newly_hot.Any()) {
 				m_hot |= newly_hot;
 				m_hot_any = true;
+				// A page turning hot starts afresh: a hash from an earlier hot period may match
+				// contents the GPU copy no longer has, and its quiet time starts now.
+				if (m_hot_hash) {
+					for (const auto [first, last]: newly_hot) {
+						std::fill(m_hot_hash->begin() + static_cast<std::ptrdiff_t>(first),
+						          m_hot_hash->begin() + static_cast<std::ptrdiff_t>(last), 0);
+						std::fill(m_hot_changed->begin() + static_cast<std::ptrdiff_t>(first),
+						          m_hot_changed->begin() + static_cast<std::ptrdiff_t>(last),
+						          static_cast<uint32_t>(generation));
+					}
+				}
 			}
 		}
 		m_faulted_recently.SetRange(start, end);
@@ -335,6 +384,8 @@ private:
 	RegionBits   m_hot_uploaded;
 	RegionBits   m_faulted_recently;
 	std::unique_ptr<std::array<uint64_t, TRACKER_REGION_PAGES>> m_hot_hash;
+	// Generation (low 32 bits) at which each hot page's contents last changed.
+	std::unique_ptr<std::array<uint32_t, TRACKER_REGION_PAGES>> m_hot_changed;
 	uint64_t     m_fault_generation  = 0;
 	uint64_t     m_upload_generation = 0;
 	bool         m_hot_any           = false;

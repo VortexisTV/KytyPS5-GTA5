@@ -140,7 +140,8 @@ std::pair<uint64_t, uint64_t> BufferCache::DownloadEnvelope(const DownloadCopy& 
 }
 
 void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
-	PerfStats::Span span(PerfStats::SpanId::BufferDownload);
+	PerfStats::Span    span(PerfStats::SpanId::BufferDownload);
+	const GpuWaitScope wait_scope(PerfStats::SpanId::GpuWaitReadback);
 	if (PerfStats::Enabled()) {
 		uint64_t bytes = 0;
 		for (const auto& copy: copies) {
@@ -273,6 +274,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 }
 
 void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) {
+	const GpuWaitScope wait_scope(PerfStats::SpanId::GpuWaitReadback);
 	// CPU invalidation reaches this point only for a GPU-owned tracker page. Resolve the exact
 	// Buffer owner on the GPU thread so the cache index remains single-thread-owned.
 	if (is_write && !IsRegionRegistered(vaddr, size)) {
@@ -350,6 +352,25 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 	    std::ranges::all_of(copies, [&](const DownloadCopy& copy) {
 		    return copy.buffer == hot_owner && !overlaps_recent_write(copy);
 	    });
+	if (PerfStats::Enabled()) {
+		// Which of the conditions above sent this readback down the draining path.
+		PerfStats::Add([&] {
+			if (shadow_usable) {
+				return PerfStats::CounterId::ReadbacksShadow;
+			}
+			if (hot_owner == nullptr) {
+				return PerfStats::CounterId::ReadbackNoOwner;
+			}
+			if (!hot_owner->readback_hot) {
+				return PerfStats::CounterId::ReadbackNotHot;
+			}
+			if (!hot_owner->shadow_valid || hot_owner->writes_since_shadow.size() >= 64 ||
+			    m_scheduler.CurrentTick() - hot_owner->shadow_tick >= 64) {
+				return PerfStats::CounterId::ReadbackShadowStale;
+			}
+			return PerfStats::CounterId::ReadbackRecentWrite;
+		}());
+	}
 	if (shadow_usable) {
 		m_scheduler.Wait(hot_owner->shadow_tick);
 		m_download_buffer.Invalidate(hot_owner->shadow_offset, hot_owner->Size());
@@ -572,6 +593,7 @@ void BufferCache::RecordHotShadows() {
 		buffer->shadow_tick   = m_scheduler.CurrentTick();
 		buffer->shadow_valid  = true;
 		buffer->writes_since_shadow.clear();
+		PerfStats::Add(PerfStats::CounterId::ShadowsRecorded);
 		// Once the GPU has produced this shadow, push it into guest memory proactively. A CPU
 		// poll that arrives afterwards then reads current data without faulting at all.
 		const auto tick = buffer->shadow_tick;

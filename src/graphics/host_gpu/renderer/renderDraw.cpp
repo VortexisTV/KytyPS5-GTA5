@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/perfStats.h"
@@ -42,6 +43,7 @@
 #include <optional>
 #include <span>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -449,6 +451,59 @@ static bool PixelShaderHasDepthOrCoverageSideEffects(const HW::ShaderRegisters& 
 	       db.shader_execute_on_noop;
 }
 
+// Writes the guest programs of a draw the renderer cannot run, once per address, so that the
+// stages it needs can be examined offline. Off unless --dump-skipped-shaders names a folder.
+static void DumpSkippedStageShaders(uint32_t stages, const HW::ShaderRegisters& sh_regs,
+                                    const HW::VertexShaderInfo& vertex_info) {
+	const auto folder = Config::GetSkippedShaderDumpFolder();
+	if (folder.empty()) {
+		return;
+	}
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> dumped;
+	const std::lock_guard               lock(mutex);
+	for (const auto& [name, address]: {
+	         std::pair {"ls", vertex_info.ls_regs.data_addr},
+	         std::pair {"hs", vertex_info.hs_regs.data_addr},
+	         std::pair {"es", vertex_info.es_regs.data_addr},
+	         std::pair {"gs", vertex_info.gs_regs.data_addr},
+	     }) {
+		if (address == 0 || !ShaderAddressValid(address) || !dumped.insert(address).second) {
+			continue;
+		}
+		ShaderMappedData data;
+		if (!ShaderTryGetMappedData(address, data) || data.code_size_bytes == 0) {
+			LOGF("Skipped %s shader 0x%016" PRIx64 " has no registered code size\n", name, address);
+			continue;
+		}
+		const auto path =
+		    folder / fmt::format("skipped_{}_{:016x}_stages_{:08x}.bin", name, address, stages);
+		Common::File::CreateDirectories(folder);
+		Common::File file(path);
+		if (file.IsInvalid()) {
+			LOGF("Can't create %s\n", Common::PathToString(path).c_str());
+			continue;
+		}
+		file.Write(reinterpret_cast<const void*>(address), data.code_size_bytes);
+		file.Close();
+		const auto registers = fmt::format(
+		    "stages=0x{:08x} ls=0x{:016x} hs=0x{:016x} es=0x{:016x} gs=0x{:016x}\n"
+		    "ls_hs_config=0x{:08x} tf_param=0x{:08x} tess_level_min=0x{:08x} "
+		    "tess_level_max=0x{:08x}\nhs_user_sgpr_count={} hs_lds_size={} code_bytes={}\n",
+		    stages, vertex_info.ls_regs.data_addr, vertex_info.hs_regs.data_addr,
+		    vertex_info.es_regs.data_addr, vertex_info.gs_regs.data_addr, sh_regs.m_vgtLsHsConfig,
+		    sh_regs.m_vgtTfParam, sh_regs.m_vgtHosMinTessLevel, sh_regs.m_vgtHosMaxTessLevel,
+		    vertex_info.hs_user_sgpr.count, vertex_info.hs_regs.rsrc2.lds_size,
+		    data.code_size_bytes);
+		auto notes = path;
+		notes.replace_extension(".txt");
+		Common::File note_file(notes);
+		if (!note_file.IsInvalid()) {
+			note_file.Write(registers.data(), registers.size());
+		}
+	}
+}
+
 static bool ShouldSkipGeShader(const CommandBuffer& buffer) {
 	const auto& ctx         = buffer.GetRegisters();
 	const auto& ucfg        = buffer.GetUserConfig();
@@ -491,16 +546,26 @@ static bool ShouldSkipGeShader(const CommandBuffer& buffer) {
 			            "skipped.\n");
 		});
 
+		if (vertex_info.ls_regs.data_addr != 0 || vertex_info.hs_regs.data_addr != 0) {
+			PerfStats::Add(PerfStats::CounterId::DrawsSkippedTessellation);
+		}
+		DumpSkippedStageShaders(stages, sh_regs, vertex_info);
+
 		const auto log_id = g_shader_stage_log_count.fetch_add(1);
 		if (log_id < 32) {
 			LOGF("Skipping unsupported GE shader draw: stages=0x%08" PRIx32
 			     " prim_group=0x%04" PRIx16 " vert_group=0x%04" PRIx16 " ngg=0x%08" PRIx32
 			     " max_out=0x%08" PRIx32 " gs_max_vert=0x%08" PRIx32 " gs_out_prim=0x%08" PRIx32
-			     " es=0x%016" PRIx64 " gs=0x%016" PRIx64 "\n",
+			     " es=0x%016" PRIx64 " gs=0x%016" PRIx64 " ls=0x%016" PRIx64 " hs=0x%016" PRIx64
+			     " ls_hs_config=0x%08" PRIx32 " tf_param=0x%08" PRIx32 " tess_level=0x%08" PRIx32
+			     "-0x%08" PRIx32 "\n",
 			     stages, ge_cntl.primitive_group_size, ge_cntl.vertex_group_size,
 			     sh_regs.m_geNggSubgrpCntl, sh_regs.m_geMaxOutputPerSubgroup,
 			     sh_regs.m_vgtGsMaxVertOut, sh_regs.m_vgtGsOutPrimType,
-			     vertex_info.es_regs.data_addr, vertex_info.gs_regs.data_addr);
+			     vertex_info.es_regs.data_addr, vertex_info.gs_regs.data_addr,
+			     vertex_info.ls_regs.data_addr, vertex_info.hs_regs.data_addr,
+			     sh_regs.m_vgtLsHsConfig, sh_regs.m_vgtTfParam, sh_regs.m_vgtHosMinTessLevel,
+			     sh_regs.m_vgtHosMaxTessLevel);
 		}
 		return true;
 	}
@@ -1351,7 +1416,11 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                    reinterpret_cast<uint64_t>(args.index_addr));
 
 	Common::LockGuard lock(m_context.GetMutex());
+	if (args.offset_source == DrawOffsetSource::IndirectArgs) {
+		PerfStats::Add(PerfStats::CounterId::DrawsIndirect);
+	}
 	if (args.index_count == 0 || args.instance_count == 0) {
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedEmpty);
 		return;
 	}
 
@@ -1361,10 +1430,12 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedVertexShader);
 		return;
 	}
 
 	if (ShouldSkipGeShader(buffer)) {
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedStage);
 		return;
 	}
 
@@ -1391,6 +1462,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, false, topology)) {
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedState);
 		return;
 	}
 
@@ -1443,6 +1515,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	PerfStats::Span targets_span(PerfStats::SpanId::DrawTargets);
 	if (!PrepareDrawRenderState(submit_id, buffer, draw, args.render_target_slice_offset, true,
 	                            state)) {
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedState);
 		ResetBindings();
 		return;
 	}
@@ -1494,7 +1567,11 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	                    args.first_instance);
 
 	Common::LockGuard lock(m_context.GetMutex());
+	if (args.offset_source == DrawOffsetSource::IndirectArgs) {
+		PerfStats::Add(PerfStats::CounterId::DrawsIndirect);
+	}
 	if (args.vertex_count == 0 || args.instance_count == 0) {
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedEmpty);
 		return;
 	}
 
@@ -1504,10 +1581,12 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedVertexShader);
 		return;
 	}
 
 	if (ShouldSkipGeShader(buffer)) {
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedStage);
 		return;
 	}
 
@@ -1535,6 +1614,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	PerfStats::Span targets_span(PerfStats::SpanId::DrawTargets);
 	if (!PrepareDrawRenderState(submit_id, buffer, draw, args.render_target_slice_offset, false,
 	                            state)) {
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedState);
 		ResetBindings();
 		return;
 	}
@@ -1542,6 +1622,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, true, topology)) {
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedState);
 		ResetBindings();
 		return;
 	}
@@ -1565,6 +1646,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 			     state.ps_input_info.input_num, sh_ctx.GetPs().ps_regs.data_addr,
 			     sh_ctx.GetVs().es_regs.data_addr, sh_ctx.GetVs().gs_regs.data_addr);
 		}
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedState);
 		ResetBindings();
 		return;
 	}

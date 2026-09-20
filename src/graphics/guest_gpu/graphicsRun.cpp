@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -771,6 +772,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		if ((packet_header & 1u) != 0 && ShouldSkipPredicatedPackets()) {
 			auto packet_dw = KYTY_PM4_LEN(packet_header);
 			EXIT_NOT_IMPLEMENTED(packet_dw == 0 || packet_dw > remaining_dw);
+			PerfStats::Add(PerfStats::CounterId::PacketsSkippedPredicated);
 			static std::atomic<uint32_t> skip_log_count {0};
 			if (skip_log_count.fetch_add(1) < 2048) {
 				LOGF("\t predicated skip: op=0x%02" PRIx32 ", r=0x%02" PRIx32 ", len=%" PRIu32
@@ -872,8 +874,14 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 			const bool predicate_gpu_dirty =
 			    buffer_cache.HasGpuDirtyBytes(predicate_address, sizeof(uint64_t)) ||
 			    buffer_cache.IsRegionGpuModified(predicate_address, sizeof(uint64_t));
-			if (wait_op != 0 && predicate_gpu_dirty) {
-				BufferFlushAndWait();
+			if (predicate_gpu_dirty) {
+				if (wait_op != 0) {
+					const GpuWaitScope wait_scope(PerfStats::SpanId::GpuWaitPredicate);
+					BufferFlushAndWait();
+				} else {
+					// Read without waiting for the GPU writes that produce it.
+					PerfStats::Add(PerfStats::CounterId::PredicateStale);
+				}
 			}
 
 			auto value = *reinterpret_cast<const volatile uint64_t*>(address);
@@ -882,6 +890,9 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 				case 0x00: m_predicate_skip = (value != 0); break;
 				case 0x01: m_predicate_skip = (value == 0); break;
 				default: EXIT("unknown predication condition: 0x%08" PRIx32 "\n", condition);
+			}
+			if (m_predicate_skip) {
+				PerfStats::Add(PerfStats::CounterId::PredicateSkips);
 			}
 			static std::atomic<uint32_t> log_count {0};
 			if (log_count.fetch_add(1) < 128) {
@@ -981,6 +992,9 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 	const uint32_t index_count =
 	    (m_index_buffer_size != 0 ? std::min(args.index_count_per_instance, m_index_buffer_size)
 	                              : args.index_count_per_instance);
+	if (index_count != args.index_count_per_instance) {
+		PerfStats::Add(PerfStats::CounterId::DrawsIndexClamped);
+	}
 	if (GraphicsRunDebugDumpEnabled() && index_count != args.index_count_per_instance) {
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
@@ -1075,6 +1089,9 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		    (m_index_buffer_size != 0
 		         ? std::min(args->index_count_per_instance, m_index_buffer_size)
 		         : args->index_count_per_instance);
+		if (index_count != args->index_count_per_instance) {
+			PerfStats::Add(PerfStats::CounterId::DrawsIndexClamped);
+		}
 		if (GraphicsRunDebugDumpEnabled() && index_count != args->index_count_per_instance) {
 			static std::atomic<uint32_t> log_count {0};
 			if (log_count.fetch_add(1, std::memory_order_relaxed) < 64) {

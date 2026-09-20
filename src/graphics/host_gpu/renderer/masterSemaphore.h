@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_MASTERSEMAPHORE_H_
 
 #include "common/common.h"
+#include "common/perfStats.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <atomic>
@@ -9,6 +10,23 @@
 namespace Libs::Graphics {
 
 struct GraphicContext;
+
+// Names the work a GPU wait belongs to. A wait inside a scope is recorded in its span as well as
+// in GpuWait; the innermost scope on the waiting thread wins.
+class GpuWaitScope final {
+public:
+	explicit GpuWaitScope(PerfStats::SpanId reason) noexcept: m_previous(Reason()) {
+		Reason() = reason;
+	}
+	~GpuWaitScope() { Reason() = m_previous; }
+	KYTY_CLASS_NO_COPY(GpuWaitScope);
+
+	// SpanId::Count outside every scope, for a wait that belongs to no named part of the frame.
+	[[nodiscard]] static PerfStats::SpanId& Reason() noexcept;
+
+private:
+	PerfStats::SpanId m_previous;
+};
 
 class MasterSemaphore {
 public:

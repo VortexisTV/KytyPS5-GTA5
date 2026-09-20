@@ -33,23 +33,42 @@ constexpr std::array<std::string_view, SpanCount> SpanNames = {
     "gpu_thread_commands",   "game_wait_gpu_idle",   "game_wait_gpu_command",
     "draw",                  "draw_targets",         "draw_shaders",
     "shader_prepare",        "shader_key",           "shader_materialize",
+    "shader_srt_walk",       "shader_indirect_images", "shader_specialize",
     "shader_permutation",
-    "draw_bindings",         "draw_vertex_index",    "draw_pipeline",
+    "draw_bindings",         "bind_resolve",         "bind_find_buffers",
+    "bind_dma_sources",      "bind_rebind_buffers",  "bind_rebind_images",
+    "draw_vertex_index",     "draw_pipeline",
     "draw_record",           "dispatch",             "bda_prepare",
+    "hot_page_hash",
     "buffer_download",       "queue_submit",         "gpu_wait",
+    "gpu_wait_readback",     "gpu_wait_faults",      "gpu_wait_stream",
+    "gpu_wait_predicate",
     "flip_wait",             "present",              "page_fault",
+    "virtual_map_edit",      "virtual_map_query",    "virtual_map_wait",
     "garbage_collect",       "shader_compile_sync",  "shader_compile_async",
     "pipeline_create_sync",  "pipeline_create_async", "pipeline_cache_save",
+    "audio_push_gap",        "audio_queue_wait",
 };
 
 constexpr std::array<std::string_view, CounterCount> CounterNames = {
-    "draws_skipped_shader", "draws_skipped_pipeline", "bda_buffers_visited",
+    "draws_skipped_shader", "draws_skipped_pipeline", "draws_skipped_stage",
+    "draws_skipped_tessellation", "draws_skipped_vertex_shader", "draws_skipped_state",
+    "draws_skipped_empty",
+    "draws_indirect", "draws_index_clamped", "predicate_skips", "predicate_stale",
+    "packets_skipped_predicated", "bda_buffers_visited",
     "bda_passes_skipped",
+    "hot_pages_hashed",     "hot_pages_changed",      "hot_pages_cooled",
     "buffer_uploads",       "buffer_upload_bytes",    "stream_uploads",
     "stream_upload_bytes",  "buffer_creates",         "buffer_download_bytes",
+    "readbacks_shadow",     "readback_no_owner",      "readback_not_hot",
+    "readback_shadow_stale", "readback_recent_write", "shadows_recorded",
     "buffers_evicted",      "image_creates",          "image_uploads",
     "image_upload_bytes",   "images_evicted",         "write_faults",
     "read_faults",          "shaders_compiled",       "pipelines_created",
+    "shader_guest_reads",   "shader_range_checks",    "indirect_image_probes",
+    "srt_interpreted",      "shader_input_repeats",
+    "audio_pushes_sync",    "audio_pushes_async",     "audio_pushes_not_ready",
+    "audio_underruns",
 };
 
 constexpr std::array<std::string_view, GaugeCount> GaugeNames = {
@@ -57,6 +76,7 @@ constexpr std::array<std::string_view, GaugeCount> GaugeNames = {
     "buffer_gc_trigger_mb",
     "texture_gc_trigger_mb",
     "cached_buffers",
+    "virtual_ranges",
 };
 
 template <size_t N>
@@ -273,20 +293,72 @@ std::string FormatSummary(const Snapshot& snapshot, uint64_t ticks_per_second) {
 	               ms(SpanId::FlipWait), ms(SpanId::Present));
 	fmt::format_to(it,
 	               "[perf] per frame: {:.0f} draws {:.1f} ms (targets {:.1f}, shaders {:.1f}, "
-	               "bindings {:.1f}, vertex/index {:.1f}, pipeline {:.1f}, record {:.1f}; skipped "
-	               "{:.1f} for shaders, {:.1f} for pipelines) | {:.0f} dispatches {:.1f} ms\n",
+	               "bindings {:.1f}, vertex/index {:.1f}, pipeline {:.1f}, record {:.1f}) | "
+	               "{:.0f} dispatches {:.1f} ms\n",
 	               count(SpanId::Draw), ms(SpanId::Draw), ms(SpanId::DrawTargets),
 	               ms(SpanId::DrawShaders), ms(SpanId::DrawBindings), ms(SpanId::DrawVertexIndex),
-	               ms(SpanId::DrawPipeline), ms(SpanId::DrawRecord),
-	               per_frame(CounterId::DrawsSkippedShader),
-	               per_frame(CounterId::DrawsSkippedPipeline), count(SpanId::Dispatch),
+	               ms(SpanId::DrawPipeline), ms(SpanId::DrawRecord), count(SpanId::Dispatch),
 	               ms(SpanId::Dispatch));
+	fmt::format_to(
+	    it,
+	    "[perf] per frame: dropped draws: {:.1f} waiting for shaders, {:.1f} for "
+	    "pipelines, {:.1f} unsupported stages ({:.1f} tessellated), {:.1f} without a vertex "
+	    "shader, {:.1f} "
+	    "without state, {:.1f} empty | {:.1f} indirect draws ({:.1f} index-clamped) | "
+	    "predication: {:.1f} skips on ({:.1f} unsynchronized), {:.1f} packets "
+	    "skipped\n",
+	    per_frame(CounterId::DrawsSkippedShader), per_frame(CounterId::DrawsSkippedPipeline),
+	    per_frame(CounterId::DrawsSkippedStage), per_frame(CounterId::DrawsSkippedTessellation),
+	    per_frame(CounterId::DrawsSkippedVertexShader), per_frame(CounterId::DrawsSkippedState),
+	    per_frame(CounterId::DrawsSkippedEmpty), per_frame(CounterId::DrawsIndirect),
+	    per_frame(CounterId::DrawsIndexClamped), per_frame(CounterId::PredicateSkips),
+	    per_frame(CounterId::PredicateStale), per_frame(CounterId::PacketsSkippedPredicated));
 	fmt::format_to(it,
 	               "[perf] per frame: shader lookup {:.1f} ms: prepare {:.1f} ms, key {:.1f} ms ({:.0f} "
 	               "lookups), materialize {:.1f} ms ({:.0f}), permutation {:.1f} ms\n",
 	               ms(SpanId::DrawShaders), ms(SpanId::ShaderPrepare), ms(SpanId::ShaderKey),
 	               count(SpanId::ShaderKey), ms(SpanId::ShaderMaterialize),
 	               count(SpanId::ShaderMaterialize), ms(SpanId::ShaderPermutation));
+	const auto materialize_other =
+	    std::max(0.0, ms(SpanId::ShaderMaterialize) - ms(SpanId::ShaderSrtWalk) -
+	                      ms(SpanId::ShaderIndirect) - ms(SpanId::ShaderSpecialize));
+	fmt::format_to(it,
+	               "[perf] per frame: materialize: SRT walk {:.1f} ms ({:.0f} interpreted), "
+	               "indirect images {:.1f} ms ({:.0f} tables, {:.0f} probes), specialize {:.1f} "
+	               "ms, other {:.1f} ms | {:.0f} guest reads, {:.0f} range checks, {:.0f} "
+	               "repeated inputs\n",
+	               ms(SpanId::ShaderSrtWalk), per_frame(CounterId::SrtInterpreted),
+	               ms(SpanId::ShaderIndirect), count(SpanId::ShaderIndirect),
+	               per_frame(CounterId::IndirectProbes), ms(SpanId::ShaderSpecialize),
+	               materialize_other, per_frame(CounterId::ShaderGuestReads),
+	               per_frame(CounterId::ShaderRangeChecks),
+	               per_frame(CounterId::ShaderInputRepeats));
+	fmt::format_to(it,
+	               "[perf] per frame: bindings {:.1f} ms: resolve {:.1f} ms, find buffers {:.1f} "
+	               "ms, DMA sources {:.1f} ms, BDA {:.1f} ms, rebind buffers {:.1f} ms, rebind "
+	               "images {:.1f} ms\n",
+	               ms(SpanId::DrawBindings), ms(SpanId::BindResolve), ms(SpanId::BindFindBuffers),
+	               ms(SpanId::BindDmaSources), ms(SpanId::BdaPrepare),
+	               ms(SpanId::BindRebindBuffers), ms(SpanId::BindRebindImages));
+	fmt::format_to(
+	    it,
+	    "[perf] per frame: readbacks: {:.1f} from a shadow, {:.1f} drained the GPU "
+	    "({:.1f} unowned, {:.1f} not hot yet, {:.1f} stale shadow, {:.1f} rewritten) | "
+	    "{:.1f} shadows recorded\n",
+	    per_frame(CounterId::ReadbacksShadow),
+	    per_frame(CounterId::ReadbackNoOwner) + per_frame(CounterId::ReadbackNotHot) +
+	        per_frame(CounterId::ReadbackShadowStale) + per_frame(CounterId::ReadbackRecentWrite),
+	    per_frame(CounterId::ReadbackNoOwner), per_frame(CounterId::ReadbackNotHot),
+	    per_frame(CounterId::ReadbackShadowStale), per_frame(CounterId::ReadbackRecentWrite),
+	    per_frame(CounterId::ShadowsRecorded));
+	fmt::format_to(it,
+	               "[perf] per frame: GPU waits {:.1f} ms: readback {:.1f} ms ({:.1f}), faults "
+	               "{:.1f} ms ({:.1f}), stream buffer {:.1f} ms ({:.1f}), predicates {:.1f} ms "
+	               "({:.1f})\n",
+	               ms(SpanId::GpuWait), ms(SpanId::GpuWaitReadback), count(SpanId::GpuWaitReadback),
+	               ms(SpanId::GpuWaitFaults), count(SpanId::GpuWaitFaults),
+	               ms(SpanId::GpuWaitStream), count(SpanId::GpuWaitStream),
+	               ms(SpanId::GpuWaitPredicate), count(SpanId::GpuWaitPredicate));
 	fmt::format_to(it,
 	               "[perf] per frame: BDA {:.1f} passes {:.1f} ms ({:.1f} skipped, {:.0f} buffers per "
 	               "full pass) | {:.1f} submits {:.1f} ms | {:.1f} GPU waits {:.1f} ms (longest {:.1f} "
@@ -298,6 +370,29 @@ std::string FormatSummary(const Snapshot& snapshot, uint64_t ticks_per_second) {
 	               Milliseconds(snapshot.Get(SpanId::GpuWait).max_ticks, ticks_per_second),
 	               count(SpanId::PageFault), ms(SpanId::PageFault),
 	               per_frame(CounterId::WriteFaults), ms(SpanId::GarbageCollect));
+	fmt::format_to(it,
+	               "[perf] per frame: hot pages: {:.0f} hashed in {:.1f} ms, {:.0f} changed, "
+	               "{:.0f} cooled down\n",
+	               per_frame(CounterId::HotPagesHashed), ms(SpanId::HotPageHash),
+	               per_frame(CounterId::HotPagesChanged), per_frame(CounterId::HotPagesCooled));
+	fmt::format_to(it,
+	               "[perf] per frame: virtual memory map: {:.1f} edits holding its lock {:.1f} ms "
+	               "(longest {:.2f} ms), {:.1f} queries {:.1f} ms | range checks waited {:.1f} "
+	               "times, {:.1f} ms (longest {:.2f} ms) | {} ranges\n",
+	               count(SpanId::VirtualMapEdit), ms(SpanId::VirtualMapEdit),
+	               Milliseconds(snapshot.Get(SpanId::VirtualMapEdit).max_ticks, ticks_per_second),
+	               count(SpanId::VirtualMapQuery), ms(SpanId::VirtualMapQuery),
+	               count(SpanId::VirtualMapWait), ms(SpanId::VirtualMapWait),
+	               Milliseconds(snapshot.Get(SpanId::VirtualMapWait).max_ticks, ticks_per_second),
+	               snapshot.Get(GaugeId::VirtualRanges));
+	fmt::format_to(it,
+	               "[perf] per frame: audio {:.1f} sync and {:.1f} async pushes ({:.1f} refused), "
+	               "{:.2f} underruns | longest push gap {:.1f} ms | waiting for device room {:.1f} "
+	               "ms\n",
+	               per_frame(CounterId::AudioPushesSync), per_frame(CounterId::AudioPushesAsync),
+	               per_frame(CounterId::AudioPushesNotReady), per_frame(CounterId::AudioUnderruns),
+	               Milliseconds(snapshot.Get(SpanId::AudioPushGap).max_ticks, ticks_per_second),
+	               ms(SpanId::AudioQueueWait));
 	fmt::format_to(it,
 	               "[perf] per frame: uploads {:.1f} buffer ({:.2f} MB), {:.1f} stream ({:.2f} MB), "
 	               "{:.1f} image ({:.2f} MB) | created {:.1f} buffers, {:.1f} images | evicted "

@@ -39,6 +39,11 @@ void MasterSemaphore::Refresh() {
 	}
 }
 
+PerfStats::SpanId& GpuWaitScope::Reason() noexcept {
+	static thread_local PerfStats::SpanId reason = PerfStats::SpanId::Count;
+	return reason;
+}
+
 void MasterSemaphore::Wait(uint64_t tick) {
 	if (IsFree(tick)) {
 		return;
@@ -49,7 +54,10 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	}
 
 	// Waits on the priority-operation and present threads do not hold up command processing.
-	PerfStats::Span span(PerfStats::SpanId::GpuWait, GuestGpu::IsGpuThread());
+	const bool            counted = GuestGpu::IsGpuThread();
+	PerfStats::Span       span(PerfStats::SpanId::GpuWait, counted);
+	const auto            reason = GpuWaitScope::Reason();
+	PerfStats::Span       reason_span(reason, counted && reason != PerfStats::SpanId::Count);
 	vk::SemaphoreWaitInfo wait_info {};
 	wait_info.sType          = vk::StructureType::eSemaphoreWaitInfo;
 	wait_info.semaphoreCount = 1;

@@ -836,6 +836,74 @@ void TestUploadEpochTracksNewUploadWork() {
   Release(page_manager, memory, page_size * 2);
 }
 
+void TestHotPagesCoolDown() {
+  using Libs::Graphics::RegionManager;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 1);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  uint32_t ranges = 0;
+  const auto count_ranges = [&](uint64_t, uint64_t) noexcept { ranges++; };
+  // A read-only binding of the page, as a BDA pass makes; returns the ranges it
+  // uploads.
+  const auto sync = [&]() {
+    ranges = 0;
+    tracker.ForEachUploadRange(address, page_size, false, count_ranges,
+                               []() noexcept {});
+    return ranges;
+  };
+  const auto next_generation = [&]() {
+    RegionManager::AdvanceGeneration();
+    return sync();
+  };
+  const auto write_fault = [&]() {
+    tracker.InvalidateRegion(address, 16, [] {});
+  };
+  // Hot pages stay hot while unchanged for fewer than 64 generations.
+  const auto stay_hot = [&](const char *text) {
+    for (int i = 1; i < 64; i++) {
+      Check(next_generation() == 0 && IsWritable(memory), text);
+    }
+  };
+
+  // Two write faults within the fault window make the page hot.
+  (void)sync();
+  write_fault();
+  (void)sync();
+  write_fault();
+  Check(sync() == 1 && IsWritable(memory),
+        "a new hot page was not uploaded or not left writable");
+  stay_hot("an unchanged hot page was uploaded or cooled down early");
+  Check(next_generation() == 0 && !IsWritable(memory) &&
+            !tracker.IsRegionCpuModified(address, page_size),
+        "a hot page unchanged for 64 generations did not cool down clean and "
+        "write-protected");
+  Check(next_generation() == 0, "a cooled-down page uploaded without a write");
+  write_fault();
+  Check(sync() == 1 && !IsWritable(memory),
+        "a write to a cooled-down page was not uploaded");
+
+  // A second fault within the window heats the page again. It uploads at its
+  // first hot check even though its contents match its old hash, and its
+  // quiet time restarts instead of cooling it down at once.
+  write_fault();
+  Check(sync() == 1 && IsWritable(memory),
+        "a page turning hot again reused its old hash or quiet time");
+  stay_hot("a re-heated hot page was uploaded or cooled down early");
+
+  // Contents that change as the page cools down are uploaded; the page still
+  // ends clean and write-protected.
+  memory[0] ^= 0xff;
+  Check(next_generation() == 1 && !IsWritable(memory) &&
+            !tracker.IsRegionCpuModified(address, page_size),
+        "a hot page that changed as it cooled down was not uploaded, clean and "
+        "write-protected");
+  tracker.UntrackMemory(address, page_size);
+  Release(page_manager, memory, page_size);
+}
+
 [[noreturn]] void RunDeathCase(const char *name) {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
@@ -935,6 +1003,7 @@ int main(int argc, char **argv) {
   TestGpuUnmarkUsesRegionMask();
   TestFullRegionGpuUnmarkBatching();
   TestUploadEpochTracksNewUploadWork();
+  TestHotPagesCoolDown();
   TestFatalPaths();
   Config::Shutdown();
   std::puts("MemoryTrackerTests: all cases passed");

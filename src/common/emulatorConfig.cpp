@@ -87,6 +87,10 @@ bool CommandBufferDumpEnabled() {
 	return g_config->command_buffer_dump_enabled;
 }
 
+std::filesystem::path GetSkippedShaderDumpFolder() {
+	return g_config->skipped_shader_dump_folder;
+}
+
 std::filesystem::path GetCommandBufferDumpFolder() {
 	return g_config->command_buffer_dump_folder;
 }

@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/logging/log.h"
 #include "common/magicEnum.h"
+#include "common/perfStats.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "kernel/pthread.h"
@@ -85,6 +86,7 @@ public:
 	bool     AudioOutClose(Id handle);
 	bool     AudioOutValid(Id handle);
 	bool     AudioOutHasDevice(Id handle);
+	uint64_t AudioOutQueuedMicros(Id handle);
 	bool     AudioOutSetVolume(Id handle, uint32_t bitflag, const int* volume);
 	uint32_t AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking = true);
 	bool     AudioOutGetStatus(Id handle, int* type, int* channels_num);
@@ -109,6 +111,8 @@ private:
 
 		SDL_AudioDeviceID audio_device = 0;
 		SDL_AudioSpec     audio_spec   = {};
+		// Set once audio has been queued: from then on an empty queue means the device ran dry.
+		bool started = false;
 	};
 
 	struct PortIn {
@@ -157,6 +161,10 @@ void AudioOutClose(int handle) {
 
 bool AudioOutHasDevice(int handle) {
 	return g_audio != nullptr && handle > 0 && g_audio->AudioOutHasDevice(Audio::Id(handle));
+}
+
+uint64_t AudioOutQueuedMicros(int handle) {
+	return g_audio != nullptr && handle > 0 ? g_audio->AudioOutQueuedMicros(Audio::Id(handle)) : 0;
 }
 
 uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking) {
@@ -368,15 +376,30 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 		queue_size = static_cast<uint32_t>(cvt.len_cvt);
 	}
 
+	const uint64_t grain_us = port->freq != 0 ? (1000000ULL * port->samples_num) / port->freq : 0;
+
+	// An empty queue means the device is starting, or ran out of samples and filled the gap with
+	// silence. Lead the grain with silence up to the queue target: a stream that the game feeds at
+	// exactly the playback rate, such as a second stream paced by the first, never gets ahead of
+	// its device, so without the lead-in the device would stay a grain away from running dry.
+	const auto lead_in_size = AudioInternal::OutputLeadInBytes(
+	    SDL_GetQueuedAudioSize(port->audio_device), queue_size, grain_us);
+	if (lead_in_size != 0) {
+		if (port->started) {
+			PerfStats::Add(PerfStats::CounterId::AudioUnderruns);
+		}
+		const std::vector<uint8_t> lead_in(lead_in_size, port->audio_spec.silence);
+		if (SDL_QueueAudio(port->audio_device, lead_in.data(), lead_in_size) < 0) {
+			LOGF("AudioOut: SDL_QueueAudio failed: %s\n", SDL_GetError());
+			return false;
+		}
+	}
+
 	if (blocking) {
-		constexpr uint64_t target_latency_us = 40000;
-		const auto buffer_us = port->freq != 0 ? (1000000ULL * port->samples_num) / port->freq : 0;
-		const auto buffers =
-		    buffer_us != 0 ? static_cast<uint32_t>((target_latency_us + buffer_us - 1) / buffer_us)
-		                   : 2u;
-		const auto min_queued_size = queue_size * std::clamp(buffers, 2u, 16u);
-		const auto wait_start      = LibKernel::KernelGetProcessTime();
-		while (SDL_GetQueuedAudioSize(port->audio_device) > min_queued_size) {
+		PerfStats::Span wait_span(PerfStats::SpanId::AudioQueueWait);
+		const auto      target_size = AudioInternal::OutputQueueTargetBytes(queue_size, grain_us);
+		const auto      wait_start  = LibKernel::KernelGetProcessTime();
+		while (SDL_GetQueuedAudioSize(port->audio_device) > target_size) {
 			if (LibKernel::KernelGetProcessTime() - wait_start > 200000) {
 				SDL_ClearQueuedAudio(port->audio_device);
 				break;
@@ -390,6 +413,7 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 		return false;
 	}
 
+	port->started = true;
 	return true;
 }
 
@@ -454,6 +478,22 @@ bool Audio::AudioOutValid(Id handle) {
 
 	return (handle.GetId() >= 0 && handle.GetId() < OUT_PORTS_MAX &&
 	        m_out_ports[handle.GetId()].used);
+}
+
+uint64_t Audio::AudioOutQueuedMicros(Id handle) {
+	Common::LockGuard lock(m_mutex);
+
+	if (handle.GetId() < 0 || handle.GetId() >= OUT_PORTS_MAX) {
+		return 0;
+	}
+	const auto& port        = m_out_ports[handle.GetId()];
+	const auto  frame_bytes = static_cast<uint32_t>(SDL_AUDIO_BITSIZE(port.audio_spec.format) / 8) *
+	                          port.audio_spec.channels;
+	if (!port.used || port.audio_device == 0 || frame_bytes == 0 || port.audio_spec.freq <= 0) {
+		return 0;
+	}
+	const uint64_t frames = SDL_GetQueuedAudioSize(port.audio_device) / frame_bytes;
+	return frames * 1000000u / static_cast<uint64_t>(port.audio_spec.freq);
 }
 
 bool Audio::AudioOutHasDevice(Id handle) {
