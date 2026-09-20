@@ -1,4 +1,10 @@
-# KytyPS5
+# KytyPS5 (GTA 5 Fork)
+
+## **Red artifacts and lighting are expected upon first booting the game, let it shader build and compile before restarting.**
+
+## Set the Graphics Mode to Performance to prevent crashing.
+
+
 
 [![Build KytyPS5 (Windows)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28Windows%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
 [![Build KytyPS5 (Linux)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28Linux%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
