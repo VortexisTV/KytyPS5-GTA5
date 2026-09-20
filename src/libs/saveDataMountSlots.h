@@ -45,6 +45,13 @@ public:
 		return FULL;
 	}
 
+	// The save a slot stands for, empty when nothing is mounted in it.
+	[[nodiscard]] std::string_view Directory(size_t slot) const {
+		return slot < m_directories.size() && m_directories[slot].has_value()
+		           ? std::string_view(*m_directories[slot])
+		           : std::string_view {};
+	}
+
 	[[nodiscard]] static std::string MountPoint(size_t slot) {
 		return "/savedata" + std::to_string(slot);
 	}
