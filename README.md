@@ -30,8 +30,6 @@ compatibility is limited and behavior may change significantly between builds.
 KytyPS5 can boot 2D games and a selection of 3D games, including titles built with Unreal Engine
 4/5, Unity, and custom engines. No external low-level emulation modules are currently required.
 
-## **Red artifacts and lighting are expected upon first booting the game, let it shader build and compile before restarting.**
-
 Development is focused on compatibility and boot reliability.
 
 Windows is the primary platform and receives the most testing. Linux builds and runs; see
