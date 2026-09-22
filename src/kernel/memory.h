@@ -117,6 +117,10 @@ void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t s
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+// True when vaddr falls inside the span the guest address space is carved out of. Lock-free and
+// deliberately conservative - it never rejects a real guest address - so a fault handler can use
+// it to reject faults raised by host code before it touches any emulator state.
+[[nodiscard]] bool IsGuestAddress(uint64_t vaddr) noexcept;
 // A host fault on a range whose mapping another thread is rebuilding right now (a fixed map over
 // a live mapping, or a partial unmap of a host view) waits for that operation to finish. Returns
 // true when the faulting access should simply be retried.

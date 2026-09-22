@@ -268,6 +268,12 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 		args << "--game-patch" << patch_plan;
 	}
 
+	// Options given to the launcher itself are passed on, so a shortcut such as
+	// "launcher.exe --perf-stats true" reaches the emulator. --local is the launcher's own.
+	auto forwarded = QCoreApplication::arguments().mid(1);
+	forwarded.removeAll(QStringLiteral("--local"));
+	args << forwarded;
+
 	return args;
 }
 

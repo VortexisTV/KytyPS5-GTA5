@@ -89,6 +89,18 @@ static ShaderMappedData ShaderGetMappedData(uint64_t addr, const char* label) {
 	EXIT("%s shader=0x%016" PRIx64 " is missing from ShaderMap\n", label, addr);
 }
 
+bool ShaderTryGetMappedData(uint64_t addr, ShaderMappedData& data) {
+	if (g_shader_map == nullptr) {
+		return false;
+	}
+	const auto iter = g_shader_map->find(addr);
+	if (iter == g_shader_map->end()) {
+		return false;
+	}
+	data = iter->second;
+	return true;
+}
+
 static const ShaderBinaryInfo* GetBinaryInfo(const uint32_t* code) {
 	EXIT_IF(code == nullptr);
 

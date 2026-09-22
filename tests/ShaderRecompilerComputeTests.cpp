@@ -1,6 +1,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
 #include "gpu_test_shaders/gpu_test_ms_depth_spv.h"
@@ -3863,6 +3864,196 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "dirty-GC direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // PrepareBda synchronizes every cached buffer before a DMA draw or dispatch.
+  // It may skip a pass only when nothing it could upload has changed since the
+  // last complete one; guest writes, hot-page generations, new buffers and
+  // mapping changes must each force the next pass.
+  void CheckBdaSynchronizationSkip() {
+    constexpr const char *name = "BdaSynchronizationSkip";
+    constexpr uintptr_t base = 0x0000000206000000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t first_offset = 0x100;
+    constexpr uint64_t second_offset = 0x40100;
+    constexpr uint32_t initial_value = 0x11223344u;
+    constexpr uint32_t written_value = 0x55667788u;
+    constexpr uint32_t second_value = 0x99aabbccu;
+
+    EnsureRuntimeContext();
+    auto &context = Renderer();
+    CommandScheduler scheduler(context, m_runtime_context);
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    auto &gpu = context.GetGpu();
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "BDA direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "BDA fixed direct-memory mapping failed");
+    auto *memory = static_cast<uint8_t *>(mapped);
+    std::memcpy(memory + first_offset, &initial_value, sizeof(initial_value));
+    std::memcpy(memory + second_offset, &second_value, sizeof(second_value));
+
+    const bool stats_were_enabled = PerfStats::Detail::g_enabled;
+    PerfStats::Detail::g_enabled = true;
+    {
+      GpuResourceManager resources(m_runtime_context, scheduler);
+      resources.SetGpu(&gpu);
+      auto &cache = resources.GetBufferCache();
+      resources.MapMemory(base, allocation_size);
+
+      // Complete and skipped passes since the previous call.
+      const auto CountPasses = [] {
+        const auto snapshot = PerfStats::CollectAndReset();
+        const auto requests = snapshot.Get(PerfStats::SpanId::BdaPrepare).count;
+        const auto skipped =
+            snapshot.Get(PerfStats::CounterId::BdaPassesSkipped);
+        return std::pair<uint64_t, uint64_t>{requests - skipped, skipped};
+      };
+      const auto ReadNativeValue = [&](uint64_t address) {
+        const Libs::Graphics::Buffer &buffer =
+            cache.GetBuffer(cache.FindBuffer(address, sizeof(uint32_t)));
+        auto readback =
+            CreateHostBuffer(name, sizeof(uint32_t),
+                             vk::BufferUsageFlagBits::eTransferDst, {0});
+        const vk::BufferCopy copy{buffer.Offset(address), 0, sizeof(uint32_t)};
+        scheduler.Current().Handle().copyBuffer(buffer.Handle(), readback.buffer,
+                                                1, &copy);
+        vk::BufferMemoryBarrier barrier{};
+        barrier.sType = vk::StructureType::eBufferMemoryBarrier;
+        barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = readback.buffer;
+        barrier.size = readback.size;
+        scheduler.Current().Handle().pipelineBarrier(
+            vk::PipelineStageFlagBits::eTransfer,
+            vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0,
+            nullptr);
+        scheduler.Finish();
+        const auto value = ReadBuffer(name, readback, 1)[0];
+        DestroyBuffer(&readback);
+        return value;
+      };
+
+      const auto first = cache.FindBuffer(base + first_offset, sizeof(uint32_t));
+      // Creating tracker regions during the first pass is itself new work, so
+      // let the passes settle before expecting skips.
+      for (int pass = 0; pass < 3; pass++) {
+        resources.PrepareBda();
+      }
+      Require(name, "initial synchronization",
+              first && CountPasses().first >= 1 &&
+                  ReadNativeValue(base + first_offset) == initial_value,
+              "the first BDA pass did not upload guest memory");
+
+      resources.PrepareBda();
+      resources.PrepareBda();
+      const auto [idle_passes, idle_skips] = CountPasses();
+      Require(name, "unchanged memory",
+              idle_passes == 0 && idle_skips == 2,
+              "BDA preparation repeated a pass with nothing new to upload");
+
+      Require(name, "guest write fault",
+              resources.HandleFault(PageFaultAccess::Write, base + first_offset),
+              "a write to the synchronized page was not handled");
+      Libs::LibKernel::Memory::WriteBacking(base + first_offset, &written_value,
+                                            sizeof(written_value));
+      resources.PrepareBda();
+      resources.PrepareBda();
+      const auto [write_passes, write_skips] = CountPasses();
+      Require(name, "guest write",
+              write_passes == 1 && write_skips == 1 &&
+                  ReadNativeValue(base + first_offset) == written_value,
+              "a guest write did not force exactly one BDA pass");
+
+      Libs::Graphics::RegionManager::AdvanceGeneration();
+      resources.PrepareBda();
+      Require(name, "hot-page generation", CountPasses().first == 1,
+              "a new submission generation did not force a BDA pass");
+
+      const auto second =
+          cache.FindBuffer(base + second_offset, sizeof(uint32_t));
+      resources.PrepareBda();
+      Require(name, "new buffer",
+              second && second != first && CountPasses().first == 1 &&
+                  ReadNativeValue(base + second_offset) == second_value,
+              "a new buffer did not force a BDA pass");
+
+      resources.MapMemory(base, allocation_size);
+      resources.PrepareBda();
+      Require(name, "mapping change", CountPasses().first == 1,
+              "a GPU mapping change did not force a BDA pass");
+
+      // A generation still requests a complete pass, but clean buffers should
+      // no longer be visited. Uncached dirty pages must not select a neighbour.
+      (void)PerfStats::CollectAndReset();
+      Libs::Graphics::RegionManager::AdvanceGeneration();
+      resources.PrepareBda();
+      auto stats = PerfStats::CollectAndReset();
+      Require(name, "clean buffer filtering",
+              stats.Get(PerfStats::SpanId::BdaPrepare).count == 1 &&
+                  stats.Get(PerfStats::CounterId::BdaPassesSkipped) == 0 &&
+                  stats.Get(PerfStats::CounterId::BdaBuffersVisited) == 0,
+              "a new generation visited clean cached buffers");
+
+      // Several separated dirty runs in a single buffer should upload through
+      // one buffer visit, retaining values at both ends of the buffer.
+      constexpr uint64_t large_offset = 0x80000;
+      constexpr uint64_t large_size = 0x10000;
+      constexpr uint64_t tail_offset = large_offset + large_size - 4;
+      (void)cache.FindBuffer(base + large_offset, large_size);
+      resources.PrepareBda();
+      Require(
+          name, "fragmented first write",
+          resources.HandleFault(PageFaultAccess::Write, base + large_offset),
+          "first dirty-run write was not handled");
+      Require(name, "fragmented last write",
+              resources.HandleFault(PageFaultAccess::Write, base + tail_offset),
+              "last dirty-run write was not handled");
+      Libs::LibKernel::Memory::WriteBacking(base + large_offset, &initial_value,
+                                            sizeof(initial_value));
+      Libs::LibKernel::Memory::WriteBacking(base + tail_offset, &written_value,
+                                            sizeof(written_value));
+      (void)PerfStats::CollectAndReset();
+      resources.PrepareBda();
+      stats = PerfStats::CollectAndReset();
+      Require(name, "fragmented buffer filtering",
+              stats.Get(PerfStats::CounterId::BdaBuffersVisited) == 1 &&
+                  ReadNativeValue(base + large_offset) == initial_value &&
+                  ReadNativeValue(base + tail_offset) == written_value,
+              "dirty runs duplicated a buffer visit or lost GPU data");
+
+      resources.SetGpu(nullptr);
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    PerfStats::Detail::g_enabled = stats_were_enabled;
+    (void)PerfStats::CollectAndReset();
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "BDA direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "BDA direct-memory allocation release failed");
     std::printf("[host]    %-32s ok\n", name);
   }
 
@@ -26280,6 +26471,11 @@ int main(int argc, char **argv) {
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--bda-sync-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBdaSynchronizationSkip();
+    return 0;
+  }
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   if (argc == 2 && std::strcmp(argv[1], "--reverse-rt-death") == 0) {
     RunReverseRenderTargetDeathCase();
@@ -26418,6 +26614,7 @@ int main(int argc, char **argv) {
   vulkan.CheckDescriptorHeapLargeSet();
   vulkan.CheckGraphicsPushConstantBank();
   vulkan.CheckGpuMappedRangeLifecycle();
+  vulkan.CheckBdaSynchronizationSkip();
   vulkan.CheckStreamBufferRing();
   vulkan.CheckGpuTilerCpuParity();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

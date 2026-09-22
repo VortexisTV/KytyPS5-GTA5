@@ -2975,7 +2975,9 @@ void TestConcurrentFixedRemapWaitsForTransition() {
 	        Libs::LibKernel::Memory::KernelMapDirectMemory(&addr, size, prot, SceKernelMapFixed,
 	                                                       first, 0),
 	        "KernelMapDirectMemory(initial)");
-	Check(test, Common::HostException::InstallHandler(TransitionFaultHandler),
+	// No final handler: a fault this test's handler declines keeps the platform's own disposition
+	// rather than being reported as fatal.
+	Check(test, Common::HostException::InstallHandler(TransitionFaultHandler, nullptr),
 	      "failed to install the host fault handler");
 
 	std::atomic<bool>     stop {false};

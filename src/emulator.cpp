@@ -5,6 +5,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
@@ -143,6 +144,7 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 	subsystems.Initialize<Loader::Timer::Lifecycle>();
 	subsystems.Initialize<Libs::LibKernel::PthreadLifecycle>();
 	subsystems.Initialize<Profiler::Lifecycle>();
+	subsystems.Initialize<PerfStats::Lifecycle>();
 	subsystems.Initialize<Libs::Network::Lifecycle>();
 	subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
 	subsystems.Initialize<Libs::LibKernel::FileSystem::Lifecycle>();

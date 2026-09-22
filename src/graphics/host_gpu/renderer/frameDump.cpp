@@ -6,19 +6,22 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
-
-#include <fmt/format.h>
+#include "graphics/shader/shader.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fmt/format.h>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #ifdef _WIN32
@@ -26,6 +29,10 @@
 #endif
 
 namespace Libs::Graphics {
+
+// Defined below, beside the rest of the watch; arming it comes first in the file.
+void WatchImage(RenderContext& context, uint64_t address, const std::string& label);
+
 namespace {
 
 constexpr const char* TRIGGER_FILE    = "kyty_dump.trigger";
@@ -214,19 +221,23 @@ struct DumpMeta {
 
 std::mutex g_index_mutex;
 
-void AppendIndex(const std::filesystem::path& dir, const std::string& line) {
+void AppendLine(const std::filesystem::path& path, const std::string& line) {
 	std::lock_guard lock(g_index_mutex);
-	const auto      path = (dir / "index.txt").string();
+	const auto      name = path.string();
 #ifdef _WIN32
-	FILE* file = _fsopen(path.c_str(), "a", _SH_DENYNO);
+	FILE* file = _fsopen(name.c_str(), "a", _SH_DENYNO);
 #else
-	FILE* file = std::fopen(path.c_str(), "a");
+	FILE* file = std::fopen(name.c_str(), "a");
 #endif
 	if (file != nullptr) {
 		std::fputs(line.c_str(), file);
 		std::fputc('\n', file);
 		std::fclose(file);
 	}
+}
+
+void AppendIndex(const std::filesystem::path& dir, const std::string& line) {
+	AppendLine(dir / "index.txt", line);
 }
 
 void WriteBinary(const std::filesystem::path& path, const std::string& header,
@@ -374,9 +385,205 @@ void WriteImage(const DumpMeta& meta, const uint8_t* data) {
 	}
 }
 
+constexpr const char* WATCH_TRIGGER_FILE   = "kyty_watch.trigger";
+constexpr const char* WATCH_FILE           = "watch.txt";
+// Each watched operation holds a copy of the target until its readback runs, so the cap keeps
+// a frame's worth of them from filling host-visible memory. It is far more than a jump needs.
+constexpr uint32_t    WATCH_MAX_OPERATIONS = 32;
+// No ordinary colour comes near this, so counting the texels above it says whether an operation
+// left something wild behind.
+constexpr float WATCH_LOUD_VALUE = 1000.0F;
+
+std::atomic<uint64_t> g_watch_address {0};
+std::atomic<uint32_t> g_watch_operations {0};
+
+struct WatchMeta {
+	vk::Format  format  = vk::Format::eUndefined;
+	uint32_t    width   = 0;
+	uint32_t    height  = 0;
+	uint32_t    depth   = 0;
+	uint64_t    bytes   = 0;
+	uint32_t    ordinal = 0;
+	std::string label;
+};
+
+std::mutex                   g_watch_shader_mutex;
+std::unordered_set<uint64_t> g_watch_shaders;
+
+void WatchReport(const std::string& line) {
+	std::error_code error;
+	std::filesystem::create_directories("_FrameDump", error);
+	AppendLine(std::filesystem::path("_FrameDump") / WATCH_FILE, line);
+	std::fputs(line.c_str(), stdout);
+	std::fputc('\n', stdout);
+	std::fflush(stdout);
+}
+
+void WatchStats(const WatchMeta& meta, const uint8_t* data) {
+	const auto layout = LayoutOf(meta.format);
+	if (layout.bytes == 0) {
+		return;
+	}
+	std::array<float, 4>    max_value {};
+	std::array<uint64_t, 4> loud {};
+	std::array<float, 4>    texel {};
+	const uint64_t          texels = static_cast<uint64_t>(meta.width) * meta.height * meta.depth;
+	for (uint64_t i = 0; i < texels; i++) {
+		DecodeTexel(meta.format, data + i * layout.bytes, texel);
+		for (uint32_t c = 0; c < layout.channels; c++) {
+			if (std::isfinite(texel[c])) {
+				max_value[c] = std::max(max_value[c], texel[c]);
+				loud[c] += (texel[c] > WATCH_LOUD_VALUE ? 1 : 0);
+			}
+		}
+	}
+	static constexpr std::array channel_names {'R', 'G', 'B', 'A'};
+	auto                        line = fmt::format("{}", meta.label);
+	for (uint32_t c = 0; c < layout.channels; c++) {
+		line += fmt::format(" | {}: max={:.6g} loud={}", channel_names[c], max_value[c], loud[c]);
+	}
+	WatchReport(line);
+}
+
+// Armed by the trigger for exactly one frame: leaving it on would log every frame of the run.
+void UpdateWatch(RenderContext& context) {
+	if (const auto address = g_watch_address.exchange(0); address != 0) {
+		// The closing state, for whatever wrote it outside the operations the watch hooks.
+		g_watch_address.store(address);
+		WatchImage(context, address, "     at flip");
+		g_watch_address.store(0);
+		WatchReport(fmt::format("watch 0x{:010x}: {} operations wrote it", address,
+		                        g_watch_operations.load()));
+		return;
+	}
+	std::error_code error;
+	if (!std::filesystem::exists(WATCH_TRIGGER_FILE, error)) {
+		return;
+	}
+	std::string text;
+	if (FILE* file = std::fopen(WATCH_TRIGGER_FILE, "r"); file != nullptr) {
+		std::array<char, 64> buffer {};
+		if (std::fgets(buffer.data(), static_cast<int>(buffer.size()), file) != nullptr) {
+			text = buffer.data();
+		}
+		std::fclose(file);
+	}
+	std::filesystem::remove(WATCH_TRIGGER_FILE, error);
+	const auto address = std::strtoull(text.c_str(), nullptr, 16);
+	if (address == 0) {
+		WatchReport("watch: kyty_watch.trigger needs the target's guest address in hex");
+		return;
+	}
+	g_watch_operations.store(0);
+	g_watch_address.store(address);
+	WatchReport(fmt::format("watch 0x{:010x}: armed for one frame", address));
+	// What the frame starts from tells a target that arrives spoiled apart from one an operation
+	// spoils.
+	WatchImage(context, address, "     at arm ");
+}
+
 } // namespace
 
+uint64_t FrameDumpWatchAddress() {
+	return g_watch_address.load(std::memory_order_relaxed);
+}
+
+void FrameDumpWatchShader(uint64_t address) {
+	if (address == 0 || g_watch_address.load(std::memory_order_relaxed) == 0) {
+		return;
+	}
+	{
+		std::lock_guard lock(g_watch_shader_mutex);
+		if (!g_watch_shaders.insert(address).second) {
+			return;
+		}
+	}
+	ShaderMappedData data;
+	if (!ShaderTryGetMappedData(address, data) || data.code_size_bytes == 0) {
+		WatchReport(fmt::format("shader 0x{:016x}: no registered code size", address));
+		return;
+	}
+	std::error_code error;
+	const auto      dir = std::filesystem::path("_FrameDump") / "shaders";
+	std::filesystem::create_directories(dir, error);
+	const auto path = dir / fmt::format("{:016x}.bin", address);
+	WriteBinary(
+	    path, {},
+	    std::vector<uint8_t>(reinterpret_cast<const uint8_t*>(address),
+	                         reinterpret_cast<const uint8_t*>(address) + data.code_size_bytes));
+	WatchReport(fmt::format("shader 0x{:016x}: {} bytes written", address, data.code_size_bytes));
+}
+
+// `ordinal` is only a label; an input carries the ordinal of the operation that read it.
+void WatchImage(RenderContext& context, uint64_t address, const std::string& label) {
+	auto& cache     = context.GetTextureCache();
+	auto& scheduler = context.GetCommandScheduler();
+	auto& graphics  = context.GetGraphics();
+	cache.DebugForEachImage([&](ImageId /*id*/, Image& image) {
+		const auto& backing = image.backing;
+		if (image.info.data.address != address || backing.image == nullptr ||
+		    backing.samples != 1 || image.info.IsDepth()) {
+			return;
+		}
+		const auto     layout = LayoutOf(backing.format);
+		const auto     depth = backing.image_type == vk::ImageType::e3D ? backing.extent.depth : 1U;
+		const uint64_t bytes = static_cast<uint64_t>(backing.extent.width) * backing.extent.height *
+		                       depth * layout.bytes;
+		if (layout.bytes == 0 || bytes == 0 || bytes > MAX_IMAGE_BYTES ||
+		    !(backing.usage & vk::ImageUsageFlagBits::eTransferSrc)) {
+			return;
+		}
+		auto buffer = std::make_shared<Buffer>(graphics, scheduler, MemoryUsage::Download, 0,
+		                                       vk::BufferUsageFlagBits::eTransferDst, bytes);
+		vk::BufferImageCopy copy {};
+		copy.bufferOffset     = 0;
+		copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		copy.imageExtent      = {backing.extent.width, backing.extent.height, depth};
+		image.Download(std::span {&copy, 1}, buffer->Handle(), 0, bytes);
+		WatchMeta meta {backing.format,
+		                backing.extent.width,
+		                backing.extent.height,
+		                depth,
+		                bytes,
+		                0,
+		                fmt::format("{} 0x{:010x} {}x{}", label, address, backing.extent.width,
+		                            backing.extent.height)};
+		scheduler.DeferPriorityOperation([buffer, meta] {
+			buffer->Invalidate(0, meta.bytes);
+			WatchStats(meta, buffer->Mapped().data());
+		});
+	});
+}
+
+void FrameDumpWatchOperation(RenderContext& context, uint64_t address, const char* kind,
+                             uint64_t first_shader, uint64_t second_shader,
+                             const std::string& details) {
+	if (g_watch_address.load(std::memory_order_relaxed) != address) {
+		return;
+	}
+	const auto ordinal = g_watch_operations.fetch_add(1);
+	if (ordinal >= WATCH_MAX_OPERATIONS) {
+		return;
+	}
+	FrameDumpWatchShader(first_shader);
+	FrameDumpWatchShader(second_shader);
+	auto label = fmt::format("#{:03} wrote {} first=0x{:016x} second=0x{:016x}", ordinal, kind,
+	                         first_shader, second_shader);
+	if (!details.empty()) {
+		label += " " + details;
+	}
+	WatchImage(context, address, label);
+}
+
+void FrameDumpWatchInput(RenderContext& context, uint64_t address, const char* role) {
+	if (g_watch_address.load(std::memory_order_relaxed) == 0) {
+		return;
+	}
+	WatchImage(context, address, fmt::format("     read {}", role));
+}
+
 void FrameDumpOnFlip(RenderContext& context, uint64_t surface_address) {
+	UpdateWatch(context);
 	static uint32_t flip_count = 0;
 	if ((++flip_count % 15u) != 0) {
 		return;

@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -1124,6 +1125,8 @@ bool FlipQueue::Flip(uint32_t micros) {
 
 	m_presenter.Present(*r.frame);
 	KYTY_PROFILER_FRAME_MARK;
+	PerfStats::OnGuestFrame();
+	Graphics::PipelineCache::NoteGuestFrame();
 	Graphics::RenderDocOnGuestFlip();
 
 	m_mutex.Lock();

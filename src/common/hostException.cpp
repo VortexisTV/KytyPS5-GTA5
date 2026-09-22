@@ -25,15 +25,63 @@ namespace Common::HostException {
 
 #if !defined(__APPLE__)
 
-static std::atomic<Handler> g_handler {nullptr};
-static std::atomic_uint32_t g_install_state {0};
+static std::atomic<Handler>      g_handler {nullptr};
+static std::atomic<FinalHandler> g_final_handler {nullptr};
+static std::atomic_uint32_t      g_install_state {0};
 
 static_assert(decltype(g_handler)::is_always_lock_free);
+static_assert(decltype(g_final_handler)::is_always_lock_free);
 static_assert(decltype(g_install_state)::is_always_lock_free);
 #endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
+// Translate a Windows exception record into the platform-neutral ExceptionInfo. Returns false for
+// the exception codes the emulator never resolves, which are left entirely to Windows.
+static bool FillExceptionInfo(PEXCEPTION_POINTERS exception, ExceptionInfo* info) noexcept {
+	const auto* exception_record = exception->ExceptionRecord;
+
+	info->exception_address = reinterpret_cast<uint64_t>(exception_record->ExceptionAddress);
+	info->native_code       = exception_record->ExceptionCode;
+	info->native_context    = exception->ContextRecord;
+
+	if (exception_record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+		info->type = ExceptionType::AccessViolation;
+		switch (exception_record->ExceptionInformation[0]) {
+			case 0: info->access_violation_type = AccessViolationType::Read; break;
+			case 1: info->access_violation_type = AccessViolationType::Write; break;
+			case 8: info->access_violation_type = AccessViolationType::Execute; break;
+			default: info->access_violation_type = AccessViolationType::Unknown; break;
+		}
+		info->access_violation_vaddr = exception_record->ExceptionInformation[1];
+	} else if (exception_record->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION) {
+		info->type = ExceptionType::IllegalInstruction;
+	} else {
+		return false;
+	}
+
+	info->rax = exception->ContextRecord->Rax;
+	info->rbx = exception->ContextRecord->Rbx;
+	info->rcx = exception->ContextRecord->Rcx;
+	info->rdx = exception->ContextRecord->Rdx;
+	info->rsi = exception->ContextRecord->Rsi;
+	info->rdi = exception->ContextRecord->Rdi;
+	info->rbp = exception->ContextRecord->Rbp;
+	info->rsp = exception->ContextRecord->Rsp;
+	info->r8  = exception->ContextRecord->R8;
+	info->r9  = exception->ContextRecord->R9;
+	info->r10 = exception->ContextRecord->R10;
+	info->r11 = exception->ContextRecord->R11;
+	info->r12 = exception->ContextRecord->R12;
+	info->r13 = exception->ContextRecord->R13;
+	info->r14 = exception->ContextRecord->R14;
+	info->r15 = exception->ContextRecord->R15;
+	return true;
+}
+
+// A vectored handler runs for every first-chance exception in the process, on every thread, and
+// before any frame-based handler. Decline anything the emulator cannot resolve so that the
+// faulting module's own __except still gets its turn.
 static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	auto* exception_record = exception->ExceptionRecord;
 
@@ -48,41 +96,9 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	}
 
 	ExceptionInfo info {};
-	info.exception_address = reinterpret_cast<uint64_t>(exception_record->ExceptionAddress);
-	info.native_code       = exception_record->ExceptionCode;
-	info.native_context    = exception->ContextRecord;
-
-	if (exception_record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
-		info.type = ExceptionType::AccessViolation;
-		switch (exception_record->ExceptionInformation[0]) {
-			case 0: info.access_violation_type = AccessViolationType::Read; break;
-			case 1: info.access_violation_type = AccessViolationType::Write; break;
-			case 8: info.access_violation_type = AccessViolationType::Execute; break;
-			default: info.access_violation_type = AccessViolationType::Unknown; break;
-		}
-		info.access_violation_vaddr = exception_record->ExceptionInformation[1];
-	} else if (exception_record->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION) {
-		info.type = ExceptionType::IllegalInstruction;
-	} else {
+	if (!FillExceptionInfo(exception, &info)) {
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
-
-	info.rax = exception->ContextRecord->Rax;
-	info.rbx = exception->ContextRecord->Rbx;
-	info.rcx = exception->ContextRecord->Rcx;
-	info.rdx = exception->ContextRecord->Rdx;
-	info.rsi = exception->ContextRecord->Rsi;
-	info.rdi = exception->ContextRecord->Rdi;
-	info.rbp = exception->ContextRecord->Rbp;
-	info.rsp = exception->ContextRecord->Rsp;
-	info.r8  = exception->ContextRecord->R8;
-	info.r9  = exception->ContextRecord->R9;
-	info.r10 = exception->ContextRecord->R10;
-	info.r11 = exception->ContextRecord->R11;
-	info.r12 = exception->ContextRecord->R12;
-	info.r13 = exception->ContextRecord->R13;
-	info.r14 = exception->ContextRecord->R14;
-	info.r15 = exception->ContextRecord->R15;
 
 	const auto handler = g_handler.load(std::memory_order_acquire);
 	if (handler != nullptr && handler(info)) {
@@ -91,12 +107,25 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	return EXCEPTION_CONTINUE_SEARCH;
 }
 
+// Reached only once the SEH search has run out of handlers, so a fault declined above is still
+// reported when it really was nobody's.
+static LONG WINAPI UnhandledFilter(PEXCEPTION_POINTERS exception) noexcept {
+	const auto    final_handler = g_final_handler.load(std::memory_order_acquire);
+	ExceptionInfo info {};
+	if (final_handler != nullptr && FillExceptionInfo(exception, &info)) {
+		final_handler(info); // expected not to return
+	}
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
 #elif defined(__APPLE__)
 
-static std::atomic<Handler> g_handler {nullptr};
-static std::atomic_uint32_t g_install_state {0};
+static std::atomic<Handler>      g_handler {nullptr};
+static std::atomic<FinalHandler> g_final_handler {nullptr};
+static std::atomic_uint32_t      g_install_state {0};
 
 static_assert(decltype(g_handler)::is_always_lock_free);
+static_assert(decltype(g_final_handler)::is_always_lock_free);
 static_assert(decltype(g_install_state)::is_always_lock_free);
 
 // Translate the x86-64 page-fault error code (mcontext __es.__err) into an access type.
@@ -153,6 +182,13 @@ static void SignalHandler(int sig, siginfo_t* si, void* uctx) {
 	const auto handler = g_handler.load(std::memory_order_acquire);
 	if (handler != nullptr && handler(info)) {
 		return; // retry the faulting instruction against the fixed mapping
+	}
+
+	// A signal handler pre-empts nothing the way a vectored handler does, so there is no other
+	// handler to defer a declined fault to: report it here.
+	if (const auto final_handler = g_final_handler.load(std::memory_order_acquire);
+	    final_handler != nullptr) {
+		final_handler(info); // expected not to return
 	}
 
 	// Unresolved: restore the default action so the re-executed instruction terminates.
@@ -226,12 +262,19 @@ static void SignalHandler(int signal_number, siginfo_t* signal_info, void* nativ
 		return;
 	}
 
+	// A signal handler pre-empts nothing the way a vectored handler does, so there is no other
+	// handler to defer a declined fault to: report it here.
+	if (const auto final_handler = g_final_handler.load(std::memory_order_acquire);
+	    final_handler != nullptr) {
+		final_handler(info); // expected not to return
+	}
+
 	ChainToDefault(signal_number);
 }
 
 #endif
 
-bool InstallHandler(Handler handler) {
+bool InstallHandler(Handler handler, FinalHandler final_handler) {
 	if (handler == nullptr) {
 		return false;
 	}
@@ -241,15 +284,18 @@ bool InstallHandler(Handler handler) {
 		return expected_state == 2 && g_handler.load(std::memory_order_acquire) == handler;
 	}
 
+	g_final_handler.store(final_handler, std::memory_order_release);
 	g_handler.store(handler, std::memory_order_release);
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	if (AddVectoredExceptionHandler(0, ExceptionFilter) == nullptr) {
 		g_handler.store(nullptr, std::memory_order_release);
+		g_final_handler.store(nullptr, std::memory_order_release);
 		g_install_state.store(0, std::memory_order_release);
 		printf("AddVectoredExceptionHandler() failed\n");
 		return false;
 	}
+	SetUnhandledExceptionFilter(UnhandledFilter);
 #elif defined(__APPLE__)
 	struct sigaction sa {};
 	sa.sa_sigaction = SignalHandler;
@@ -266,6 +312,7 @@ bool InstallHandler(Handler handler) {
 	          sigaction(SIGILL, &sa, nullptr) == 0;
 	if (!ok) {
 		g_handler.store(nullptr, std::memory_order_release);
+		g_final_handler.store(nullptr, std::memory_order_release);
 		g_install_state.store(0, std::memory_order_release);
 		printf("sigaction() failed to install the host fault handler\n");
 		return false;
@@ -280,6 +327,7 @@ bool InstallHandler(Handler handler) {
 	for (const int signal_number: {SIGSEGV, SIGBUS, SIGILL}) {
 		if (::sigaction(signal_number, &action, nullptr) != 0) {
 			g_handler.store(nullptr, std::memory_order_release);
+			g_final_handler.store(nullptr, std::memory_order_release);
 			g_install_state.store(0, std::memory_order_release);
 			printf("sigaction(%d) failed\n", signal_number);
 			return false;

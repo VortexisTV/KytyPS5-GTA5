@@ -234,6 +234,8 @@ struct ShaderMappedData {
 
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
+// Unlike the internal lookup, a program the guest never registered is a miss, not a fatal error.
+bool ShaderTryGetMappedData(uint64_t addr, ShaderMappedData& data);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);

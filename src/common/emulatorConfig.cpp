@@ -87,6 +87,10 @@ bool CommandBufferDumpEnabled() {
 	return g_config->command_buffer_dump_enabled;
 }
 
+std::filesystem::path GetSkippedShaderDumpFolder() {
+	return g_config->skipped_shader_dump_folder;
+}
+
 std::filesystem::path GetCommandBufferDumpFolder() {
 	return g_config->command_buffer_dump_folder;
 }
@@ -105,6 +109,10 @@ std::filesystem::path GetPrintfOutputFile() {
 
 ProfilerDirection GetProfilerDirection() {
 	return g_config->profiler_direction;
+}
+
+bool PerfStatsEnabled() {
+    return g_config->perf_stats_enabled;
 }
 
 bool SpirvDebugPrintfEnabled() {
@@ -131,7 +139,7 @@ bool HotPageTrackingEnabled() {
 	return g_config->hot_page_tracking;
 }
 
-bool AsyncShadersEnabled() {
+AsyncShaders GetAsyncShaders() {
 	return g_config->async_shaders;
 }
 

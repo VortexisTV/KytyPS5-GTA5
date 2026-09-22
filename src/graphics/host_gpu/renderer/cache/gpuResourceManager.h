@@ -7,7 +7,9 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
+#include <atomic>
 #include <cstdint>
+#include <optional>
 #include <shared_mutex>
 
 namespace Libs::Graphics {
@@ -44,6 +46,8 @@ private:
 	TextureCache              m_texture_cache;
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
+	std::atomic_uint64_t      m_mapping_epoch {0};
+	std::optional<uint64_t>   m_bda_epoch; // synchronization epoch of the last complete BDA pass
 	GuestGpu*                 m_gpu = nullptr;
 	bool                      m_fault_process_pending = false;
 };

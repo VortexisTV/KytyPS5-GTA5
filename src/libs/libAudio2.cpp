@@ -1,6 +1,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/threads.h"
 #include "kernel/pthread.h"
 #include "libs/audio.h"
@@ -12,6 +13,7 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <optional>
 #include <vector>
 
 namespace Libs::Audio {
@@ -176,6 +178,8 @@ struct AudioOut2ContextState {
 	uint32_t               queued      = 0;
 	uint32_t               num_grains  = 512;
 	uint64_t               last_update = 0;
+	// PerfStats clock at the last accepted push, for the gap between pushes.
+	uint64_t               last_push   = 0;
 };
 
 struct AudioOut2PortStateEntry {
@@ -347,6 +351,37 @@ static bool audioout2_context_has_queueable_device(AudioOut2ContextHandle ctx) {
 	return false;
 }
 
+// Audio still queued on the host devices of the context's PCM ports, in microseconds. The
+// least-filled device runs dry first, so it decides. Empty when no such port has a device.
+static std::optional<uint64_t> audioout2_context_device_queue_micros(AudioOut2ContextHandle ctx) {
+	std::array<int, AudioInternal::OUT_PORTS_MAX> handles {};
+	size_t                                        handles_num = 0;
+	g_audioout2_port_mutex.Lock();
+	for (const auto& state: g_audioout2_ports) {
+		if (state.used && state.context == ctx && state.audio_handle > 0 &&
+		    state.pcm_data != nullptr && handles_num < handles.size()) {
+			handles[handles_num++] = state.audio_handle;
+		}
+	}
+	g_audioout2_port_mutex.Unlock();
+
+	std::optional<uint64_t> least;
+	for (size_t i = 0; i < handles_num; i++) {
+		if (AudioInternal::AudioOutHasDevice(handles[i])) {
+			const auto queued = AudioInternal::AudioOutQueuedMicros(handles[i]);
+			least             = least.has_value() ? std::min(*least, queued) : queued;
+		}
+	}
+	return least;
+}
+
+// How much audio a device keeps queued before an asynchronous push is refused: the target the
+// blocking path waits for, and never less than two grains.
+static uint64_t audioout2_device_cushion_micros(uint32_t num_grains) {
+	return std::max<uint64_t>(AudioInternal::OUTPUT_LATENCY_TARGET_US,
+	                          2u * static_cast<uint64_t>(audioout2_grain_micros(num_grains)));
+}
+
 static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool blocking) {
 	std::vector<AudioInternal::OutputParam> params;
 	params.reserve(AudioInternal::OUT_PORTS_MAX);
@@ -504,24 +539,44 @@ int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t bloc
 	uint32_t sleep_micros = audioout2_grain_micros(512);
 
 	for (;;) {
-		// Only a synchronous submission carrying PCM to a real device can rely on the SDL queue for
-		// pacing. Async pushes must retain queue-depth backpressure, and a handle without PCM (or a
-		// vibration/failed-open handle) has no downstream operation that can block this call.
+		// A push carrying PCM to a real device follows that device. A synchronous push waits in the
+		// output backend for room in the device queue. An asynchronous one is accepted while the
+		// device holds no more than the latency cushion: pacing it by queue depth alone keeps only
+		// queue_depth grains ahead of playback, less than one host device period for small grains,
+		// so any late push would leave the device without samples. A handle without PCM (or a
+		// vibration/failed-open handle) has no device to follow and keeps the modelled queue.
 		const bool use_device_clock =
 		    blocking != 0 && audioout2_context_has_queueable_device(ctx);
+		std::optional<uint64_t> device_queue;
+		if (blocking == 0) {
+			device_queue = audioout2_context_device_queue_micros(ctx);
+		}
 
 		g_audioout2_context_mutex.Lock();
 		if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
 			audioout2_update_context_locked(state);
 			sleep_micros = audioout2_grain_micros(state->num_grains);
-			if (state->queued < state->queue_depth || use_device_clock) {
+			const bool accepted =
+			    device_queue.has_value()
+			        ? *device_queue <= audioout2_device_cushion_micros(state->num_grains)
+			        : state->queued < state->queue_depth || use_device_clock;
+			if (accepted) {
 				if (state->queued == 0) {
 					state->last_update = LibKernel::KernelGetProcessTime();
 				}
 				if (state->queued < state->queue_depth) {
 					state->queued++;
 				}
+				if (PerfStats::Enabled()) {
+					const auto now = PerfStats::Now();
+					if (state->last_push != 0) {
+						PerfStats::Record(PerfStats::SpanId::AudioPushGap, now - state->last_push);
+					}
+					state->last_push = now;
+				}
 				g_audioout2_context_mutex.Unlock();
+				PerfStats::Add(blocking != 0 ? PerfStats::CounterId::AudioPushesSync
+				                             : PerfStats::CounterId::AudioPushesAsync);
 				audioout2_queue_context_audio(ctx, blocking != 0);
 				return OK;
 			}
@@ -529,6 +584,7 @@ int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t bloc
 		g_audioout2_context_mutex.Unlock();
 
 		if (blocking == 0) {
+			PerfStats::Add(PerfStats::CounterId::AudioPushesNotReady);
 			return AUDIO_OUT2_ERROR_NOT_READY;
 		}
 
@@ -538,6 +594,7 @@ int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t bloc
 
 int KYTY_SYSV_ABI AudioOut2ContextGetQueueLevel(AudioOut2ContextHandle ctx, uint32_t* queue_level,
                                                 uint32_t* available_queues) {
+	const auto device_queue = audioout2_context_device_queue_micros(ctx);
 	if (queue_level != nullptr) {
 		*queue_level = 0;
 	}
@@ -548,12 +605,21 @@ int KYTY_SYSV_ABI AudioOut2ContextGetQueueLevel(AudioOut2ContextHandle ctx, uint
 	g_audioout2_context_mutex.Lock();
 	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
 		audioout2_update_context_locked(state);
+		// With a device behind the context, only audio beyond the latency cushion counts as queued.
+		uint32_t level = state->queued;
+		if (device_queue.has_value()) {
+			const auto cushion = audioout2_device_cushion_micros(state->num_grains);
+			const auto grain   = static_cast<uint64_t>(audioout2_grain_micros(state->num_grains));
+			const auto excess  = *device_queue > cushion ? *device_queue - cushion : 0;
+			level               = static_cast<uint32_t>(
+			    std::min<uint64_t>((excess + grain - 1) / grain, state->queue_depth));
+		}
 		if (queue_level != nullptr) {
-			*queue_level = state->queued;
+			*queue_level = level;
 		}
 		if (available_queues != nullptr) {
 			*available_queues =
-			    (state->queued < state->queue_depth ? state->queue_depth - state->queued : 0);
+			    (level < state->queue_depth ? state->queue_depth - level : 0);
 		}
 	}
 	g_audioout2_context_mutex.Unlock();

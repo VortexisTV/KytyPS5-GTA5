@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "gpu_tiler_shaders/fault_buffer_process_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -88,6 +89,7 @@ FaultManager::~FaultManager() {
 }
 
 void FaultManager::ProcessFaultBuffer() {
+	const GpuWaitScope wait_scope(PerfStats::SpanId::GpuWaitFaults);
 	if (const auto wait_tick = m_fault_areas[m_current_area]; wait_tick != 0) {
 		m_scheduler.Wait(wait_tick);
 		m_scheduler.PopPendingOperations();

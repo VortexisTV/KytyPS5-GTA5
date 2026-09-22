@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include "common/assert.h"
+#include "common/perfStats.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
@@ -1669,6 +1670,7 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 		}
 		return true;
 	}
+	PerfStats::Add(PerfStats::CounterId::SrtInterpreted);
 	std::vector<DescriptorValue> slow_results;
 	std::vector<uint32_t>        slow_flat;
 	const bool slow_ok = EvaluateRuntimeSourcesInterpreted(program, sources, runtime, slow_results,

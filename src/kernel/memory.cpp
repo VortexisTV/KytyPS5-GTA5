@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/magicEnum.h"
+#include "common/perfStats.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -270,7 +271,7 @@ public:
 
 	bool Add(uint64_t start, uint64_t size, uint64_t offset, int protection, int memory_type,
 	         VirtualRangeType type, const char* name, bool disallow_merge = false) {
-		Common::LockGuard lock(m_mutex);
+		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapEdit);
 
 		if (start == 0 || size == 0) {
 			return false;
@@ -300,27 +301,25 @@ public:
 	}
 
 	bool Remove(uint64_t start, uint64_t size) {
-		Common::LockGuard lock(m_mutex);
+		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapEdit);
 
 		auto position = LowerBound(start);
 		if (position != m_ranges.end() && position->start == start && position->size == size) {
 			m_ranges.erase(position);
 			return true;
 		}
-		auto removed = RemoveUnlocked(start, size);
-		MergeUnlocked();
-		return removed;
+		return RemoveUnlocked(start, size);
 	}
 
 	bool HasOverlap(uint64_t start, uint64_t size) {
-		Common::LockGuard lock(m_mutex);
+		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapQuery);
 
 		return FindOverlap(start, size) != nullptr;
 	}
 
 	bool QueryOverlap(uint64_t start, uint64_t size, Range* out) {
 		EXIT_IF(out == nullptr);
-		Common::LockGuard lock(m_mutex);
+		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapQuery);
 
 		const auto* overlap = FindOverlap(start, size);
 		if (overlap == nullptr) {
@@ -331,37 +330,39 @@ public:
 	}
 
 	bool ReleaseReserved(uint64_t start, uint64_t size) {
-		Common::LockGuard lock(m_mutex);
+		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapEdit);
 
-		for (size_t index = 0; index < m_ranges.size(); index++) {
-			auto& r = m_ranges[index];
-			if (r.start == start && r.size == size && IsReservedRangeType(r.type)) {
-				m_ranges.erase(m_ranges.begin() + static_cast<std::ptrdiff_t>(index));
-				return true;
-			}
+		auto position = LowerBound(start);
+		if (position != m_ranges.end() && position->start == start && position->size == size &&
+		    IsReservedRangeType(position->type)) {
+			m_ranges.erase(position);
 		}
 		return true;
 	}
 
 	bool ConsumeReserved(uint64_t start, uint64_t size,
 	                     VirtualRangeType type = VirtualRangeType::Reserved) {
-		Common::LockGuard lock(m_mutex);
+		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapEdit);
 
 		auto end = End(start, size);
-		for (const auto& r: m_ranges) {
-			if (r.type == type && start >= r.start && end <= End(r.start, r.size)) {
-				RemoveUnlocked(start, size);
-				MergeUnlocked();
-				return true;
-			}
+		if (size == 0) {
+			// Nothing to consume; report whether a range of the type touches start.
+			return std::any_of(m_ranges.begin(), m_ranges.end(), [&](const Range& r) {
+				return r.type == type && start >= r.start && end <= End(r.start, r.size);
+			});
 		}
-
-		return false;
+		const auto index = FindContaining(start);
+		if (index == m_ranges.size() || m_ranges[index].type != type ||
+		    end > End(m_ranges[index].start, m_ranges[index].size)) {
+			return false;
+		}
+		RemoveUnlocked(start, size);
+		return true;
 	}
 
 	bool ConsumeReservedSpan(uint64_t start, uint64_t size, Range* first_range = nullptr,
 	                         VirtualRangeType type = VirtualRangeType::Reserved) {
-		Common::LockGuard lock(m_mutex);
+		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapEdit);
 
 		if (size == 0) {
 			return false;
@@ -370,29 +371,23 @@ public:
 		auto current = start;
 		auto end     = End(start, size);
 		while (current < end) {
-			const Range* candidate = nullptr;
-			for (const auto& r: m_ranges) {
-				if (r.type == type && current >= r.start && current < End(r.start, r.size)) {
-					candidate = &r;
-					break;
-				}
-			}
-			if (candidate == nullptr) {
+			const auto index = FindContaining(current);
+			if (index == m_ranges.size() || m_ranges[index].type != type) {
 				return false;
 			}
+			const auto& candidate = m_ranges[index];
 			if (current == start && first_range != nullptr) {
-				*first_range = *candidate;
+				*first_range = candidate;
 			}
-			current = std::min(end, End(candidate->start, candidate->size));
+			current = std::min(end, End(candidate.start, candidate.size));
 		}
 
 		RemoveUnlocked(start, size);
-		MergeUnlocked();
 		return true;
 	}
 
 	void Rename(uint64_t start, uint64_t size, const char* name) {
-		Common::LockGuard lock(m_mutex);
+		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapEdit);
 
 		auto position = LowerBound(start);
 		if (position != m_ranges.end() && position->start == start && position->size == size) {
@@ -404,13 +399,13 @@ public:
 	}
 
 	void Protect(uint64_t start, uint64_t size, int protection) {
-		Common::LockGuard lock(m_mutex);
+		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapEdit);
 
 		EditUnlocked(start, size, [protection](Range* r) { r->protection = protection; });
 	}
 
 	void SetMemoryType(uint64_t start, uint64_t size, int memory_type) {
-		Common::LockGuard lock(m_mutex);
+		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapEdit);
 
 		EditUnlocked(start, size, [memory_type](Range* r) { r->memory_type = memory_type; });
 	}
@@ -418,7 +413,7 @@ public:
 	bool Query(uint64_t addr, int flags, Range* out) {
 		EXIT_IF(out == nullptr);
 
-		Common::LockGuard lock(m_mutex);
+		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapQuery);
 
 		auto next = std::upper_bound(
 		    m_ranges.begin(), m_ranges.end(), addr,
@@ -441,7 +436,7 @@ public:
 	bool QuerySpan(uint64_t start, uint64_t size, std::vector<Range>* out) {
 		EXIT_IF(out == nullptr);
 
-		Common::LockGuard lock(m_mutex);
+		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapQuery);
 		out->clear();
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
@@ -508,7 +503,17 @@ public:
 	}
 
 	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
-		Common::LockGuard lock(m_mutex);
+		// Range checks come from the emulated GPU thread (shader buffers and vertex ranges): time
+		// how long they wait while another operation holds the map.
+		if (!m_mutex.TryLock()) {
+			PerfStats::Span wait(PerfStats::SpanId::VirtualMapWait);
+			m_mutex.Lock();
+		}
+		struct Unlock {
+			Common::Mutex& mutex;
+			~Unlock() { mutex.Unlock(); }
+		} unlock {m_mutex};
+		PerfStats::Set(PerfStats::GaugeId::VirtualRanges, m_ranges.size());
 
 		if (virtual_addr == 0 || size == 0 || size > UINT64_MAX - virtual_addr) {
 			return 0;
@@ -544,7 +549,7 @@ public:
 	}
 
 	uint64_t CountPageTableEntries(bool gpu) {
-		Common::LockGuard lock(m_mutex);
+		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapQuery);
 
 		uint64_t used = 0;
 		for (const auto& r: m_ranges) {
@@ -638,20 +643,18 @@ private:
 			return;
 		}
 
-		std::vector<Range> out;
-		auto               edit_end = End(start, size);
+		const auto [first, last] = OverlapBlock(start, size);
+		const auto edit_end      = End(start, size);
 
-		for (const auto& r: m_ranges) {
-			auto r_end = End(r.start, r.size);
-			if (!VirtualRangesOverlap(start, size, r.start, r.size)) {
-				out.push_back(r);
-				continue;
-			}
+		std::vector<Range> pieces;
+		for (size_t index = first; index < last; index++) {
+			const auto& r     = m_ranges[index];
+			const auto  r_end = End(r.start, r.size);
 
 			auto mid_start = std::max(start, r.start);
 			auto mid_end   = std::min(edit_end, r_end);
 
-			AddPiece(&out, r, r.start, mid_start);
+			AddPiece(&pieces, r, r.start, mid_start);
 
 			Range mid = r;
 			mid.start = mid_start;
@@ -660,13 +663,14 @@ private:
 				mid.offset += mid_start - r.start;
 			}
 			edit(&mid);
-			out.push_back(mid);
+			pieces.push_back(mid);
 
-			AddPiece(&out, r, mid_end, r_end);
+			AddPiece(&pieces, r, mid_end, r_end);
 		}
 
-		m_ranges = out;
-		MergeUnlocked();
+		if (first != last) {
+			SpliceUnlocked(first, last, pieces);
+		}
 	}
 
 	bool RemoveUnlocked(uint64_t start, uint64_t size) {
@@ -674,46 +678,93 @@ private:
 			return false;
 		}
 
-		std::vector<Range> out;
-		bool               removed = false;
-		auto               rem_end = End(start, size);
-
-		for (const auto& r: m_ranges) {
-			auto r_end = End(r.start, r.size);
-			if (!VirtualRangesOverlap(start, size, r.start, r.size)) {
-				out.push_back(r);
-				continue;
-			}
-
-			removed = true;
-			AddPiece(&out, r, r.start, std::max(start, r.start));
-			AddPiece(&out, r, std::min(rem_end, r_end), r_end);
+		const auto [first, last] = OverlapBlock(start, size);
+		if (first == last) {
+			return false;
 		}
 
-		m_ranges = out;
-		return removed;
+		// Only the first overlapping range can keep a head and only the last a tail.
+		const auto         rem_end = End(start, size);
+		const auto&        head    = m_ranges[first];
+		const auto&        tail    = m_ranges[last - 1];
+		std::vector<Range> pieces;
+		AddPiece(&pieces, head, head.start, std::max(start, head.start));
+		AddPiece(&pieces, tail, std::min(rem_end, End(tail.start, tail.size)),
+		         End(tail.start, tail.size));
+		SpliceUnlocked(first, last, pieces);
+		return true;
 	}
 
-	void MergeUnlocked() {
-		if (m_ranges.size() < 2) {
-			return;
+	// Index of the first range that starts after addr.
+	size_t UpperBound(uint64_t addr) const {
+		const auto next = std::upper_bound(
+		    m_ranges.begin(), m_ranges.end(), addr,
+		    [](uint64_t value, const Range& range) { return value < range.start; });
+		return static_cast<size_t>(next - m_ranges.begin());
+	}
+
+	// Index of the range containing addr, or m_ranges.size() if none does.
+	size_t FindContaining(uint64_t addr) const {
+		const auto next = UpperBound(addr);
+		if (next == 0 || addr >= End(m_ranges[next - 1].start, m_ranges[next - 1].size)) {
+			return m_ranges.size();
 		}
+		return next - 1;
+	}
 
-		std::sort(m_ranges.begin(), m_ranges.end(),
-		          [](const Range& left, const Range& right) { return left.start < right.start; });
+	// The ranges overlapping [start, start + size), which are always contiguous: [first, last).
+	std::pair<size_t, size_t> OverlapBlock(uint64_t start, uint64_t size) const {
+		const auto end   = End(start, size);
+		auto       first = UpperBound(start);
+		if (first != 0 && start < End(m_ranges[first - 1].start, m_ranges[first - 1].size)) {
+			first--;
+		}
+		auto last = first;
+		while (last < m_ranges.size() && m_ranges[last].start < end) {
+			last++;
+		}
+		return {first, last};
+	}
 
+	// Replaces m_ranges[first, last) with pieces and merges what became mergeable. The map is
+	// always fully merged outside an edit, so merging the pieces with each other and with the one
+	// neighbour on each side gives the same map as merging everything.
+	void SpliceUnlocked(size_t first, size_t last, const std::vector<Range>& pieces) {
+		const size_t       begin = first != 0 ? first - 1 : first;
+		const size_t       end   = last < m_ranges.size() ? last + 1 : last;
 		std::vector<Range> merged;
-		for (const auto& r: m_ranges) {
+		merged.reserve(pieces.size() + 2);
+		const auto append = [&merged](const Range& r) {
 			if (!merged.empty()) {
-				auto& last = merged[merged.size() - 1];
-				if (End(last.start, last.size) == r.start && SameMergeKey(last, r)) {
-					last.size += r.size;
-					continue;
+				auto& previous = merged.back();
+				if (End(previous.start, previous.size) == r.start && SameMergeKey(previous, r)) {
+					previous.size += r.size;
+					return;
 				}
 			}
 			merged.push_back(r);
+		};
+		if (begin != first) {
+			append(m_ranges[begin]);
 		}
-		m_ranges = merged;
+		for (const auto& piece: pieces) {
+			append(piece);
+		}
+		if (end != last) {
+			append(m_ranges[last]);
+		}
+
+		const auto old_count = end - begin;
+		const auto kept      = std::min(old_count, merged.size());
+		std::copy(merged.begin(), merged.begin() + static_cast<std::ptrdiff_t>(kept),
+		          m_ranges.begin() + static_cast<std::ptrdiff_t>(begin));
+		if (merged.size() > old_count) {
+			m_ranges.insert(m_ranges.begin() + static_cast<std::ptrdiff_t>(begin + old_count),
+			                merged.begin() + static_cast<std::ptrdiff_t>(old_count), merged.end());
+		} else {
+			m_ranges.erase(m_ranges.begin() + static_cast<std::ptrdiff_t>(begin + merged.size()),
+			               m_ranges.begin() + static_cast<std::ptrdiff_t>(end));
+		}
 	}
 
 	Range* FindOverlap(uint64_t start, uint64_t size) {
@@ -730,6 +781,15 @@ private:
 		}
 		return nullptr;
 	}
+
+	// Every operation other than a range check holds m_mutex through Hold, which, with PerfStats
+	// on, records how long the operation kept the lock.
+	struct Hold {
+		Hold(Common::Mutex& mutex, PerfStats::SpanId id): lock(mutex), span(id) {}
+
+		Common::LockGuard lock;
+		PerfStats::Span   span;
+	};
 
 	std::vector<Range> m_ranges;
 	Common::Mutex      m_mutex;
@@ -4468,6 +4528,10 @@ int KYTY_SYSV_ABI KernelMemoryPoolGetBlockStats(KernelMemoryPoolBlockStats* outp
 	}
 
 	return OK;
+}
+
+bool IsGuestAddress(uint64_t vaddr) noexcept {
+	return vaddr >= HOST_SYSTEM_MANAGED_MIN && vaddr <= HOST_USER_MAX;
 }
 
 bool WaitForMappingTransition(uint64_t vaddr) noexcept {

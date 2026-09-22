@@ -3,6 +3,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -10,6 +11,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/frameDump.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -265,6 +267,7 @@ static bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input, Com
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode) {
+	PerfStats::Span dispatch_span(PerfStats::SpanId::Dispatch);
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();
@@ -458,6 +461,41 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+
+	if (const auto watched = FrameDumpWatchAddress(); watched != 0) {
+		auto&      texture_cache = m_context.GetTextureCache();
+		const auto address_of    = [&](ImageId id) -> uint64_t {
+			const auto* image = texture_cache.m_slot_images.try_get(id);
+			return image != nullptr ? image->info.data.address : 0;
+		};
+		const bool writes_watched =
+		    std::any_of(bindings.resources.images.begin(), bindings.resources.images.end(),
+		                [&](const auto& binding) {
+			                return binding.desc.type == TextureCache::BindingType::Storage &&
+			                       address_of(binding.image_id) == watched;
+		                });
+		if (writes_watched) {
+			// What it read matters as much as what it wrote: an input that already holds nonsense
+			// moves the question one pass upstream.
+			std::string details = "buffers:";
+			for (const auto& buffer_binding: bindings.buffer_bindings) {
+				details += fmt::format(" 0x{:010x}/{}", buffer_binding.descriptor.Base48(),
+				                       buffer_binding.extent);
+			}
+			FrameDumpWatchOperation(m_context, watched, "Dispatch",
+			                        sh_ctx.GetCs().cs_regs.data_addr, 0, details);
+			for (const auto& binding: bindings.resources.images) {
+				const auto address = address_of(binding.image_id);
+				if (address == 0 || address == watched) {
+					continue;
+				}
+				FrameDumpWatchInput(m_context, address,
+				                    binding.desc.type == TextureCache::BindingType::Storage
+				                        ? "storage"
+				                        : "sampled");
+			}
+		}
+	}
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);

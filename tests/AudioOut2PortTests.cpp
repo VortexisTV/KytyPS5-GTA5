@@ -25,6 +25,10 @@ int                     g_next_device  = 1;
 int                     g_open_waiters = 0;
 bool                    g_block_opens  = false;
 
+// Modelled host device queue: every output adds g_output_micros of audio to it.
+uint64_t g_device_queue_micros = 0;
+uint64_t g_output_micros       = 0;
+
 void Check(bool value, const char* text) {
 	if (!value) {
 		std::fprintf(stderr, "AudioOut2PortTests: failed: %s\n", text);
@@ -146,6 +150,12 @@ std::vector<bool> OutputCalls() {
 	return g_output_blocking;
 }
 
+void SetDeviceQueue(uint64_t queued_micros, uint64_t output_micros) {
+	std::lock_guard lock(g_device_mutex);
+	g_device_queue_micros = queued_micros;
+	g_output_micros       = output_micros;
+}
+
 void TestSlotReuse() {
 	const auto context = CreateContext();
 	const auto param   = MakeParam();
@@ -258,7 +268,7 @@ void TestSynchronousDevicePushBypassesModelledQueue() {
 	AudioOut2::AudioOut2ContextDestroy(context);
 }
 
-void TestAsynchronousDevicePushKeepsQueueBounded() {
+void TestAsynchronousDevicePushFollowsDeviceQueue() {
 	const auto context = CreateContext(1);
 	const auto param   = MakeParam();
 	AudioOut2::AudioOut2PortHandle port = 0;
@@ -268,19 +278,31 @@ void TestAsynchronousDevicePushKeepsQueueBounded() {
 	uint32_t pcm[512] {};
 	SetPcm(port, pcm);
 	ResetOutputCalls();
+	// 512-sample grains last 10666 us; the device keeps 40000 us queued before refusing pushes.
+	SetDeviceQueue(0, 10666);
 
-	Check(AudioOut2::AudioOut2ContextPush(context, 0) == OK, "first async push failed");
-	Check(AudioOut2::AudioOut2ContextPush(context, 0) != OK,
-	      "full async queue accepted another buffer");
+	uint32_t accepted = 0;
+	while (AudioOut2::AudioOut2ContextPush(context, 0) == OK) {
+		accepted++;
+		Check(accepted <= 16, "async pushes to a device were never refused");
+	}
+	Check(accepted == 4, "async pushes did not fill the device up to its latency cushion");
 	const auto calls = OutputCalls();
-	Check(calls.size() == 1 && !calls[0], "rejected async push reached the device backend");
+	Check(calls.size() == 4 && std::ranges::none_of(calls, [](bool blocking) { return blocking; }),
+	      "async pushes did not reach the device backend without blocking");
 
 	uint32_t queued    = 0;
 	uint32_t available = 0;
 	Check(AudioOut2::AudioOut2ContextGetQueueLevel(context, &queued, &available) == OK,
 	      "queue-level query failed");
-	Check(queued == 1 && available == 0, "async queue level does not match accepted pushes");
+	Check(queued == 1 && available == 0,
+	      "queue level does not report the audio beyond the device cushion");
 
+	SetDeviceQueue(30000, 10666);
+	Check(AudioOut2::AudioOut2ContextPush(context, 0) == OK,
+	      "async push was refused after the device drained");
+
+	SetDeviceQueue(0, 0);
 	AudioOut2::AudioOut2PortDestroy(port);
 	AudioOut2::AudioOut2ContextDestroy(context);
 }
@@ -300,6 +322,61 @@ void TestHandleWithoutPcmDoesNotBypassQueue() {
 
 	AudioOut2::AudioOut2PortDestroy(port);
 	AudioOut2::AudioOut2ContextDestroy(context);
+}
+
+void TestOutputQueueTarget() {
+	using Libs::Audio::AudioInternal::OutputQueueTargetBytes;
+	// 256-frame grains at 48 kHz last 5333 us: 8 of them cover the 40 ms target.
+	Check(OutputQueueTargetBytes(2048, 5333) == 8 * 2048, "short grains miss the latency target");
+	Check(OutputQueueTargetBytes(8192, 21333) == 2 * 8192, "long grains miss the latency target");
+	Check(OutputQueueTargetBytes(4096, 50000) == 2 * 4096, "fewer than two grains are kept");
+	Check(OutputQueueTargetBytes(64, 1000) == 16 * 64, "tiny grains are not capped at 16");
+	Check(OutputQueueTargetBytes(512, 0) == 2 * 512, "unknown grain length is not two grains");
+}
+
+// A pseudo-random delay for the next grain: 0 to 239 frames, up to 5 ms at 48 kHz.
+uint32_t NextLateness(uint32_t* state) {
+	*state = *state * 1103515245u + 12345u;
+	return (*state >> 16u) % 240u;
+}
+
+// A device that plays 480-frame periods (10 ms at 48 kHz, the Windows shared-mode period), fed
+// 256-frame grains at exactly its playback rate, each up to 5 ms late, so the game never runs
+// ahead of it. Returns the periods that found fewer frames queued than they play.
+uint32_t CountStarvedPeriods(bool lead_in, uint32_t period_phase) {
+	constexpr uint32_t GRAIN  = 256;
+	constexpr uint32_t PERIOD = 480;
+
+	uint32_t random    = 12345;
+	uint32_t queued    = 0;
+	uint32_t starved   = 0;
+	uint32_t grains    = 0;
+	uint32_t next_push = NextLateness(&random);
+	for (uint32_t frame = 0; frame < 4 * 48000; frame++) {
+		while (frame >= next_push) {
+			if (lead_in) {
+				queued += Libs::Audio::AudioInternal::OutputLeadInBytes(queued, GRAIN, 5333);
+			}
+			queued += GRAIN;
+			next_push = ++grains * GRAIN + NextLateness(&random);
+		}
+		if (grains != 0 && frame % PERIOD == period_phase) {
+			if (queued < PERIOD) {
+				starved++;
+			}
+			queued -= std::min(queued, PERIOD);
+		}
+	}
+	return starved;
+}
+
+void TestLeadInKeepsRealTimeStreamFed() {
+	uint32_t starved_without = 0;
+	for (uint32_t phase = 0; phase < 480; phase += 16) {
+		starved_without += CountStarvedPeriods(false, phase);
+		Check(CountStarvedPeriods(true, phase) == 0, "a stream fed at its playback rate ran dry");
+	}
+	Check(starved_without > 0, "the model no longer starves a stream that has no lead-in");
 }
 
 } // namespace
@@ -341,7 +418,13 @@ bool AudioOutHasDevice(int handle) {
 uint32_t AudioOutOutputs(const OutputParam* /*params*/, uint32_t /*num*/, bool blocking) {
 	std::lock_guard lock(g_device_mutex);
 	g_output_blocking.push_back(blocking);
+	g_device_queue_micros += g_output_micros;
 	return 0;
+}
+
+uint64_t AudioOutQueuedMicros(int /*handle*/) {
+	std::lock_guard lock(g_device_mutex);
+	return g_device_queue_micros;
 }
 
 } // namespace Libs::Audio::AudioInternal
@@ -361,8 +444,10 @@ int main() {
 	TestConcurrentCreates();
 	TestContextDestroyCancelsPendingCreate();
 	TestSynchronousDevicePushBypassesModelledQueue();
-	TestAsynchronousDevicePushKeepsQueueBounded();
+	TestAsynchronousDevicePushFollowsDeviceQueue();
 	TestHandleWithoutPcmDoesNotBypassQueue();
+	TestOutputQueueTarget();
+	TestLeadInKeepsRealTimeStreamFed();
 	std::printf("AudioOut2PortTests: all cases passed\n");
 	return 0;
 }

@@ -785,6 +785,235 @@ void TestFullRegionGpuUnmarkBatching() {
   Release(page_manager, memory, region_size * 2);
 }
 
+void TestUploadCandidates() {
+  constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  auto *memory = Allocate(page_manager, region_size * 2 / page_size);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto boundary = (address & ~(region_size - 1)) + region_size;
+  std::vector<GuestRange> candidates;
+  const auto collect = [&](uint64_t start, uint64_t size) {
+    candidates.push_back({start, size});
+  };
+  const auto epoch = tracker.UploadEpoch();
+  tracker.ForEachUploadCandidateRange(boundary - 7, 14, collect);
+  Check(candidates ==
+                std::vector<GuestRange>{{boundary - 7, 7}, {boundary, 7}} &&
+            tracker.UploadEpoch() == epoch,
+        "uncreated candidate regions were not clipped or query created state");
+  tracker.ForEachUploadRange(
+      address, region_size * 2, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  candidates.clear();
+  tracker.ForEachUploadCandidateRange(address, region_size * 2, collect);
+  Check(candidates.empty(), "clean pages were selected for upload");
+
+  tracker.MarkRegionAsCpuModified(boundary - page_size, page_size * 2);
+  candidates.clear();
+  tracker.ForEachUploadCandidateRange(boundary - 7, 14, collect);
+  Check(candidates == std::vector<GuestRange>{{boundary - 7, 7}, {boundary, 7}},
+        "dirty candidate snapshot escaped its requested range");
+  // Uploading from inside the callback must be safe and must leave the next
+  // walk empty. Discovery itself must not consume dirty state.
+  uint32_t uploaded = 0;
+  tracker.ForEachUploadCandidateRange(
+      address, region_size * 2, [&](uint64_t start, uint64_t size) {
+        tracker.ForEachUploadRange(
+            start, size, false,
+            [&](uint64_t, uint64_t) noexcept { uploaded++; }, []() noexcept {});
+      });
+  Check(uploaded == 2, "candidate discovery consumed dirty state");
+  candidates.clear();
+  tracker.ForEachUploadCandidateRange(address, region_size * 2, collect);
+  Check(candidates.empty(), "uploaded pages remained candidates");
+  tracker.MarkRegionAsGpuModified(address, page_size);
+  tracker.ForEachUploadCandidateRange(address, page_size, collect);
+  Check(candidates.empty(), "GPU-owned page was selected for CPU upload");
+  tracker.UnmarkRegionAsGpuModified(address, page_size);
+  tracker.UntrackMemory(address, region_size * 2);
+  Release(page_manager, memory, region_size * 2);
+}
+
+// Optional CPU-only benchmark of the old per-buffer tracker walk versus the
+// candidate walk. It deliberately excludes Vulkan uploads and gameplay timing.
+void BenchmarkUploadCandidates() {
+  constexpr uint64_t buffer_size = 16 * 1024;
+  constexpr uint64_t buffer_count = 8192;
+  constexpr uint64_t size = buffer_size * buffer_count;
+  constexpr int passes = 200;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &pages = harness.page_manager;
+  auto *memory = Allocate(pages, size / pages.GetPageSize());
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto range = [](uint64_t, uint64_t) noexcept {};
+  const auto upload = []() noexcept {};
+  tracker.ForEachUploadRange(address, size, false, range, upload);
+  const auto measure = [&](bool candidates) {
+    const auto started = std::chrono::steady_clock::now();
+    for (int pass = 0; pass < passes; pass++) {
+      Libs::Graphics::RegionManager::AdvanceGeneration();
+      if (candidates) {
+        tracker.ForEachUploadCandidateRange(address, size,
+            [&](uint64_t start, uint64_t bytes) {
+              tracker.ForEachUploadRange(start, bytes, false, range, upload);
+            });
+      } else {
+        for (uint64_t offset = 0; offset < size; offset += buffer_size) {
+          tracker.ForEachUploadRange(address + offset, buffer_size, false,
+                                    range, upload);
+        }
+      }
+    }
+    return std::chrono::duration<double, std::micro>(
+               std::chrono::steady_clock::now() - started).count() / passes;
+  };
+  for (int sample = 0; sample < 3; sample++) {
+    const auto full = measure(false);
+    const auto filtered = measure(true);
+    std::printf("Clean tracker pass (%llu buffers): full=%.2f us candidates=%.2f us\n",
+                static_cast<unsigned long long>(buffer_count), full, filtered);
+  }
+  tracker.UntrackMemory(address, size);
+  Release(pages, memory, size);
+}
+
+void TestUploadEpochTracksNewUploadWork() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  uint32_t ranges = 0;
+  const auto count_ranges = [&](uint64_t, uint64_t) noexcept { ranges++; };
+  const auto upload = []() noexcept {};
+
+  auto epoch = tracker.UploadEpoch();
+  Check(tracker.IsRegionCpuModified(address, page_size) &&
+            tracker.UploadEpoch() != epoch,
+        "a new CPU-dirty region did not advance the upload epoch");
+  tracker.ForEachUploadRange(address, page_size * 2, false, count_ranges,
+                             upload);
+  epoch = tracker.UploadEpoch();
+  ranges = 0;
+  tracker.ForEachUploadRange(address, page_size * 2, false, count_ranges,
+                             upload);
+  Check(ranges == 0 && tracker.UploadEpoch() == epoch,
+        "an upload with nothing to copy advanced the upload epoch");
+
+  tracker.MarkRegionAsCpuModified(address + 16, 32);
+  Check(tracker.UploadEpoch() != epoch,
+        "a page turning CPU-dirty did not advance the upload epoch");
+  epoch = tracker.UploadEpoch();
+  tracker.MarkRegionAsCpuModified(address, page_size);
+  tracker.InvalidateRegion(address + 64, 16, [] {});
+  Check(tracker.UploadEpoch() == epoch,
+        "re-marking a CPU-dirty page advanced the upload epoch");
+  tracker.InvalidateRegion(address + page_size + 16, 16, [] {});
+  Check(tracker.UploadEpoch() != epoch,
+        "invalidating a clean page did not advance the upload epoch");
+
+  epoch = tracker.UploadEpoch();
+  Libs::Graphics::RegionManager::AdvanceGeneration();
+  Check(tracker.UploadEpoch() != epoch,
+        "a new submission generation did not advance the upload epoch");
+  epoch = tracker.UploadEpoch();
+  tracker.ClearHotPages(address, page_size * 2);
+  Check(tracker.UploadEpoch() != epoch,
+        "resetting hot pages did not advance the upload epoch");
+  epoch = tracker.UploadEpoch();
+  tracker.UntrackMemory(address, page_size * 2);
+  Check(tracker.UploadEpoch() != epoch,
+        "untracking memory did not advance the upload epoch");
+  Release(page_manager, memory, page_size * 2);
+}
+
+void TestHotPagesCoolDown() {
+  using Libs::Graphics::RegionManager;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 1);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  uint32_t ranges = 0;
+  const auto count_ranges = [&](uint64_t, uint64_t) noexcept { ranges++; };
+  // A read-only binding of the page, as a BDA pass makes; returns the ranges it
+  // uploads.
+  const auto sync = [&]() {
+    ranges = 0;
+    tracker.ForEachUploadRange(address, page_size, false, count_ranges,
+                               []() noexcept {});
+    return ranges;
+  };
+  const auto next_generation = [&]() {
+    RegionManager::AdvanceGeneration();
+    return sync();
+  };
+  const auto write_fault = [&]() {
+    tracker.InvalidateRegion(address, 16, [] {});
+  };
+  // Hot pages stay hot while unchanged for fewer than 64 generations.
+  const auto stay_hot = [&](const char *text) {
+    for (int i = 1; i < 64; i++) {
+      Check(next_generation() == 0 && IsWritable(memory), text);
+    }
+  };
+
+  // Two write faults within the fault window make the page hot.
+  (void)sync();
+  write_fault();
+  (void)sync();
+  write_fault();
+  Check(sync() == 1 && IsWritable(memory),
+        "a new hot page was not uploaded or not left writable");
+  uint32_t candidates = 0;
+  const auto count_candidates = [&](uint64_t, uint64_t) { candidates++; };
+  tracker.ForEachUploadCandidateRange(address, page_size, count_candidates);
+  Check(candidates == 0, "already uploaded hot page was selected again");
+  RegionManager::AdvanceGeneration();
+  tracker.ForEachUploadCandidateRange(address, page_size, count_candidates);
+  Check(candidates == 1, "new generation did not select hot page for hashing");
+  Check(sync() == 0, "unchanged hot candidate was needlessly uploaded");
+  // The extra generation above counts toward the existing 64-generation
+  // cooldown.
+  write_fault();
+  memory[0] ^= 1;
+  RegionManager::AdvanceGeneration();
+  Check(sync() == 1, "changed hot candidate was not uploaded");
+  stay_hot("an unchanged hot page was uploaded or cooled down early");
+  Check(next_generation() == 0 && !IsWritable(memory) &&
+            !tracker.IsRegionCpuModified(address, page_size),
+        "a hot page unchanged for 64 generations did not cool down clean and "
+        "write-protected");
+  Check(next_generation() == 0, "a cooled-down page uploaded without a write");
+  write_fault();
+  Check(sync() == 1 && !IsWritable(memory),
+        "a write to a cooled-down page was not uploaded");
+
+  // A second fault within the window heats the page again. It uploads at its
+  // first hot check even though its contents match its old hash, and its
+  // quiet time restarts instead of cooling it down at once.
+  write_fault();
+  Check(sync() == 1 && IsWritable(memory),
+        "a page turning hot again reused its old hash or quiet time");
+  stay_hot("a re-heated hot page was uploaded or cooled down early");
+
+  // Contents that change as the page cools down are uploaded; the page still
+  // ends clean and write-protected.
+  memory[0] ^= 0xff;
+  Check(next_generation() == 1 && !IsWritable(memory) &&
+            !tracker.IsRegionCpuModified(address, page_size),
+        "a hot page that changed as it cooled down was not uploaded, clean and "
+        "write-protected");
+  tracker.UntrackMemory(address, page_size);
+  Release(page_manager, memory, page_size);
+}
+
 [[noreturn]] void RunDeathCase(const char *name) {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
@@ -865,6 +1094,11 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
 
 int main(int argc, char **argv) {
   Config::Initialize();
+  if (argc == 2 && std::strcmp(argv[1], "--benchmark-upload-candidates") == 0) {
+    BenchmarkUploadCandidates();
+    Config::Shutdown();
+    return 0;
+  }
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
   }
@@ -883,6 +1117,9 @@ int main(int argc, char **argv) {
   TestDownloadDoesNotSerializeDisjointRegion();
   TestGpuUnmarkUsesRegionMask();
   TestFullRegionGpuUnmarkBatching();
+  TestUploadEpochTracksNewUploadWork();
+  TestUploadCandidates();
+  TestHotPagesCoolDown();
   TestFatalPaths();
   Config::Shutdown();
   std::puts("MemoryTrackerTests: all cases passed");

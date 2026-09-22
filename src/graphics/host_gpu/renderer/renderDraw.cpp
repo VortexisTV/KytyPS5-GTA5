@@ -2,8 +2,10 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -15,6 +17,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/frameDump.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -41,6 +44,7 @@
 #include <optional>
 #include <span>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -448,6 +452,59 @@ static bool PixelShaderHasDepthOrCoverageSideEffects(const HW::ShaderRegisters& 
 	       db.shader_execute_on_noop;
 }
 
+// Writes the guest programs of a draw the renderer cannot run, once per address, so that the
+// stages it needs can be examined offline. Off unless --dump-skipped-shaders names a folder.
+static void DumpSkippedStageShaders(uint32_t stages, const HW::ShaderRegisters& sh_regs,
+                                    const HW::VertexShaderInfo& vertex_info) {
+	const auto folder = Config::GetSkippedShaderDumpFolder();
+	if (folder.empty()) {
+		return;
+	}
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> dumped;
+	const std::lock_guard               lock(mutex);
+	for (const auto& [name, address]: {
+	         std::pair {"ls", vertex_info.ls_regs.data_addr},
+	         std::pair {"hs", vertex_info.hs_regs.data_addr},
+	         std::pair {"es", vertex_info.es_regs.data_addr},
+	         std::pair {"gs", vertex_info.gs_regs.data_addr},
+	     }) {
+		if (address == 0 || !ShaderAddressValid(address) || !dumped.insert(address).second) {
+			continue;
+		}
+		ShaderMappedData data;
+		if (!ShaderTryGetMappedData(address, data) || data.code_size_bytes == 0) {
+			LOGF("Skipped %s shader 0x%016" PRIx64 " has no registered code size\n", name, address);
+			continue;
+		}
+		const auto path =
+		    folder / fmt::format("skipped_{}_{:016x}_stages_{:08x}.bin", name, address, stages);
+		Common::File::CreateDirectories(folder);
+		Common::File file(path);
+		if (file.IsInvalid()) {
+			LOGF("Can't create %s\n", Common::PathToString(path).c_str());
+			continue;
+		}
+		file.Write(reinterpret_cast<const void*>(address), data.code_size_bytes);
+		file.Close();
+		const auto registers = fmt::format(
+		    "stages=0x{:08x} ls=0x{:016x} hs=0x{:016x} es=0x{:016x} gs=0x{:016x}\n"
+		    "ls_hs_config=0x{:08x} tf_param=0x{:08x} tess_level_min=0x{:08x} "
+		    "tess_level_max=0x{:08x}\nhs_user_sgpr_count={} hs_lds_size={} code_bytes={}\n",
+		    stages, vertex_info.ls_regs.data_addr, vertex_info.hs_regs.data_addr,
+		    vertex_info.es_regs.data_addr, vertex_info.gs_regs.data_addr, sh_regs.m_vgtLsHsConfig,
+		    sh_regs.m_vgtTfParam, sh_regs.m_vgtHosMinTessLevel, sh_regs.m_vgtHosMaxTessLevel,
+		    vertex_info.hs_user_sgpr.count, vertex_info.hs_regs.rsrc2.lds_size,
+		    data.code_size_bytes);
+		auto notes = path;
+		notes.replace_extension(".txt");
+		Common::File note_file(notes);
+		if (!note_file.IsInvalid()) {
+			note_file.Write(registers.data(), registers.size());
+		}
+	}
+}
+
 static bool ShouldSkipGeShader(const CommandBuffer& buffer) {
 	const auto& ctx         = buffer.GetRegisters();
 	const auto& ucfg        = buffer.GetUserConfig();
@@ -490,16 +547,26 @@ static bool ShouldSkipGeShader(const CommandBuffer& buffer) {
 			            "skipped.\n");
 		});
 
+		if (vertex_info.ls_regs.data_addr != 0 || vertex_info.hs_regs.data_addr != 0) {
+			PerfStats::Add(PerfStats::CounterId::DrawsSkippedTessellation);
+		}
+		DumpSkippedStageShaders(stages, sh_regs, vertex_info);
+
 		const auto log_id = g_shader_stage_log_count.fetch_add(1);
 		if (log_id < 32) {
 			LOGF("Skipping unsupported GE shader draw: stages=0x%08" PRIx32
 			     " prim_group=0x%04" PRIx16 " vert_group=0x%04" PRIx16 " ngg=0x%08" PRIx32
 			     " max_out=0x%08" PRIx32 " gs_max_vert=0x%08" PRIx32 " gs_out_prim=0x%08" PRIx32
-			     " es=0x%016" PRIx64 " gs=0x%016" PRIx64 "\n",
+			     " es=0x%016" PRIx64 " gs=0x%016" PRIx64 " ls=0x%016" PRIx64 " hs=0x%016" PRIx64
+			     " ls_hs_config=0x%08" PRIx32 " tf_param=0x%08" PRIx32 " tess_level=0x%08" PRIx32
+			     "-0x%08" PRIx32 "\n",
 			     stages, ge_cntl.primitive_group_size, ge_cntl.vertex_group_size,
 			     sh_regs.m_geNggSubgrpCntl, sh_regs.m_geMaxOutputPerSubgroup,
 			     sh_regs.m_vgtGsMaxVertOut, sh_regs.m_vgtGsOutPrimType,
-			     vertex_info.es_regs.data_addr, vertex_info.gs_regs.data_addr);
+			     vertex_info.es_regs.data_addr, vertex_info.gs_regs.data_addr,
+			     vertex_info.ls_regs.data_addr, vertex_info.hs_regs.data_addr,
+			     sh_regs.m_vgtLsHsConfig, sh_regs.m_vgtTfParam, sh_regs.m_vgtHosMinTessLevel,
+			     sh_regs.m_vgtHosMaxTessLevel);
 		}
 		return true;
 	}
@@ -1223,16 +1290,23 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto& ucfg = buffer.GetUserConfig();
 
 	LogDrawPhase(draw.name, "PrepareBindings");
+	PerfStats::Span bindings_span(PerfStats::SpanId::DrawBindings);
 	auto& bindings = PrepareGraphicsBindings(state.vs_input_info.stage, state.ps_input_info.stage,
 	                                         state.ps_active);
+	bindings_span.Stop();
+	PerfStats::Span vertex_index_span(PerfStats::SpanId::DrawVertexIndex);
 	auto vertex_bindings = PrepareVertexBuffers(submit_id, buffer, draw, state.vs_input_info);
 	auto index_binding   = PrepareIndexBuffer(buffer, index_source);
+	vertex_index_span.Stop();
+	PerfStats::Span acquire_targets_span(PerfStats::SpanId::DrawTargets);
 	state.rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info);
+	acquire_targets_span.Stop();
 
 	if (log_pipeline_phase) {
 		LogDrawPhase(draw.name, "CreatePipeline");
 	}
+	PerfStats::Span pipeline_span(PerfStats::SpanId::DrawPipeline);
 	const auto&                      regs = buffer.GetRegisters();
 	const PipelinePointerCache::Key  pipeline_key {
 	    .rt_version        = regs.GetRenderTargetVersion(),
@@ -1259,8 +1333,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			m_pipeline_pointer_cache.pipeline = pipeline_ptr;
 		}
 	}
+	pipeline_span.Stop();
 	if (pipeline_ptr == nullptr) {
 		// The pipeline is still compiling on a worker; this draw is dropped for the frame.
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedPipeline);
 		return;
 	}
 	auto& pipeline = *pipeline_ptr;
@@ -1268,6 +1344,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
 	// memory.
+	PerfStats::Span record_span(PerfStats::SpanId::DrawRecord);
 	auto vk_buffer = buffer.Handle();
 	if (set_bind_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x100u);
@@ -1304,6 +1381,21 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	EmitDrawPrimitives(ucfg, vk_buffer, state.vs_input_info, draw, emit);
 
+	if (const auto watched = FrameDumpWatchAddress(); watched != 0) {
+		for (uint32_t i = 0; i < state.color_count; i++) {
+			if (state.color_info[i].base_addr != watched) {
+				continue;
+			}
+			// The watch records a copy, which a render pass does not allow; the next draw begins
+			// the pass again.
+			m_context.GetCommandScheduler().EndRendering();
+			FrameDumpWatchOperation(m_context, watched, draw.name,
+			                        buffer.GetShaders().GetVs().es_regs.data_addr,
+			                        buffer.GetShaders().GetPs().ps_regs.data_addr);
+			break;
+		}
+	}
+
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);
 	}
@@ -1327,6 +1419,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	PerfStats::Span draw_span(PerfStats::SpanId::Draw);
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -1339,7 +1432,11 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                    reinterpret_cast<uint64_t>(args.index_addr));
 
 	Common::LockGuard lock(m_context.GetMutex());
+	if (args.offset_source == DrawOffsetSource::IndirectArgs) {
+		PerfStats::Add(PerfStats::CounterId::DrawsIndirect);
+	}
 	if (args.index_count == 0 || args.instance_count == 0) {
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedEmpty);
 		return;
 	}
 
@@ -1349,10 +1446,12 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedVertexShader);
 		return;
 	}
 
 	if (ShouldSkipGeShader(buffer)) {
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedStage);
 		return;
 	}
 
@@ -1379,6 +1478,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, false, topology)) {
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedState);
 		return;
 	}
 
@@ -1428,15 +1528,21 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	index_source.type = index_type;
 
 	DrawRenderState state {};
+	PerfStats::Span targets_span(PerfStats::SpanId::DrawTargets);
 	if (!PrepareDrawRenderState(submit_id, buffer, draw, args.render_target_slice_offset, true,
 	                            state)) {
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedState);
 		ResetBindings();
 		return;
 	}
+	targets_span.Stop();
 
+	PerfStats::Span shaders_span(PerfStats::SpanId::DrawShaders);
 	RefreshShaders(buffer, draw, true, state);
+	shaders_span.Stop();
 	if (!state.programs.vertex || (state.ps_active && !state.programs.pixel)) {
 		// A shader is still being translated on a worker; drop this draw for the frame.
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedShader);
 		ResetBindings();
 		return;
 	}
@@ -1464,6 +1570,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	PerfStats::Span draw_span(PerfStats::SpanId::Draw);
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -1476,7 +1583,11 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	                    args.first_instance);
 
 	Common::LockGuard lock(m_context.GetMutex());
+	if (args.offset_source == DrawOffsetSource::IndirectArgs) {
+		PerfStats::Add(PerfStats::CounterId::DrawsIndirect);
+	}
 	if (args.vertex_count == 0 || args.instance_count == 0) {
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedEmpty);
 		return;
 	}
 
@@ -1486,10 +1597,12 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedVertexShader);
 		return;
 	}
 
 	if (ShouldSkipGeShader(buffer)) {
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedStage);
 		return;
 	}
 
@@ -1514,20 +1627,27 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	                         args.vertex_count, args.instance_count, args.first_instance};
 
 	DrawRenderState state {};
+	PerfStats::Span targets_span(PerfStats::SpanId::DrawTargets);
 	if (!PrepareDrawRenderState(submit_id, buffer, draw, args.render_target_slice_offset, false,
 	                            state)) {
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedState);
 		ResetBindings();
 		return;
 	}
+	targets_span.Stop();
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, true, topology)) {
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedState);
 		ResetBindings();
 		return;
 	}
+	PerfStats::Span shaders_span(PerfStats::SpanId::DrawShaders);
 	RefreshShaders(buffer, draw, false, state);
+	shaders_span.Stop();
 	if (!state.programs.vertex || (state.ps_active && !state.programs.pixel)) {
 		// A shader is still being translated on a worker; drop this draw for the frame.
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedShader);
 		ResetBindings();
 		return;
 	}
@@ -1542,6 +1662,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 			     state.ps_input_info.input_num, sh_ctx.GetPs().ps_regs.data_addr,
 			     sh_ctx.GetVs().es_regs.data_addr, sh_ctx.GetVs().gs_regs.data_addr);
 		}
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedState);
 		ResetBindings();
 		return;
 	}

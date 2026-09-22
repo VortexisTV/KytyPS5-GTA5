@@ -4,6 +4,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
@@ -93,12 +94,19 @@ void NormalizeStaticParamsForDynamicState(PipelineStaticParameters& static_param
 	static_params.scissor_ltrb[3] = 1;
 }
 
+// Guest words and buffer ranges that resource materialization checked since the last shader lookup
+// reported them to PerfStats. Counting locally keeps atomics off the per-word path.
+thread_local uint64_t g_materialize_reads        = 0;
+thread_local uint64_t g_materialize_range_checks = 0;
+
 bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
+	g_materialize_reads++;
 	return value != nullptr &&
 	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value));
 }
 
 bool ValidateShaderGuestMemoryRange(void*, uint64_t address, uint64_t size) {
+	g_materialize_range_checks++;
 	return Libs::LibKernel::Memory::TryClampRangeSize(address, size) != 0;
 }
 
@@ -391,6 +399,7 @@ struct PipelineCache::ProgramCache {
 
 	template <typename InputInfo>
 	void RunAsyncJob(AsyncJob<InputInfo>& job) {
+		PerfStats::Span span(PerfStats::SpanId::ShaderCompileAsync);
 		constexpr ShaderType stage = StageOf<InputInfo>();
 		const auto         options = MakeOptions<InputInfo>(job.input_info, job.user_data, job.hash);
 		const ShaderParams params {.code = job.code, .user_data = job.user_data, .hash = job.hash};
@@ -404,6 +413,7 @@ struct PipelineCache::ProgramCache {
 			result.permutation = CompilePermutation<stage>(params, options, std::move(translated),
 			                                               std::move(job.specialization),
 			                                               job.push_data_cursor);
+			PerfStats::Add(PerfStats::CounterId::ShadersCompiled);
 		}
 		std::lock_guard lock(completed_mutex);
 		completed.push_back(std::move(result));
@@ -444,6 +454,7 @@ struct PipelineCache::ProgramCache {
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info, uint32_t& push_data_cursor,
 	                  bool allow_async = true) {
 		constexpr ShaderType stage = StageOf<InputInfo>();
+		PerfStats::Span key_span(PerfStats::SpanId::ShaderKey);
 		if (enqueue) {
 			DrainCompleted();
 		}
@@ -462,10 +473,21 @@ struct PipelineCache::ProgramCache {
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .validate_memory_range      = ValidateShaderGuestMemoryRange,
 		};
+		key_span.Stop();
 		if (entry != programs.end()) {
 			auto& source = entry->second;
+			if (PerfStats::Enabled()) {
+				CountRepeatedInputs(source, params);
+			}
+			PerfStats::Span materialize_span(PerfStats::SpanId::ShaderMaterialize);
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(source.resource_plan, runtime,
 			                                                    resources, specialization));
+			materialize_span.Stop();
+			PerfStats::Add(PerfStats::CounterId::ShaderGuestReads,
+			               std::exchange(g_materialize_reads, 0));
+			PerfStats::Add(PerfStats::CounterId::ShaderRangeChecks,
+			               std::exchange(g_materialize_range_checks, 0));
+			PerfStats::Span permutation_span(PerfStats::SpanId::ShaderPermutation);
 			const auto specialization_hash = HashSpecialization(specialization);
 			if (const auto permutation = std::ranges::find_if(
 			        source.permutations, [&](const Permutation& candidate) {
@@ -513,6 +535,7 @@ struct PipelineCache::ProgramCache {
 			return {};
 		}
 
+		PerfStats::Span compile_span(PerfStats::SpanId::ShaderCompileSync);
 		const auto options    = MakeOptions<InputInfo>(input_info, params.user_data, params.hash);
 		auto       translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		if (entry == programs.end()) {
@@ -527,8 +550,28 @@ struct PipelineCache::ProgramCache {
 		input_info.stage = {.program = &permutation.program, .resources = std::move(resources)};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
+		PerfStats::Add(PerfStats::CounterId::ShadersCompiled);
+		sync_builds++;
 		std::printf("Num compiled %u shaders\n", ++num_compiled);
 		return permutation.handle;
+	}
+
+	// Counts lookups whose program, shader base and user data match a recent lookup: the work a
+	// cache keyed on those inputs could skip, provided the guest memory behind them is unchanged.
+	// A direct-mapped table remembers roughly the last 64k input sets.
+	void CountRepeatedInputs(const SourceEntry& source, const ShaderParams& params) {
+		static constexpr size_t RecentInputsSize = size_t {1} << 16u;
+		if (recent_inputs.empty()) {
+			recent_inputs.resize(RecentInputsSize);
+		}
+		const auto seed = reinterpret_cast<uintptr_t>(&source) ^ params.Base();
+		const auto inputs =
+		    XXH3_64bits_withSeed(params.user_data.data(), params.user_data.size_bytes(), seed);
+		auto& slot = recent_inputs[inputs & (RecentInputsSize - 1u)];
+		if (slot == inputs) {
+			PerfStats::Add(PerfStats::CounterId::ShaderInputRepeats);
+		}
+		slot = inputs;
 	}
 
 	explicit ProgramCache(vk::Device device): device(device) {
@@ -548,9 +591,12 @@ struct PipelineCache::ProgramCache {
 	vk::Device                                                  device;
 	uint32_t                                                    num_compiled   = 0;
 	std::atomic<uint64_t>                                       next_shader_id = 0;
+	std::vector<uint64_t>                                       recent_inputs;
 
 	// Async translation: set by PipelineCache when workers are enabled.
 	std::function<void(std::function<void()>)>                             enqueue;
+	// Shaders this thread had to build itself, which is what warm-up watches.
+	uint64_t                                                               sync_builds = 0;
 	std::mutex                                                             completed_mutex;
 	std::vector<AsyncResult>                                               completed;
 	std::unordered_map<ProgramKey, std::vector<uint64_t>, ProgramKeyHash> pending;
@@ -568,13 +614,44 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 	} else {
 		PipelineCacheLog("Vulkan graphics pipeline libraries: monolithic fallback");
 	}
-	m_async = Config::AsyncShadersEnabled();
+	const auto async_mode = Config::GetAsyncShaders();
+	m_async               = async_mode != Config::AsyncShaders::Off;
+	if (async_mode == Config::AsyncShaders::WarmUp) {
+		m_warm_up.Start();
+	}
+	// Which mode is running is worth stating in every one of them: the difference is visible on
+	// screen, and a run that was meant to warm up but did not looks like the mode doing nothing.
+	PipelineCacheLog(
+	    "Shaders: {}",
+	    async_mode == Config::AsyncShaders::Off ? "synchronous, every draw waits for what it needs"
+	    : async_mode == Config::AsyncShaders::WarmUp
+	        ? "warming up, nothing is skipped until a frame needs nothing new"
+	        : "asynchronous, a draw is skipped until its shader and pipeline are ready");
 	if (m_async) {
 		StartWorkers();
 		m_program_cache->enqueue = [this](std::function<void()> job) { EnqueueJob(std::move(job)); };
 	}
 	if (m_driver_cache != nullptr) {
 		StartSaver();
+	}
+}
+
+std::atomic<uint64_t> PipelineCache::s_guest_frames {0};
+
+void PipelineCache::NoteGuestFrame() noexcept {
+	s_guest_frames.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Called before every graphics lookup, so it sees the first lookup of each frame.
+void PipelineCache::UpdateWarmUp() {
+	if (!m_warm_up.Active()) {
+		return;
+	}
+	m_warm_up.Update(s_guest_frames.load(std::memory_order_relaxed),
+	                 m_sync_pipeline_builds + m_program_cache->sync_builds);
+	if (!m_warm_up.Active()) {
+		PipelineCacheLog("Shaders: warm-up finished after {} frames and {} builds",
+		                 m_warm_up.Frames(), m_warm_up.Builds());
 	}
 }
 
@@ -828,6 +905,7 @@ void PipelineCache::EmergencySave() noexcept {
 
 // Caller holds m_save_mutex and m_driver_cache is valid.
 bool PipelineCache::WriteDriverCache() {
+	PerfStats::Span span(PerfStats::SpanId::PipelineCacheSave);
 	size_t               size = 0;
 	vk::Result           result;
 	std::vector<uint8_t> payload;
@@ -886,6 +964,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
     std::span<const uint8_t, 8> target_attachment, bool pixel_active,
     ShaderVertexInputInfo& vertex_info, ShaderPixelInputInfo& pixel_info) {
+	PerfStats::Span prepare_span(PerfStats::SpanId::ShaderPrepare);
 	const auto vertex_params = PrepareProgram(vertex_regs, sh, vertex_info);
 	ShaderParams pixel_params;
 	if (pixel_active) {
@@ -894,6 +973,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			pixel_info.target_attachment[slot] = target_attachment[slot];
 		}
 	}
+	prepare_span.Stop();
 	if (context.GetClipControl().clip_disable) {
 		const auto& viewport = context.GetScreenViewport().viewports[0];
 		const auto& limits   = m_graphics.GetPhysicalDeviceProperties().limits;
@@ -909,16 +989,19 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		clip.enabled = true;
 	}
 	Common::LockGuard lock(m_mutex);
+	UpdateWarmUp();
+	const bool        allow_async      = !m_warm_up.Active();
 	uint32_t          push_data_cursor = 0;
 	GraphicsPrograms  result;
 	if (pixel_active) {
-		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
+		result.pixel =
+		    m_program_cache->Get(pixel_params, pixel_info, push_data_cursor, allow_async);
 		if (!result.pixel) {
 			// Still compiling; the vertex lookup would otherwise bake a wrong push-data cursor.
 			return result;
 		}
 	}
-	result.vertex = m_program_cache->Get(vertex_params, vertex_info, push_data_cursor);
+	result.vertex = m_program_cache->Get(vertex_params, vertex_info, push_data_cursor, allow_async);
 	return result;
 }
 
@@ -1122,7 +1205,7 @@ PipelineCache::GraphicsPipeline* PipelineCache::CreateGraphicsPipeline(
 		m_last_graphics_pipeline = iter->second.get();
 		return iter->second.get();
 	}
-	if (m_async) {
+	if (m_async && !m_warm_up.Active()) {
 		if (m_pending_pipelines.contains(key)) {
 			return nullptr;
 		}
@@ -1138,6 +1221,7 @@ PipelineCache::GraphicsPipeline* PipelineCache::CreateGraphicsPipeline(
 		const auto ps_module = pixel_program.module;
 		EnqueueJob([this, key, p, static_params, rendering, vs_copy, ps_copy, vs_module,
 		            ps_module]() mutable {
+			PerfStats::Span span(PerfStats::SpanId::PipelineCreateAsync);
 			auto cached = std::make_unique<GraphicsPipeline>(p);
 			CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, *vs_copy,
 			                       vs_module, ps_copy ? ps_copy.get() : nullptr, ps_module,
@@ -1145,6 +1229,8 @@ PipelineCache::GraphicsPipeline* PipelineCache::CreateGraphicsPipeline(
 			EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 			EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 			m_pipelines_created.fetch_add(1, std::memory_order_acq_rel);
+			PerfStats::Add(PerfStats::CounterId::PipelinesCreated);
+			span.Stop();
 			std::lock_guard lock(m_completed_mutex);
 			m_completed_pipelines.push_back({std::move(key), std::move(cached)});
 		});
@@ -1163,10 +1249,14 @@ PipelineCache::GraphicsPipeline* PipelineCache::CreateGraphicsPipeline(
 
 	auto cached = std::make_unique<GraphicsPipeline>(p);
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
+	m_sync_pipeline_builds++;
+	PerfStats::Span create_span(PerfStats::SpanId::PipelineCreateSync);
 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vs_input_info,
 	                       vertex_program.module, ps_input_info, pixel_program.module,
 	                       static_params, m_driver_cache,
 	                       m_graphics_library_cache.get());
+	create_span.Stop();
+	PerfStats::Add(PerfStats::CounterId::PipelinesCreated);
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
@@ -1205,7 +1295,10 @@ PipelineCache::CreateComputePipeline(ShaderComputeInputInfo& input_info,
 	}
 
 	auto cached = std::make_unique<ComputePipeline>(p);
+	PerfStats::Span create_span(PerfStats::SpanId::PipelineCreateSync);
 	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+	create_span.Stop();
+	PerfStats::Add(PerfStats::CounterId::PipelinesCreated);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);

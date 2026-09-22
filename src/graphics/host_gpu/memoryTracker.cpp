@@ -70,6 +70,8 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	auto* ptr     = manager.get();
 	m_region_storage.push_back(std::move(manager));
 	m_regions[index].store(ptr, std::memory_order_release);
+	// A new region starts CPU-dirty everywhere.
+	AdvanceUploadEpoch();
 	return ptr;
 }
 
@@ -91,10 +93,15 @@ bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 
 void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
-	Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+	bool newly_dirty = false;
+	Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
+		newly_dirty |= !manager->IsFullyModified<DirtySource::Cpu>(offset, bytes);
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 	});
+	if (newly_dirty) {
+		AdvanceUploadEpoch();
+	}
 }
 
 void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
@@ -136,6 +143,7 @@ void MemoryTracker::UntrackMemoryImpl(uint64_t vaddr, uint64_t size) {
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 	});
 	locks.clear();
+	AdvanceUploadEpoch();
 }
 
 void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {

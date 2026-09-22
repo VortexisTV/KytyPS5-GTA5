@@ -1,12 +1,4 @@
-# KytyPS5 (GTA 5 Fork)
-
-## Check Actions for pre-built releases
-
-## **Red artifacts and lighting are expected upon first booting the game, let it shader build and compile before restarting.**
-
-## Set the Graphics Mode to Performance to prevent crashing.
-
-
+# KytyPS5
 
 [![Build KytyPS5 (Windows)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28Windows%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
 [![Build KytyPS5 (Linux)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28Linux%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
@@ -29,6 +21,8 @@ compatibility is limited and behavior may change significantly between builds.
 
 KytyPS5 can boot 2D games and a selection of 3D games, including titles built with Unreal Engine
 4/5, Unity, and custom engines. No external low-level emulation modules are currently required.
+
+## **Red artifacts and lighting are expected upon first booting the game, let it shader build and compile before restarting.**
 
 Development is focused on compatibility and boot reliability.
 

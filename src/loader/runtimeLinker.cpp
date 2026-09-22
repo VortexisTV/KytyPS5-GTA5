@@ -779,35 +779,10 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
-static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
+// Report whatever guest context can be read safely before terminating: which guest thread
+// faulted, the register file, the faulting code bytes and the top of its stack.
+static void ReportFatalException(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
-
-	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
-	    Loader::X64InstructionEmulator::TryEmulate(info->native_context)) {
-		return true;
-	}
-
-	if (info->type == Common::HostException::ExceptionType::AccessViolation) {
-		// A page is briefly inaccessible while a memory operation on another thread rebuilds its
-		// host mapping; once that operation has finished the access simply succeeds.
-		if (Libs::LibKernel::Memory::WaitForMappingTransition(info->access_violation_vaddr)) {
-			return true;
-		}
-		using CoreAccess = Common::HostException::AccessViolationType;
-		using GpuAccess  = Libs::Graphics::PageFaultAccess;
-		GpuAccess access;
-		switch (info->access_violation_type) {
-			case CoreAccess::Read: access = GpuAccess::Read; break;
-			case CoreAccess::Write: access = GpuAccess::Write; break;
-			case CoreAccess::Execute: access = GpuAccess::Execute; break;
-			case CoreAccess::Unknown: return false;
-		}
-		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
-			return true;
-		}
-	}
-	// Report whatever guest context can be read safely before terminating: which guest thread
-	// faulted, the register file, the faulting code bytes and the top of its stack.
 	{
 		char thread_name[64] = "(host thread)";
 		if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
@@ -849,6 +824,50 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	     " access=%u address=0x%016" PRIx64 "\n",
 	     static_cast<unsigned>(info->type), info->native_code, info->exception_address,
 	     static_cast<unsigned>(info->access_violation_type), info->access_violation_vaddr);
+}
+
+static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
+	const auto* info = &exception_info;
+
+	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
+	    Loader::X64InstructionEmulator::TryEmulate(info->native_context)) {
+		return true;
+	}
+
+	if (info->type == Common::HostException::ExceptionType::AccessViolation) {
+		// This handler sees every fault in the process, including ones raised on threads the
+		// emulator never created by code it never called - injected Vulkan layers and overlays
+		// are the usual source - and on Windows it runs before the faulting module's own
+		// __except. A fault outside the guest address space is that module's to handle, so
+		// decline it here without touching any emulator state or lock. Should nothing else
+		// handle it either, it comes back through KytyFinalExceptionHandler.
+		if (!Libs::LibKernel::Memory::IsGuestAddress(info->access_violation_vaddr)) {
+			return false;
+		}
+		// A page is briefly inaccessible while a memory operation on another thread rebuilds its
+		// host mapping; once that operation has finished the access simply succeeds.
+		if (Libs::LibKernel::Memory::WaitForMappingTransition(info->access_violation_vaddr)) {
+			return true;
+		}
+		using CoreAccess = Common::HostException::AccessViolationType;
+		using GpuAccess  = Libs::Graphics::PageFaultAccess;
+		GpuAccess access;
+		switch (info->access_violation_type) {
+			case CoreAccess::Read: access = GpuAccess::Read; break;
+			case CoreAccess::Write: access = GpuAccess::Write; break;
+			case CoreAccess::Execute: access = GpuAccess::Execute; break;
+			case CoreAccess::Unknown: return false;
+		}
+		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+			return true;
+		}
+	}
+	ReportFatalException(exception_info);
+	return false;
+}
+
+static void KytyFinalExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
+	ReportFatalException(exception_info);
 }
 
 static void EncodeId64(uint16_t in_id, std::string* out_id) {
@@ -2066,7 +2085,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		LOGF("tls_handler_size       = 0x%016" PRIx64 "\n", tls_handler_size);
 	}
 
-	if (!Common::HostException::InstallHandler(KytyExceptionHandler)) {
+	if (!Common::HostException::InstallHandler(KytyExceptionHandler, KytyFinalExceptionHandler)) {
 		EXIT("Failed to install the required vectored exception handler\n");
 	}
 

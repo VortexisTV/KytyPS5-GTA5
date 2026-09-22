@@ -35,9 +35,16 @@ struct ExceptionInfo {
 	void* native_context = nullptr;
 };
 
+// Returns true when the fault was resolved and the faulting instruction should be retried.
+// Returning false declines the fault: it belongs to whatever code raised it, and the platform's
+// own dispatch continues as if the emulator had never looked at it.
 using Handler = bool (*)(const ExceptionInfo&);
 
-bool InstallHandler(Handler handler);
+// Last stop for a fault Handler declined that nothing else in the process handled either.
+// Expected not to return.
+using FinalHandler = void (*)(const ExceptionInfo&);
+
+bool InstallHandler(Handler handler, FinalHandler final_handler);
 
 } // namespace Common::HostException
 

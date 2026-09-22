@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -926,6 +927,7 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings&         prepared) {
 	KYTY_PROFILER_FUNCTION();
+	PerfStats::Span span(PerfStats::SpanId::BindResolve);
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
 	const auto& snapshot = runtime.resources;
@@ -966,6 +968,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 
 void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
+	PerfStats::Span span(PerfStats::SpanId::BindFindBuffers);
 	EXIT_IF(prepared.program == nullptr || prepared.snapshot == nullptr);
 	const auto& program  = *prepared.program;
 	const auto& snapshot = *prepared.snapshot;
@@ -994,6 +997,7 @@ void RenderExecutor::PrepareDmaSources(const PreparedBindings& prepared) {
 	if (!program.info.uses_dma) {
 		return;
 	}
+	PerfStats::Span span(PerfStats::SpanId::BindDmaSources);
 	// Covers a glyph bitmap or a small record run; reads beyond it still take the fault path.
 	constexpr uint64_t SourceWindow = 256ull * 1024ull;
 	auto&              resources    = m_context.GetGpuResources();
@@ -1023,6 +1027,7 @@ void RenderExecutor::PrepareDmaSources(const PreparedBindings& prepared) {
 
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
+	PerfStats::Span span(PerfStats::SpanId::BindRebindBuffers);
 	EXIT_IF(prepared.program == nullptr || prepared.snapshot == nullptr);
 	const auto& program   = *prepared.program;
 	const auto& snapshot  = *prepared.snapshot;
@@ -1060,6 +1065,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
+	PerfStats::Span span(PerfStats::SpanId::BindRebindImages);
 	EXIT_IF(prepared.program == nullptr || prepared.snapshot == nullptr);
 	const auto& program  = *prepared.program;
 	const auto& snapshot = *prepared.snapshot;

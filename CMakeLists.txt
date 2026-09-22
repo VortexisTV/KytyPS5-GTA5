@@ -408,7 +408,7 @@ add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ReadLaneElimination.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 )
-target_link_libraries(scalar_provenance_tests fmt::fmt)
+target_link_libraries(scalar_provenance_tests fmt::fmt common)
 target_include_directories(scalar_provenance_tests PRIVATE ${inc_headers})
 
 add_executable(page_manager_tests EXCLUDE_FROM_ALL
@@ -422,6 +422,12 @@ add_executable(bit_array_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/BitArrayTests.cpp"
 )
 target_include_directories(bit_array_tests PRIVATE ${inc_headers})
+
+add_executable(perf_stats_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PerfStatsTests.cpp"
+)
+target_link_libraries(perf_stats_tests common)
+target_include_directories(perf_stats_tests PRIVATE ${inc_headers})
 
 add_executable(ime_dialog_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImeDialogTests.cpp"
@@ -452,7 +458,7 @@ add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 )
-target_link_libraries(resource_materialization_tests fmt::fmt)
+target_link_libraries(resource_materialization_tests fmt::fmt common)
 target_include_directories(resource_materialization_tests PRIVATE ${inc_headers})
 
 add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
@@ -466,7 +472,7 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ShaderInfoCollection.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/BindingLayout.cpp"
 )
-target_link_libraries(resource_tracking_tests fmt::fmt)
+target_link_libraries(resource_tracking_tests fmt::fmt common)
 target_include_directories(resource_tracking_tests PRIVATE ${inc_headers})
 
 add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
@@ -476,6 +482,18 @@ add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(audio_out2_port_tests common fmt::fmt)
 target_include_directories(audio_out2_port_tests PRIVATE ${inc_headers})
+
+add_executable(shader_warm_up_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ShaderWarmUpTests.cpp"
+)
+target_include_directories(shader_warm_up_tests PRIVATE ${inc_headers})
+
+add_executable(save_data_files_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SaveDataFilesTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/saveDataFiles.cpp"
+)
+target_link_libraries(save_data_files_tests common fmt::fmt)
+target_include_directories(save_data_files_tests PRIVATE ${inc_headers})
 
 add_executable(event_queue_lifetime_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/EventQueueLifetimeTests.cpp"
@@ -554,6 +572,7 @@ if(BUILD_TESTING)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
+	add_test(NAME perf_stats COMMAND $<TARGET_FILE:perf_stats_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
@@ -561,6 +580,8 @@ if(BUILD_TESTING)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
+	add_test(NAME save_data_files COMMAND $<TARGET_FILE:save_data_files_tests>)
+	add_test(NAME shader_warm_up COMMAND $<TARGET_FILE:shader_warm_up_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
@@ -591,6 +612,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-meta-clear-only)
 	add_test(NAME buffer_cache_dirty_gc
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
+	add_test(NAME bda_synchronization_skip
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-sync-only)
 	add_test(NAME vertex_buffer_mapped_extent
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --vertex-buffer-extent-only)
 
@@ -612,6 +635,7 @@ if(BUILD_TESTING)
 		memory_tracker_tests
 		page_manager_tests
 		bit_array_tests
+		perf_stats_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests
@@ -621,6 +645,8 @@ if(BUILD_TESTING)
 		shader_recompiler_compute_tests
 		virtual_memory_allocation_tests
 		audio_out2_port_tests
+		save_data_files_tests
+		shader_warm_up_tests
 	)
 endif()
 

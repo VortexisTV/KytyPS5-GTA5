@@ -82,6 +82,32 @@ void TestMaskedConstructionAndBitwiseOperations() {
   }
 }
 
+void TestRangeQueries() {
+  Common::BitArray<1024> bits;
+  for (const size_t point :
+       {size_t{0}, size_t{63}, size_t{64}, size_t{511}, size_t{1023}}) {
+    bits.Set(point);
+  }
+  bits.SetRange(95, 257);
+  // Compare every valid subrange against individual bits, including empty
+  // ranges and all word boundaries in a full tracker-sized bitset.
+  for (size_t start = 0; start <= 1024; start++) {
+    bool any = false;
+    bool all = true;
+    for (size_t end = start; end <= 1024; end++) {
+      if (end != start) {
+        any |= bits.Get(end - 1);
+        all &= bits.Get(end - 1);
+      }
+      Check(bits.Any(start, end) == any, "range Any diverged");
+      Check(bits.All(start, end) == all, "range All diverged");
+    }
+  }
+  Check(!bits.Any(2, 1) && !bits.All(2, 1) && !bits.Any(0, 1025) &&
+            !bits.All(0, 1025),
+        "invalid range query accepted");
+}
+
 void TestRangeDiscoveryAndIteration() {
   Bits bits;
   Check(bits.FirstRange() == Bits::Range{128, 128},
@@ -302,6 +328,7 @@ void TestTrackerSizedRandomizedDifferential() {
 int main() {
   TestPointAndRangeOperations();
   TestMaskedConstructionAndBitwiseOperations();
+  TestRangeQueries();
   TestRangeDiscoveryAndIteration();
   TestRandomizedDifferential();
   TestTrackerSizedRandomizedDifferential();

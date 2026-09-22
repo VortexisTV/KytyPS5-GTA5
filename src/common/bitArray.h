@@ -155,6 +155,46 @@ public:
 
 	[[nodiscard]] constexpr bool Any() const { return !None(); }
 
+	// Query only the words intersecting [start, end), without constructing a masked array.
+	[[nodiscard]] constexpr bool Any(size_t start, size_t end) const {
+		return TestRange<false>(start, end);
+	}
+
+	[[nodiscard]] constexpr bool All(size_t start, size_t end) const {
+		return TestRange<true>(start, end);
+	}
+
+private:
+	template <bool all>
+	[[nodiscard]] constexpr bool TestRange(size_t start, size_t end) const {
+		if (start > end || end > N) {
+			return false;
+		}
+		if (start == end) {
+			return all;
+		}
+		const auto first = start / BITS_PER_WORD;
+		const auto last  = (end - 1) / BITS_PER_WORD;
+		for (auto word = first; word <= last; word++) {
+			auto mask = ~uint64_t {0};
+			if (word == first) {
+				mask &= ~uint64_t {0} << (start % BITS_PER_WORD);
+			}
+			if (word == last) {
+				mask &= ~uint64_t {0} >> (BITS_PER_WORD - 1 - (end - 1) % BITS_PER_WORD);
+			}
+			if constexpr (all) {
+				if ((m_data[word] & mask) != mask) {
+					return false;
+				}
+			} else if ((m_data[word] & mask) != 0) {
+				return true;
+			}
+		}
+		return all;
+	}
+
+public:
 	[[nodiscard]] constexpr Range FirstRangeFrom(size_t start) const {
 		if (start >= N) {
 			return {N, N};

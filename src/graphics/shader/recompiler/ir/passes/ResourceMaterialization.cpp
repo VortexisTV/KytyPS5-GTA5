@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include "common/assert.h"
+#include "common/perfStats.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
@@ -262,6 +263,7 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 	if (probe_count > MaxIndirectImageProbes) {
 		return false;
 	}
+	PerfStats::Add(PerfStats::CounterId::IndirectProbes, probe_count);
 
 	std::vector<uint32_t>        keys {0u};
 	std::unordered_set<uint32_t> seen {0u};
@@ -326,10 +328,12 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& r
 	}
 	std::vector<DescriptorValue> values;
 	std::vector<uint32_t>        flattened_srt;
+	PerfStats::Span              srt_span(PerfStats::SpanId::ShaderSrtWalk);
 	if (!EvaluateRuntimeSources(program, program.materialization_sources, runtime, values,
 	                            flattened_srt, program.clean_flat_slots)) {
 		return false;
 	}
+	srt_span.Stop();
 
 	auto& next   = snapshot.resources;
 	auto  cursor = values.begin();
@@ -347,6 +351,7 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& r
 		const auto& image  = program.info.images[image_index];
 		const auto* source = Source(program, image.source);
 		if (source != nullptr && source->indirect_image.has_value()) {
+			PerfStats::Span  indirect_span(PerfStats::SpanId::ShaderIndirect);
 			const std::array requests {source->indirect_image->material_source,
 			                           source->indirect_image->heap_source};
 			SrtRuntime       clean_runtime = runtime;
@@ -745,6 +750,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	if (!MaterializeSnapshot(program, runtime, materialized)) {
 		return false;
 	}
+	PerfStats::Span specialize_span(PerfStats::SpanId::ShaderSpecialize);
 	return BuildResourceSpecialization(program, std::move(materialized), snapshot, specialization);
 }
 

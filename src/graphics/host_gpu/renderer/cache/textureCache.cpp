@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/tile.h"
@@ -240,6 +241,7 @@ bool TextureCache::SafeToDownload(const Image& image) {
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	PerfStats::Add(PerfStats::CounterId::ImageCreates);
 	if (!info.data.Empty()) {
 		RegisterImage(id);
 	}
@@ -1113,6 +1115,8 @@ TextureCache::DownloadPlan TextureCache::BuildDownload(const Image& image) const
 void TextureCache::UploadImage(Image& image, const ImageDesc& desc, Buffer& source,
                                uint64_t source_offset) {
 	const auto& info   = image.info;
+	PerfStats::Add(PerfStats::CounterId::ImageUploads);
+	PerfStats::Add(PerfStats::CounterId::ImageUploadBytes, info.data.size);
 	const auto  upload = [&](std::vector<vk::BufferImageCopy>& copies, TileManager::Result linear) {
 		for (auto& copy: copies) {
 			copy.bufferOffset += linear.offset;
@@ -2196,6 +2200,7 @@ void TextureCache::RunGarbageCollector() {
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
+	PerfStats::Set(PerfStats::GaugeId::TextureGcTriggerMb, m_trigger_gc_memory >> 20u);
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
@@ -2234,6 +2239,7 @@ void TextureCache::RunGarbageCollector() {
 				}
 				owner->ClearGpuModified();
 			}
+			PerfStats::Add(PerfStats::CounterId::ImagesEvicted);
 			DeleteImage(id);
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;

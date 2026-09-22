@@ -1,6 +1,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/dateTime.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
@@ -8,6 +9,7 @@
 #include "kernel/fileSystem.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "libs/saveDataFiles.h"
 #include "libs/saveDataMountSlots.h"
 #include "loader/symbolDatabase.h"
 #include "loader/systemContent.h"
@@ -15,6 +17,8 @@
 #include <algorithm>
 #include <cstring>
 #include <deque>
+#include <filesystem>
+#include <span>
 #include <vector>
 
 namespace Libs {
@@ -232,7 +236,8 @@ static constexpr uint32_t SAVE_DATA_EVENT_TYPE_UMOUNT_BACKUP_END = 1u;
 static constexpr uint32_t SAVE_DATA_EVENT_TYPE_BACKUP_END        = 2u;
 static constexpr uint32_t SAVE_DATA_EVENT_TYPE_COMMIT_BACKUP_END = 4u;
 
-static std::vector<uint8_t>      g_save_data_memory(0x10000);
+static std::vector<uint8_t>      g_save_data_memory;
+static bool                      g_save_data_memory_loaded   = false;
 static int32_t                   g_next_transaction_resource = 1;
 static std::deque<SaveDataEvent> g_save_data_events;
 static SaveDataMountSlots        g_mount_slots;
@@ -245,6 +250,54 @@ static std::string get_title_id() {
 	}
 
 	return title_id;
+}
+
+static std::filesystem::path title_dir_path() {
+	return std::filesystem::path(SAVE_DATA_DIR) / get_title_id();
+}
+
+static std::filesystem::path save_dir_path(std::string_view dir_name) {
+	return title_dir_path() / std::string(dir_name);
+}
+
+// The save a mount point stands for, empty when nothing is mounted there.
+static std::string mounted_dir_name(const SaveDataMountPoint* mount_point) {
+	if (mount_point == nullptr) {
+		return {};
+	}
+	Common::LockGuard lock(g_mount_mutex);
+	const int         slot = g_mount_slots.Find(mount_point->data);
+	if (slot < 0) {
+		return {};
+	}
+	return std::string(g_mount_slots.Directory(static_cast<size_t>(slot)));
+}
+
+// The guest parameter fields are fixed-size and need not be terminated.
+static std::string bounded_string(const char* data, size_t size) {
+	const auto* end = static_cast<const char*>(std::memchr(data, 0, size));
+	return std::string(data, end != nullptr ? static_cast<size_t>(end - data) : size);
+}
+
+// The image is read back the first time the guest asks for it, and the title having none at all
+// is an answer in itself.
+static bool load_save_data_memory() {
+	if (g_save_data_memory_loaded) {
+		return true;
+	}
+	std::vector<uint8_t> stored;
+	if (!Files::ReadMemory(title_dir_path(), stored)) {
+		return false;
+	}
+	g_save_data_memory        = std::move(stored);
+	g_save_data_memory_loaded = true;
+	return true;
+}
+
+static void store_save_data_memory() {
+	if (!Files::WriteMemory(title_dir_path(), g_save_data_memory)) {
+		LOGF("\t save data memory could not be written\n");
+	}
 }
 
 static void queue_save_data_event(uint32_t type, int32_t user_id,
@@ -369,8 +422,14 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 	std::memset(result->reserved, 0, sizeof(result->reserved));
 	result->pad2 = 0;
 
-	std::vector<std::string> dir_list;
-	std::string              root =
+	// A save is reported with what is known about it, because a search is how a game decides
+	// whether the save it is looking for is there.
+	struct Found {
+		std::string  name;
+		Files::Param param;
+	};
+	std::vector<Found> dir_list;
+	std::string        root =
 	    Common::FixDirectorySlash((std::string(SAVE_DATA_DIR) + "/" + get_title_id()));
 
 	if (Common::File::IsDirectoryExisting(root)) {
@@ -380,22 +439,34 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 				if (cond->dir_name == nullptr || cond->dir_name->data[0] == '\0' ||
 				    dir_name_match(Common::ToLower(entry.name).c_str(),
 				                   Common::ToLower(std::string(cond->dir_name->data)).c_str())) {
-					dir_list.push_back(entry.name);
+					dir_list.push_back({entry.name, Files::ReadParam(save_dir_path(entry.name))});
 				}
 			}
 		}
 	}
 
-	std::sort(dir_list.begin(), dir_list.end(), [](const std::string& a, const std::string& b) {
-		return std::strcmp(a.c_str(), b.c_str()) < 0;
+	std::sort(dir_list.begin(), dir_list.end(), [&](const Found& a, const Found& b) {
+		switch (cond->key) {
+			case SaveDataSortKey::UserParam:
+				if (a.param.user_param != b.param.user_param) {
+					return a.param.user_param < b.param.user_param;
+				}
+				break;
+			case SaveDataSortKey::Mtime:
+				if (a.param.mtime != b.param.mtime) {
+					return a.param.mtime < b.param.mtime;
+				}
+				break;
+			// Every save reports the same block counts, so they order by name like DirName does.
+			case SaveDataSortKey::DirName:
+			case SaveDataSortKey::Blocks:
+			case SaveDataSortKey::FreeBlocks: break;
+		}
+		return std::strcmp(a.name.c_str(), b.name.c_str()) < 0;
 	});
 
 	if (cond->order == SaveDataSortOrder::Descent) {
-		std::vector<std::string> reversed;
-		for (size_t i = dir_list.size(); i > 0; i--) {
-			reversed.push_back(dir_list[i - 1]);
-		}
-		dir_list = reversed;
+		std::reverse(dir_list.begin(), dir_list.end());
 	}
 
 	auto max_count =
@@ -405,16 +476,33 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 	result->set_num = static_cast<uint32_t>(max_count);
 
 	for (size_t i = 0; i < max_count; i++) {
+		const auto& found = dir_list[i];
 		std::snprintf(result->dir_names[i].data, sizeof(result->dir_names[i].data), "%s",
-		              dir_list[i].c_str());
+		              found.name.c_str());
 		if (result->params != nullptr) {
 			result->params[i] = {};
+			std::snprintf(result->params[i].title, sizeof(result->params[i].title), "%s",
+			              found.param.title.c_str());
+			std::snprintf(result->params[i].sub_title, sizeof(result->params[i].sub_title), "%s",
+			              found.param.sub_title.c_str());
+			std::snprintf(result->params[i].detail, sizeof(result->params[i].detail), "%s",
+			              found.param.detail.c_str());
+			result->params[i].user_param = found.param.user_param;
+			result->params[i].mtime      = found.param.mtime;
 		}
 		if (result->infos != nullptr) {
 			result->infos[i]             = {};
 			result->infos[i].blocks      = SAVE_DATA_BLOCKS_MAX;
 			result->infos[i].free_blocks = SAVE_DATA_BLOCKS_MAX;
 		}
+	}
+
+	LOGF("\t hit_num       = %" PRIu32 "\n"
+	     "\t set_num       = %" PRIu32 "\n",
+	     result->hit_num, result->set_num);
+	for (size_t i = 0; i < max_count; i++) {
+		LOGF("\t [%" PRIu64 "] %s, mtime = %" PRId64 ", title = %s\n", static_cast<uint64_t>(i),
+		     dir_list[i].name.c_str(), dir_list[i].param.mtime, dir_list[i].param.title.c_str());
 	}
 
 	return OK;
@@ -493,13 +581,18 @@ int KYTY_SYSV_ABI SaveDataSetupSaveDataMemory2(const SaveDataMemorySetup2* setup
 	     setup_param->option, setup_param->user_id, static_cast<uint64_t>(setup_param->memory_size),
 	     static_cast<uint64_t>(setup_param->icon_memory_size), setup_param->slot_id);
 
+	const bool existed        = load_save_data_memory();
+	const auto existed_size   = existed ? g_save_data_memory.size() : 0;
+	g_save_data_memory_loaded = true;
 	if (setup_param->memory_size > g_save_data_memory.size()) {
 		g_save_data_memory.resize(setup_param->memory_size);
 	}
+	// The image has to exist from here on: the guest may set it up now and write it much later.
+	store_save_data_memory();
 
 	if (result != nullptr) {
 		*result                     = {};
-		result->existed_memory_size = g_save_data_memory.size();
+		result->existed_memory_size = existed_size;
 	}
 
 	return OK;
@@ -520,6 +613,13 @@ int KYTY_SYSV_ABI SaveDataGetSaveDataMemory2(SaveDataMemoryGet2* get_param) {
 	     get_param->user_id, reinterpret_cast<uint64_t>(get_param->data),
 	     reinterpret_cast<uint64_t>(get_param->param), reinterpret_cast<uint64_t>(get_param->icon),
 	     get_param->slot_id);
+
+	if (!load_save_data_memory()) {
+		// Nothing was ever set up for this title. Reporting an empty image instead would tell the
+		// guest its settings are there and blank.
+		LOGF("\t no save data memory for this title\n");
+		return SAVE_DATA_ERROR_NOT_FOUND;
+	}
 
 	if (get_param->data != nullptr) {
 		auto* data = get_param->data;
@@ -560,6 +660,9 @@ int KYTY_SYSV_ABI SaveDataSetSaveDataMemory2(const SaveDataMemorySet2* set_param
 	     reinterpret_cast<uint64_t>(set_param->param), reinterpret_cast<uint64_t>(set_param->icon),
 	     set_param->data_num, set_param->slot_id);
 
+	(void)load_save_data_memory();
+	g_save_data_memory_loaded = true;
+
 	const uint32_t data_num = (set_param->data_num == 0 ? 1 : set_param->data_num);
 	if (set_param->data != nullptr) {
 		for (uint32_t i = 0; i < data_num; i++) {
@@ -574,6 +677,7 @@ int KYTY_SYSV_ABI SaveDataSetSaveDataMemory2(const SaveDataMemorySet2* set_param
 			}
 			std::memcpy(g_save_data_memory.data() + offset, data.buf, data.buf_size);
 		}
+		store_save_data_memory();
 	}
 
 	return OK;
@@ -714,7 +818,21 @@ int KYTY_SYSV_ABI SaveDataGetParam(const SaveDataMountPoint* mount_point, uint32
 		if (param_buf_size < sizeof(SaveDataParam)) {
 			return SAVE_DATA_ERROR_PARAMETER;
 		}
-		std::memset(param_buf, 0, sizeof(SaveDataParam));
+		auto* out = static_cast<SaveDataParam*>(param_buf);
+		*out      = {};
+		if (const auto dir_name = mounted_dir_name(mount_point); !dir_name.empty()) {
+			const auto stored = Files::ReadParam(save_dir_path(dir_name));
+			std::snprintf(out->title, sizeof(out->title), "%s", stored.title.c_str());
+			std::snprintf(out->sub_title, sizeof(out->sub_title), "%s", stored.sub_title.c_str());
+			std::snprintf(out->detail, sizeof(out->detail), "%s", stored.detail.c_str());
+			out->user_param = stored.user_param;
+			out->mtime      = stored.mtime;
+			LOGF("\t title      = %s\n"
+			     "\t sub_title  = %s\n"
+			     "\t user_param = %u\n"
+			     "\t mtime      = %" PRId64 "\n",
+			     out->title, out->sub_title, out->user_param, out->mtime);
+		}
 		if (got_size != nullptr) {
 			*got_size = sizeof(SaveDataParam);
 		}
@@ -764,6 +882,10 @@ int KYTY_SYSV_ABI SaveDataSyncSaveDataMemory(const void* sync_param) {
 	PRINT_NAME();
 
 	LOGF("\t sync_param = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(sync_param));
+
+	if (g_save_data_memory_loaded) {
+		store_save_data_memory();
+	}
 
 	return OK;
 }
@@ -830,6 +952,9 @@ int KYTY_SYSV_ABI SaveDataSetParam(const SaveDataMountPoint* mount_point, uint32
 	     mount_point->data, param_type, param_buf_size);
 
 	if (param_type == 0) {
+		if (param_buf == nullptr || param_buf_size < sizeof(SaveDataParam)) {
+			return SAVE_DATA_ERROR_PARAMETER;
+		}
 		const auto* p = static_cast<const SaveDataParam*>(param_buf);
 
 		LOGF("\t title      = %s\n"
@@ -837,6 +962,23 @@ int KYTY_SYSV_ABI SaveDataSetParam(const SaveDataMountPoint* mount_point, uint32
 		     "\t detail     = %s\n"
 		     "\t user_param = %u\n",
 		     p->title, p->sub_title, p->detail, p->user_param);
+
+		const auto dir_name = mounted_dir_name(mount_point);
+		if (dir_name.empty()) {
+			return SAVE_DATA_ERROR_NOT_MOUNTED;
+		}
+		Files::Param stored;
+		stored.title      = bounded_string(p->title, sizeof(p->title));
+		stored.sub_title  = bounded_string(p->sub_title, sizeof(p->sub_title));
+		stored.detail     = bounded_string(p->detail, sizeof(p->detail));
+		stored.user_param = p->user_param;
+		// The guest leaves mtime to the system, which stamps it when the save changes.
+		const auto now = Common::DateTime::FromSystemUTC().ToUnix();
+		stored.mtime   = p->mtime != 0 ? p->mtime : static_cast<int64_t>(now);
+		if (!Files::WriteParam(save_dir_path(dir_name), stored)) {
+			LOGF("\t parameters could not be written\n");
+			return SAVE_DATA_ERROR_INTERNAL;
+		}
 	} else {
 		LOGF("\t unsupported param_type, accepting as no-op\n");
 	}
