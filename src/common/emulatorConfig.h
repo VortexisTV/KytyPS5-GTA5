@@ -27,6 +27,13 @@ enum class ProfilerDirection { None, Network };
 
 enum class OutputDirection { Silent, Console, File };
 
+// What happens when a draw needs a shader or pipeline that is not compiled yet.
+enum class AsyncShaders {
+	Off,    // build it now, with the guest waiting
+	On,     // build it on a worker thread and drop the draw until it is ready
+	WarmUp, // Off until the guest shows a frame that needed nothing new, then On
+};
+
 enum class PresentMode { Fifo, Mailbox, Immediate };
 
 using Keymap = std::vector<std::string>;
@@ -71,7 +78,7 @@ struct ConfigOptions {
 	bool                   readback_linear_images      = false;
 	bool                   playgo_hack_enabled         = false;
 	bool                   hot_page_tracking           = true;
-	bool                   async_shaders               = true;
+	AsyncShaders           async_shaders               = AsyncShaders::On;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -117,7 +124,7 @@ bool RenderDocEnabled();
 bool ReadbackLinearImagesEnabled();
 bool PlayGoHackEnabled();
 bool HotPageTrackingEnabled();
-bool AsyncShadersEnabled();
+AsyncShaders GetAsyncShaders();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif

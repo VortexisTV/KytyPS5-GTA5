@@ -139,7 +139,7 @@ bool HotPageTrackingEnabled() {
 	return g_config->hot_page_tracking;
 }
 
-bool AsyncShadersEnabled() {
+AsyncShaders GetAsyncShaders() {
 	return g_config->async_shaders;
 }
 

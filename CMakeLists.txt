@@ -483,6 +483,11 @@ add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
 target_link_libraries(audio_out2_port_tests common fmt::fmt)
 target_include_directories(audio_out2_port_tests PRIVATE ${inc_headers})
 
+add_executable(shader_warm_up_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ShaderWarmUpTests.cpp"
+)
+target_include_directories(shader_warm_up_tests PRIVATE ${inc_headers})
+
 add_executable(save_data_files_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SaveDataFilesTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/saveDataFiles.cpp"
@@ -576,6 +581,7 @@ if(BUILD_TESTING)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
 	add_test(NAME save_data_files COMMAND $<TARGET_FILE:save_data_files_tests>)
+	add_test(NAME shader_warm_up COMMAND $<TARGET_FILE:shader_warm_up_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
@@ -640,6 +646,7 @@ if(BUILD_TESTING)
 		virtual_memory_allocation_tests
 		audio_out2_port_tests
 		save_data_files_tests
+		shader_warm_up_tests
 	)
 endif()
 

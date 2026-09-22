@@ -551,6 +551,7 @@ struct PipelineCache::ProgramCache {
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
 		PerfStats::Add(PerfStats::CounterId::ShadersCompiled);
+		sync_builds++;
 		std::printf("Num compiled %u shaders\n", ++num_compiled);
 		return permutation.handle;
 	}
@@ -594,6 +595,8 @@ struct PipelineCache::ProgramCache {
 
 	// Async translation: set by PipelineCache when workers are enabled.
 	std::function<void(std::function<void()>)>                             enqueue;
+	// Shaders this thread had to build itself, which is what warm-up watches.
+	uint64_t                                                               sync_builds = 0;
 	std::mutex                                                             completed_mutex;
 	std::vector<AsyncResult>                                               completed;
 	std::unordered_map<ProgramKey, std::vector<uint64_t>, ProgramKeyHash> pending;
@@ -611,13 +614,44 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 	} else {
 		PipelineCacheLog("Vulkan graphics pipeline libraries: monolithic fallback");
 	}
-	m_async = Config::AsyncShadersEnabled();
+	const auto async_mode = Config::GetAsyncShaders();
+	m_async               = async_mode != Config::AsyncShaders::Off;
+	if (async_mode == Config::AsyncShaders::WarmUp) {
+		m_warm_up.Start();
+	}
+	// Which mode is running is worth stating in every one of them: the difference is visible on
+	// screen, and a run that was meant to warm up but did not looks like the mode doing nothing.
+	PipelineCacheLog(
+	    "Shaders: {}",
+	    async_mode == Config::AsyncShaders::Off ? "synchronous, every draw waits for what it needs"
+	    : async_mode == Config::AsyncShaders::WarmUp
+	        ? "warming up, nothing is skipped until a frame needs nothing new"
+	        : "asynchronous, a draw is skipped until its shader and pipeline are ready");
 	if (m_async) {
 		StartWorkers();
 		m_program_cache->enqueue = [this](std::function<void()> job) { EnqueueJob(std::move(job)); };
 	}
 	if (m_driver_cache != nullptr) {
 		StartSaver();
+	}
+}
+
+std::atomic<uint64_t> PipelineCache::s_guest_frames {0};
+
+void PipelineCache::NoteGuestFrame() noexcept {
+	s_guest_frames.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Called before every graphics lookup, so it sees the first lookup of each frame.
+void PipelineCache::UpdateWarmUp() {
+	if (!m_warm_up.Active()) {
+		return;
+	}
+	m_warm_up.Update(s_guest_frames.load(std::memory_order_relaxed),
+	                 m_sync_pipeline_builds + m_program_cache->sync_builds);
+	if (!m_warm_up.Active()) {
+		PipelineCacheLog("Shaders: warm-up finished after {} frames and {} builds",
+		                 m_warm_up.Frames(), m_warm_up.Builds());
 	}
 }
 
@@ -955,16 +989,19 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		clip.enabled = true;
 	}
 	Common::LockGuard lock(m_mutex);
+	UpdateWarmUp();
+	const bool        allow_async      = !m_warm_up.Active();
 	uint32_t          push_data_cursor = 0;
 	GraphicsPrograms  result;
 	if (pixel_active) {
-		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
+		result.pixel =
+		    m_program_cache->Get(pixel_params, pixel_info, push_data_cursor, allow_async);
 		if (!result.pixel) {
 			// Still compiling; the vertex lookup would otherwise bake a wrong push-data cursor.
 			return result;
 		}
 	}
-	result.vertex = m_program_cache->Get(vertex_params, vertex_info, push_data_cursor);
+	result.vertex = m_program_cache->Get(vertex_params, vertex_info, push_data_cursor, allow_async);
 	return result;
 }
 
@@ -1168,7 +1205,7 @@ PipelineCache::GraphicsPipeline* PipelineCache::CreateGraphicsPipeline(
 		m_last_graphics_pipeline = iter->second.get();
 		return iter->second.get();
 	}
-	if (m_async) {
+	if (m_async && !m_warm_up.Active()) {
 		if (m_pending_pipelines.contains(key)) {
 			return nullptr;
 		}
@@ -1212,6 +1249,7 @@ PipelineCache::GraphicsPipeline* PipelineCache::CreateGraphicsPipeline(
 
 	auto cached = std::make_unique<GraphicsPipeline>(p);
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
+	m_sync_pipeline_builds++;
 	PerfStats::Span create_span(PerfStats::SpanId::PipelineCreateSync);
 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vs_input_info,
 	                       vertex_program.module, ps_input_info, pixel_program.module,

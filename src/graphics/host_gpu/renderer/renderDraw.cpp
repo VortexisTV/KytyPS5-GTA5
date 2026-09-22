@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/frameDump.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -1379,6 +1380,21 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
 	EmitDrawPrimitives(ucfg, vk_buffer, state.vs_input_info, draw, emit);
+
+	if (const auto watched = FrameDumpWatchAddress(); watched != 0) {
+		for (uint32_t i = 0; i < state.color_count; i++) {
+			if (state.color_info[i].base_addr != watched) {
+				continue;
+			}
+			// The watch records a copy, which a render pass does not allow; the next draw begins
+			// the pass again.
+			m_context.GetCommandScheduler().EndRendering();
+			FrameDumpWatchOperation(m_context, watched, draw.name,
+			                        buffer.GetShaders().GetVs().es_regs.data_addr,
+			                        buffer.GetShaders().GetPs().ps_regs.data_addr);
+			break;
+		}
+	}
 
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);

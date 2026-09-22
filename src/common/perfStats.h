@@ -24,6 +24,7 @@ enum class SpanId : uint8_t {
 	GpuThreadCommands,  // commands other threads ran on the emulated GPU thread
 	GameWaitGpuIdle,    // guest thread blocked at a suspend point until the GPU thread drains
 	GameWaitGpuCommand, // guest thread blocked on a synchronous GPU-thread command
+	GameWaitGpuFlip,    // part of GameWaitGpuIdle: the drain covered a guest flip wait
 	Draw,
 	DrawTargets,        // render-target resolution and attachment acquisition
 	DrawShaders,        // shader program lookup, including resource materialization

@@ -31,6 +31,7 @@ constexpr const char* CsvFileName = "_PerfStats.csv";
 constexpr std::array<std::string_view, SpanCount> SpanNames = {
     "gpu_thread_busy",       "gpu_thread_idle",      "gpu_thread_blocked",
     "gpu_thread_commands",   "game_wait_gpu_idle",   "game_wait_gpu_command",
+    "game_wait_gpu_flip",
     "draw",                  "draw_targets",         "draw_shaders",
     "shader_prepare",        "shader_key",           "shader_materialize",
     "shader_srt_walk",       "shader_indirect_images", "shader_specialize",
@@ -285,12 +286,12 @@ std::string FormatSummary(const Snapshot& snapshot, uint64_t ticks_per_second) {
 	               snapshot.Get(GaugeId::TextureGcTriggerMb), snapshot.Get(GaugeId::CachedBuffers));
 	fmt::format_to(it,
 	               "[perf] per frame: GPU thread busy {:.1f} ms, idle {:.1f} ms, blocked {:.1f} ms | "
-	               "game waiting on GPU thread {:.1f} ms, on GPU commands {:.1f} ms ({:.1f}) | flip "
-	               "wait {:.1f} ms | present {:.1f} ms\n",
+	               "game waiting on GPU thread {:.1f} ms (flip {:.1f}), on GPU commands {:.1f} ms "
+	               "({:.1f}) | flip wait {:.1f} ms | present {:.1f} ms\n",
 	               ms(SpanId::GpuThreadBusy), ms(SpanId::GpuThreadIdle),
 	               ms(SpanId::GpuThreadBlocked), ms(SpanId::GameWaitGpuIdle),
-	               ms(SpanId::GameWaitGpuCommand), count(SpanId::GameWaitGpuCommand),
-	               ms(SpanId::FlipWait), ms(SpanId::Present));
+	               ms(SpanId::GameWaitGpuFlip), ms(SpanId::GameWaitGpuCommand),
+	               count(SpanId::GameWaitGpuCommand), ms(SpanId::FlipWait), ms(SpanId::Present));
 	fmt::format_to(it,
 	               "[perf] per frame: {:.0f} draws {:.1f} ms (targets {:.1f}, shaders {:.1f}, "
 	               "bindings {:.1f}, vertex/index {:.1f}, pipeline {:.1f}, record {:.1f}) | "

@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderWarmUp.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
@@ -188,6 +189,11 @@ public:
 	                       const ShaderProgram& vertex_program, const ShaderProgram& pixel_program);
 	ComputePipeline& CreateComputePipeline(ShaderComputeInputInfo& input_info,
 	                                       const ShaderProgram&    compute_program);
+
+	// The presenter counts the frames the guest shows, which is what ends warm-up. It is a
+	// counter rather than a call on this object because the presenter outlives it.
+	static void NoteGuestFrame() noexcept;
+
 	// The vertex-layout part of a graphics pipeline key, derived from the bound vertex buffers.
 	[[nodiscard]] static PipelineVertexInputState
 	BuildVertexInputState(const ShaderVertexInputInfo& vs_input_info);
@@ -298,6 +304,9 @@ private:
 	std::vector<std::jthread>                                        m_workers;
 	bool                                                             m_stop_workers = false;
 	bool                                                             m_async        = false;
+	ShaderWarmUp                                                     m_warm_up;
+	uint64_t                                                         m_sync_pipeline_builds = 0;
+	static std::atomic<uint64_t>                                     s_guest_frames;
 
 	// Periodic and emergency saves of the driver cache. m_pipelines_created counts pipelines that
 	// were really built (and therefore added to the driver cache); a save is only worth it when
@@ -318,6 +327,7 @@ private:
 	void StopWorkers();
 	void EnqueueJob(std::function<void()> job);
 	void DrainCompletedPipelines();
+	void UpdateWarmUp();
 };
 
 class GraphicsPipelineLibraryCache {

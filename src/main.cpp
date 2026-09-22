@@ -75,8 +75,11 @@ static void PrintUsage() {
 	::printf("  --perf-stats <true|false>            Enable performance statistics collection.\n");
 	::printf("  --hot-pages <true|false>             Keep frequently rewritten GPU-visible pages\n"
 	         "                                       writable instead of faulting. Default: true.\n");
-	::printf("  --async-shaders <true|false>         Build graphics pipelines on worker threads and\n"
-	         "                                       skip draws until ready. Default: true.\n");
+	::printf(
+	    "  --async-shaders <true|false|warmup>  Build graphics pipelines on worker threads and\n"
+	    "                                       skip draws until ready. Default: true.\n"
+	    "                                       warmup skips nothing until the game shows a\n"
+	    "                                       frame that needed no new shaders.\n");
 	::printf("  --spirv-debug-printf <true|false>    Enable SPIR-V debug printf.\n");
 	::printf(
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
@@ -123,6 +126,20 @@ static bool ParseEnum(const std::string& value, E& out) {
 
 	out = enum_value.value();
 	return true;
+}
+
+// Accepts the plain switch it grew out of, plus the mode in between.
+static bool ParseAsyncShaders(const std::string& value, Config::AsyncShaders& out) {
+	bool enabled = false;
+	if (ParseBool(value, enabled)) {
+		out = enabled ? Config::AsyncShaders::On : Config::AsyncShaders::Off;
+		return true;
+	}
+	if (value == "warmup") {
+		out = Config::AsyncShaders::WarmUp;
+		return true;
+	}
+	return false;
 }
 
 static bool ParseConsoleLanguage(const std::string& value, uint32_t& out) {
@@ -308,8 +325,8 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 		} else if (arg == "--async-shaders") {
-			if (!ParseBool(value, options.config.async_shaders)) {
-				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+			if (!ParseAsyncShaders(value, options.config.async_shaders)) {
+				::printf("invalid value for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
 		} else if (arg == "--hot-pages") {

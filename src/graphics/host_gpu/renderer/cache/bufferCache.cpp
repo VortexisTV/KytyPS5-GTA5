@@ -15,7 +15,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cinttypes>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <utility>
@@ -380,6 +382,27 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 			                                      copy.size);
 		}
 	} else {
+		// Each of these costs a full GPU round trip, so the handful that repeat every frame matter
+		// far more than their byte count suggests. Name them once so the ranges can be identified
+		// without a debugger; capped because a drain per frame would otherwise fill the console.
+		if (PerfStats::Enabled()) {
+			static std::atomic<uint32_t> reported = 0;
+			if (reported.fetch_add(1, std::memory_order_relaxed) < 64) {
+				uint64_t bytes = 0;
+				for (const auto& copy: copies) {
+					bytes += copy.size;
+				}
+				std::printf(
+				    "[readback] drain %s 0x%016" PRIx64 "+0x%" PRIx64 ", %zu copies, %" PRIu64
+				    " bytes, owner %s size 0x%" PRIx64 ", hot %d, shadow %d, writes %zu\n",
+				    is_write ? "write" : "read", vaddr, size, copies.size(), bytes,
+				    hot_owner != nullptr ? "yes" : "no",
+				    hot_owner != nullptr ? hot_owner->Size() : uint64_t {0},
+				    hot_owner != nullptr ? int {hot_owner->readback_hot} : -1,
+				    hot_owner != nullptr ? int {hot_owner->shadow_valid} : -1,
+				    hot_owner != nullptr ? hot_owner->writes_since_shadow.size() : size_t {0});
+			}
+		}
 		if (hot_owner != nullptr && hot_owner->Size() <= MaxHotReadbackSize) {
 			hot_owner->readback_hot = true;
 		}

@@ -43,6 +43,14 @@ static thread_local bool              g_gpu_mutex_owned   = false;
 static thread_local bool              g_gpu_thread        = false;
 static thread_local GuestGpu*         g_gpu_state         = nullptr;
 
+// Flip waiting the emulated GPU thread has finished. A guest thread draining the GPU thread samples
+// it either side of the wait to tell display pacing apart from command translation.
+static std::atomic<uint64_t> g_flip_wait_ticks = 0;
+
+static uint64_t FlipWaitTicks() {
+	return g_flip_wait_ticks.load(std::memory_order_relaxed);
+}
+
 struct DrawIndirectArgs {
 	uint32_t vertex_count_per_instance;
 	uint32_t instance_count;
@@ -205,8 +213,15 @@ void GuestGpu::SubmitFlipPreparation(uint64_t request_id) {
 void GuestGpu::Done() {
 	GpuMutexLock lock(m_submission_mutex);
 	if (!IsGpuThread()) {
+		const auto      flip_before = FlipWaitTicks();
 		PerfStats::Span wait(PerfStats::SpanId::GameWaitGpuIdle);
 		WaitForIdle();
+		wait.Stop();
+		// The drain waits for whatever the GPU thread is doing, and part of that is the guest's own
+		// flip wait: display pacing this thread would not have waited for on hardware that consumes
+		// submissions asynchronously. Separating the two says how much of the stall command
+		// translation actually accounts for.
+		PerfStats::Record(PerfStats::SpanId::GameWaitGpuFlip, FlipWaitTicks() - flip_before);
 	}
 	m_graphics_done = true;
 	m_done_num++;
@@ -1210,9 +1225,14 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
 	BufferFlush();
 
+	const auto      started = PerfStats::Enabled() ? PerfStats::Now() : uint64_t {0};
 	PerfStats::Span wait(PerfStats::SpanId::FlipWait);
 	m_renderer.GetVideoOut().WaitFlipDone(static_cast<int>(video_out_handle),
 	                                      static_cast<int>(display_buffer_index));
+	wait.Stop();
+	if (PerfStats::Enabled()) {
+		g_flip_wait_ticks.fetch_add(PerfStats::Now() - started, std::memory_order_relaxed);
+	}
 }
 
 template <typename T>
