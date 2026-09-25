@@ -1,5 +1,7 @@
 # KytyPS5 (GTA 5 Fork)
 
+## Grab the latest pre-built release in Actions
+
 ## **Red artifacts and lighting are expected upon first booting the game, let it shader build and compile before restarting.**
 
 ## Set the Graphics Mode to Performance to prevent crashing. If trees disappear, enable tessellation support (experimental).
