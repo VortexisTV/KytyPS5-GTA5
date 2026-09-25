@@ -63,12 +63,11 @@ uint64_t GpuResourceManager::MappedExtent(uint64_t vaddr, uint64_t max_size) con
 }
 
 void GpuResourceManager::MapMemory(uint64_t vaddr, uint64_t size) {
-	{
-		std::lock_guard lock(m_mapped_ranges_mutex);
-		m_mapped_ranges.Add(vaddr, size);
-	}
-	m_mapping_epoch.fetch_add(1, std::memory_order_release);
-	m_page_manager.OnGpuMap(vaddr, size);
+    {
+        std::lock_guard lock(m_mapped_ranges_mutex);
+        m_mapped_ranges.Add(vaddr, size);
+    }
+    m_mapping_epoch.fetch_add(1, std::memory_order_release);
 }
 
 void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -85,7 +84,6 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		}
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
-		m_page_manager.OnGpuUnmap(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
 		m_mapping_epoch.fetch_add(1, std::memory_order_release);
