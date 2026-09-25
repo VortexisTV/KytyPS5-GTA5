@@ -59,7 +59,11 @@ int64_t LastWriteUnixTime(const std::filesystem::path& path) {
 	if (error) {
 		return 0;
 	}
+#if defined(__APPLE__)
+	const auto system = std::filesystem::file_time_type::clock::to_sys(written);
+#else
 	const auto system = std::chrono::clock_cast<std::chrono::system_clock>(written);
+#endif
 	return std::chrono::duration_cast<std::chrono::seconds>(system.time_since_epoch()).count();
 }
 
