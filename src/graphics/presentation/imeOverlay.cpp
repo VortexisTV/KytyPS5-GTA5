@@ -1,6 +1,6 @@
 #include "graphics/presentation/imeOverlay.h"
 
-#include "SDL.h"
+#include <SDL3/SDL.h>
 #include "common/assert.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
