@@ -418,8 +418,9 @@ void ShutdownImeInput() {
 	g_input_controller = false;
 	g_input_keyboard   = false;
 	g_input_multiline  = false;
-	if (SDL_TextInputActive() == true) {
-		SDL_StopTextInput();
+	if (SDL_Window* window = SDL_GetKeyboardFocus();
+		window != nullptr && SDL_TextInputActive(window)) {
+		SDL_StopTextInput(window);
 	}
 }
 
@@ -449,12 +450,19 @@ bool ProcessImeInput(const SDL_Event& event) {
 		g_input_controller      = update.capture_controller;
 		g_input_keyboard        = update.capture_keyboard;
 		g_input_multiline       = update.multiline;
-		if (g_input_keyboard) {
-			SDL_StartTextInput();
-		} else if (SDL_TextInputActive() == true) {
-			SDL_StopTextInput();
+		
+		SDL_Window* window = SDL_GetKeyboardFocus();
+
+		if (window != nullptr) {
+			if (g_input_keyboard) {
+				SDL_StartTextInput(window);
+			} else if (SDL_TextInputActive(window)) {
+				SDL_StopTextInput(window);
+			}
 		}
+
 		return true;
+	
 	}
 	if (event.type == SDL_EVENT_GAMEPAD_REMOVED) {
 		if (g_input_active && g_input_controller) {
@@ -492,24 +500,24 @@ bool ProcessImeInput(const SDL_Event& event) {
 		}
 		case SDL_EVENT_TEXT_EDITING: return true;
 		case SDL_EVENT_KEY_DOWN: {
-			g_last_external_keycode = static_cast<uint16_t>(event.key.keysym.scancode);
+			g_last_external_keycode = static_cast<uint16_t>(event.key.scancode);
 			g_last_external_status =
-			    ExternalKeyStatus(static_cast<SDL_Keymod>(event.key.keysym.mod), false);
+			    ExternalKeyStatus(static_cast<SDL_Keymod>(event.key.mod), false);
 			auto action = Ime::ExternalAction::Text;
 			bool queue  = true;
-			if (event.key.keysym.sym == SDLK_BACKSPACE) {
+			if (event.key.key == SDLK_BACKSPACE) {
 				action = Ime::ExternalAction::Backspace;
-			} else if (event.key.keysym.sym == SDLK_LEFT) {
+			} else if (event.key.key == SDLK_LEFT) {
 				action = Ime::ExternalAction::MoveLeft;
-			} else if (event.key.keysym.sym == SDLK_RIGHT) {
+			} else if (event.key.key == SDLK_RIGHT) {
 				action = Ime::ExternalAction::MoveRight;
-			} else if (event.key.keysym.sym == SDLK_ESCAPE) {
+			} else if (event.key.key == SDLK_ESCAPE) {
 				action = Ime::ExternalAction::Cancel;
-			} else if (event.key.keysym.sym == SDLK_RETURN ||
-			           event.key.keysym.sym == SDLK_KP_ENTER) {
+			} else if (event.key.key == SDLK_RETURN ||
+			           event.key.key == SDLK_KP_ENTER) {
 				action =
 				    g_input_multiline ? Ime::ExternalAction::Newline : Ime::ExternalAction::Accept;
-			} else if (event.key.keysym.sym == SDLK_TAB) {
+			} else if (event.key.key == SDLK_TAB) {
 				action = Ime::ExternalAction::None;
 			} else {
 				queue = false;
@@ -524,12 +532,12 @@ bool ProcessImeInput(const SDL_Event& event) {
 		case SDL_EVENT_KEY_UP: return true;
 		case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
 		case SDL_EVENT_GAMEPAD_BUTTON_UP:
-			QueueInput({InputKind::Button, generation, event.cbutton.button,
+			QueueInput({InputKind::Button, generation, event.gbutton.button,
 			            event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ? 1.0f : 0.0f, 0.0f});
 			return true;
 		case SDL_EVENT_GAMEPAD_AXIS_MOTION:
-			QueueInput({InputKind::Axis, generation, event.caxis.axis,
-			            static_cast<float>(event.caxis.value), 0.0f});
+			QueueInput({InputKind::Axis, generation, event.gaxis.axis,
+			            static_cast<float>(event.gaxis.value), 0.0f});
 			return true;
 		case SDL_EVENT_MOUSE_MOTION:
 			QueueInput({InputKind::MousePosition, generation, 0, static_cast<float>(event.motion.x),
