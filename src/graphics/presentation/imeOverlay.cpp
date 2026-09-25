@@ -236,16 +236,16 @@ void OnDialogVisibilityChanged(bool, uint64_t) {
 
 uint32_t ExternalKeyStatus(SDL_Keymod modifiers, bool character_valid) {
 	uint32_t status = 0x00000001 | (character_valid ? 0x00000002 : 0);
-	if ((modifiers & KMOD_LCTRL) != 0) status |= 0x00000100;
-	if ((modifiers & KMOD_LSHIFT) != 0) status |= 0x00000200;
-	if ((modifiers & KMOD_LALT) != 0) status |= 0x00000400;
-	if ((modifiers & KMOD_LGUI) != 0) status |= 0x00000800;
-	if ((modifiers & KMOD_RCTRL) != 0) status |= 0x00001000;
-	if ((modifiers & KMOD_RSHIFT) != 0) status |= 0x00002000;
-	if ((modifiers & KMOD_RALT) != 0) status |= 0x00004000;
-	if ((modifiers & KMOD_RGUI) != 0) status |= 0x00008000;
-	if ((modifiers & KMOD_NUM) != 0) status |= 0x00010000;
-	if ((modifiers & KMOD_CAPS) != 0) status |= 0x00020000;
+	if ((modifiers & SDL_KMOD_LCTRL) != 0) status |= 0x00000100;
+	if ((modifiers & SDL_KMOD_LSHIFT) != 0) status |= 0x00000200;
+	if ((modifiers & SDL_KMOD_LALT) != 0) status |= 0x00000400;
+	if ((modifiers & SDL_KMOD_LGUI) != 0) status |= 0x00000800;
+	if ((modifiers & SDL_KMOD_RCTRL) != 0) status |= 0x00001000;
+	if ((modifiers & SDL_KMOD_RSHIFT) != 0) status |= 0x00002000;
+	if ((modifiers & SDL_KMOD_RALT) != 0) status |= 0x00004000;
+	if ((modifiers & SDL_KMOD_RGUI) != 0) status |= 0x00008000;
+	if ((modifiers & SDL_KMOD_NUM) != 0) status |= 0x00010000;
+	if ((modifiers & SDL_KMOD_CAPS) != 0) status |= 0x00020000;
 	return status;
 }
 
@@ -360,14 +360,14 @@ float AlignmentPivot(Ime::Alignment alignment) {
 
 ImGuiKey ControllerButtonToKey(int button) {
 	switch (button) {
-		case SDL_CONTROLLER_BUTTON_A: return ImGuiKey_GamepadFaceDown;
-		case SDL_CONTROLLER_BUTTON_B: return ImGuiKey_GamepadFaceRight;
-		case SDL_CONTROLLER_BUTTON_X: return ImGuiKey_GamepadFaceLeft;
-		case SDL_CONTROLLER_BUTTON_Y: return ImGuiKey_GamepadFaceUp;
-		case SDL_CONTROLLER_BUTTON_DPAD_LEFT: return ImGuiKey_GamepadDpadLeft;
-		case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: return ImGuiKey_GamepadDpadRight;
-		case SDL_CONTROLLER_BUTTON_DPAD_UP: return ImGuiKey_GamepadDpadUp;
-		case SDL_CONTROLLER_BUTTON_DPAD_DOWN: return ImGuiKey_GamepadDpadDown;
+		case SDL_GAMEPAD_BUTTON_SOUTH: return ImGuiKey_GamepadFaceDown;
+		case SDL_GAMEPAD_BUTTON_EAST: return ImGuiKey_GamepadFaceRight;
+		case SDL_GAMEPAD_BUTTON_WEST: return ImGuiKey_GamepadFaceLeft;
+		case SDL_GAMEPAD_BUTTON_NORTH: return ImGuiKey_GamepadFaceUp;
+		case SDL_GAMEPAD_BUTTON_DPAD_LEFT: return ImGuiKey_GamepadDpadLeft;
+		case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: return ImGuiKey_GamepadDpadRight;
+		case SDL_GAMEPAD_BUTTON_DPAD_UP: return ImGuiKey_GamepadDpadUp;
+		case SDL_GAMEPAD_BUTTON_DPAD_DOWN: return ImGuiKey_GamepadDpadDown;
 		default: return ImGuiKey_None;
 	}
 }
@@ -418,7 +418,7 @@ void ShutdownImeInput() {
 	g_input_controller = false;
 	g_input_keyboard   = false;
 	g_input_multiline  = false;
-	if (SDL_IsTextInputActive() == SDL_TRUE) {
+	if (SDL_TextInputActive() == true) {
 		SDL_StopTextInput();
 	}
 }
@@ -451,12 +451,12 @@ bool ProcessImeInput(const SDL_Event& event) {
 		g_input_multiline       = update.multiline;
 		if (g_input_keyboard) {
 			SDL_StartTextInput();
-		} else if (SDL_IsTextInputActive() == SDL_TRUE) {
+		} else if (SDL_TextInputActive() == true) {
 			SDL_StopTextInput();
 		}
 		return true;
 	}
-	if (event.type == SDL_CONTROLLERDEVICEREMOVED) {
+	if (event.type == SDL_EVENT_GAMEPAD_REMOVED) {
 		if (g_input_active && g_input_controller) {
 			QueueInput({InputKind::ResetController, g_input_generation, 0, 0.0f, 0.0f});
 		}
@@ -467,19 +467,19 @@ bool ProcessImeInput(const SDL_Event& event) {
 	}
 
 	const uint64_t generation       = g_input_generation;
-	const bool     controller_event = event.type == SDL_CONTROLLERBUTTONDOWN ||
-	                                  event.type == SDL_CONTROLLERBUTTONUP ||
-	                                  event.type == SDL_CONTROLLERAXISMOTION;
+	const bool     controller_event = event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ||
+	                                  event.type == SDL_EVENT_GAMEPAD_BUTTON_UP ||
+	                                  event.type == SDL_EVENT_GAMEPAD_AXIS_MOTION;
 	if (controller_event && !g_input_controller) {
 		return false;
 	}
-	const bool keyboard_event = event.type == SDL_TEXTINPUT || event.type == SDL_TEXTEDITING ||
-	                            event.type == SDL_KEYDOWN || event.type == SDL_KEYUP;
+	const bool keyboard_event = event.type == SDL_EVENT_TEXT_INPUT || event.type == SDL_EVENT_TEXT_EDITING ||
+	                            event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP;
 	if (keyboard_event && !g_input_keyboard) {
 		return false;
 	}
 	switch (event.type) {
-		case SDL_TEXTINPUT: {
+		case SDL_EVENT_TEXT_INPUT: {
 			const auto text = Utf8ToUtf16(event.text.text);
 			if (!text.empty()) {
 				auto input = MakeExternalInput(Ime::ExternalAction::Text, g_last_external_keycode,
@@ -490,8 +490,8 @@ bool ProcessImeInput(const SDL_Event& event) {
 			}
 			return true;
 		}
-		case SDL_TEXTEDITING: return true;
-		case SDL_KEYDOWN: {
+		case SDL_EVENT_TEXT_EDITING: return true;
+		case SDL_EVENT_KEY_DOWN: {
 			g_last_external_keycode = static_cast<uint16_t>(event.key.keysym.scancode);
 			g_last_external_status =
 			    ExternalKeyStatus(static_cast<SDL_Keymod>(event.key.keysym.mod), false);
@@ -521,26 +521,26 @@ bool ProcessImeInput(const SDL_Event& event) {
 			}
 			return true;
 		}
-		case SDL_KEYUP: return true;
-		case SDL_CONTROLLERBUTTONDOWN:
-		case SDL_CONTROLLERBUTTONUP:
+		case SDL_EVENT_KEY_UP: return true;
+		case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+		case SDL_EVENT_GAMEPAD_BUTTON_UP:
 			QueueInput({InputKind::Button, generation, event.cbutton.button,
-			            event.type == SDL_CONTROLLERBUTTONDOWN ? 1.0f : 0.0f, 0.0f});
+			            event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ? 1.0f : 0.0f, 0.0f});
 			return true;
-		case SDL_CONTROLLERAXISMOTION:
+		case SDL_EVENT_GAMEPAD_AXIS_MOTION:
 			QueueInput({InputKind::Axis, generation, event.caxis.axis,
 			            static_cast<float>(event.caxis.value), 0.0f});
 			return true;
-		case SDL_MOUSEMOTION:
+		case SDL_EVENT_MOUSE_MOTION:
 			QueueInput({InputKind::MousePosition, generation, 0, static_cast<float>(event.motion.x),
 			            static_cast<float>(event.motion.y)});
 			return true;
-		case SDL_MOUSEBUTTONDOWN:
-		case SDL_MOUSEBUTTONUP:
+		case SDL_EVENT_MOUSE_BUTTON_DOWN:
+		case SDL_EVENT_MOUSE_BUTTON_UP:
 			QueueInput({InputKind::MouseButton, generation, event.button.button,
-			            event.type == SDL_MOUSEBUTTONDOWN ? 1.0f : 0.0f, 0.0f});
+			            event.type == SDL_EVENT_MOUSE_BUTTON_DOWN ? 1.0f : 0.0f, 0.0f});
 			return true;
-		case SDL_MOUSEWHEEL:
+		case SDL_EVENT_MOUSE_WHEEL:
 			QueueInput({InputKind::MouseWheel, generation, 0, static_cast<float>(event.wheel.x),
 			            static_cast<float>(event.wheel.y)});
 			return true;
@@ -632,9 +632,9 @@ struct ImeOverlay::Impl {
 			switch (event.kind) {
 				case InputKind::Button: {
 					const bool down = event.x != 0.0f;
-					if (down && event.id == SDL_CONTROLLER_BUTTON_B) {
+					if (down && event.id == SDL_GAMEPAD_BUTTON_EAST) {
 						Ime::HostCancel(generation);
-					} else if (down && event.id == SDL_CONTROLLER_BUTTON_Y) {
+					} else if (down && event.id == SDL_GAMEPAD_BUTTON_NORTH) {
 						Ime::HostBackspace(generation);
 					}
 					const ImGuiKey key = ControllerButtonToKey(event.id);
@@ -645,19 +645,19 @@ struct ImeOverlay::Impl {
 				}
 				case InputKind::Axis: {
 					const float value = event.x / (event.x < 0.0f ? 32768.0f : 32767.0f);
-					if (event.id == SDL_CONTROLLER_AXIS_LEFTX) {
+					if (event.id == SDL_GAMEPAD_AXIS_LEFTX) {
 						io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickLeft, value < -0.25f,
 						                     std::max(-value, 0.0f));
 						io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickRight, value > 0.25f,
 						                     std::max(value, 0.0f));
-					} else if (event.id == SDL_CONTROLLER_AXIS_LEFTY) {
+					} else if (event.id == SDL_GAMEPAD_AXIS_LEFTY) {
 						io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickUp, value < -0.25f,
 						                     std::max(-value, 0.0f));
 						io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickDown, value > 0.25f,
 						                     std::max(value, 0.0f));
-					} else if (event.id == SDL_CONTROLLER_AXIS_RIGHTX) {
+					} else if (event.id == SDL_GAMEPAD_AXIS_RIGHTX) {
 						right_stick.x = std::abs(value) > 0.2f ? value : 0.0f;
-					} else if (event.id == SDL_CONTROLLER_AXIS_RIGHTY) {
+					} else if (event.id == SDL_GAMEPAD_AXIS_RIGHTY) {
 						right_stick.y = std::abs(value) > 0.2f ? value : 0.0f;
 					}
 					break;
