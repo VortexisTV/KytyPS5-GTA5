@@ -1,0 +1,32 @@
+[33mcommit 77992765eb7989cd7f7a10f27f70c50d9a18b9c2[m
+Author: Thomas B <69823294+VortexisTV@users.noreply.github.com>
+Date:   Fri Sep 11 08:55:35 2026 -0500
+
+    Add needs_lds_barriers to ShaderComputeInputInfo
+
+[1mdiff --git a/src/graphics/shader/shader.h b/src/graphics/shader/shader.h[m
+[1mindex 7b02eebf..b4075f76 100644[m
+[1m--- a/src/graphics/shader/shader.h[m
+[1m+++ b/src/graphics/shader/shader.h[m
+[36m@@ -119,13 +119,14 @@[m [mstruct ShaderVertexInputInfo {[m
+ };[m
+ [m
+ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {[m
+[31m-	uint32_t           dispatch_threads_num[3]    = {0, 0, 0};[m
+[31m-	bool               group_id[3]                = {false, false, false};[m
+[31m-	bool               dispatch_thread_dimensions = false;[m
+[31m-	int                thread_ids_num             = 0;[m
+[31m-	int                workgroup_register         = 0;[m
+[31m-	bool               tg_size_en                 = false;[m
+[31m-	ShaderStageRuntime stage;[m
+[32m+[m[32m    uint32_t           dispatch_threads_num[3]    = {0, 0, 0};[m
+[32m+[m[32m    bool               group_id[3]                = {false, false, false};[m
+[32m+[m[32m    bool               dispatch_thread_dimensions = false;[m
+[32m+[m[32m    bool               needs_lds_barriers         = false;[m
+[32m+[m[32m    int                thread_ids_num             = 0;[m
+[32m+[m[32m    int                workgroup_register         = 0;[m
+[32m+[m[32m    bool               tg_size_en                 = false;[m
+[32m+[m[32m    ShaderStageRuntime stage;[m
+ };[m
+ [m
+ struct ShaderPixelInputInfo {[m
