@@ -99,8 +99,8 @@ SharedMemoryBarrierStats InsertSharedMemoryBarriers(Program& program, uint32_t w
 	SharedMemoryBarrierStats stats;
 	const auto threadgroup_size = compute_info.threads_num[0] * compute_info.threads_num[1] *
 	                              compute_info.threads_num[2];
-	if (wave_size != 64u || !compute_info.needs_lds_barriers ||
-	    compute_info.lds_size_dwords == 0u || threadgroup_size != 64u) {
+	if (wave_size != 64u || compute_info.host_subgroup_size >= wave_size ||
+    	compute_info.lds_size_dwords == 0u || threadgroup_size != 64u) {
 		return stats;
 	}
 	if (program.blocks.size() != program.block_info.size()) {
