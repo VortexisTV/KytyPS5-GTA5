@@ -42,6 +42,10 @@ namespace LibPsml {
 LIB_DEFINE(InitPsml_1);
 } // namespace LibPsml
 
+namespace LibCes {
+LIB_DEFINE(InitCes_1);
+} // namespace LibCes
+
 namespace LibC {
 LIB_DEFINE(InitLibC_1);
 } // namespace LibC
@@ -68,6 +72,9 @@ LIB_DEFINE(InitRtc_1);
 
 namespace LibGen5 {
 LIB_DEFINE(InitVideoOut_1);
+namespace VrrStatus {
+LIB_DEFINE(InitVideoOutVrrStatus_1);
+} // namespace VrrStatus
 } // namespace LibGen5
 
 LIB_DEFINE(InitAppContent_1);
@@ -78,6 +85,7 @@ LIB_DEFINE(InitDialog_1);
 LIB_DEFINE(InitFont_1);
 LIB_DEFINE(InitFontFt_1);
 LIB_DEFINE(InitAgcDriver_1);
+LIB_DEFINE(InitHmd2_1);
 LIB_DEFINE(InitLibKernel_1);
 LIB_DEFINE(InitNet_1);
 LIB_DEFINE(InitPad_1);
@@ -103,6 +111,7 @@ void InitAll(Loader::SymbolDatabase* s) {
 	LibContentExport::InitContentExport_1(s);
 	LibContentSearch::InitContentSearch_1(s);
 	LibC::InitLibC_1(s);
+	LibCes::InitCes_1(s);
 	InitDbgAddressSanitizer_1(s);
 	LibRazorCpu::InitRazorCpu_1(s);
 	InitDialog_1(s);
@@ -110,6 +119,7 @@ void InitAll(Loader::SymbolDatabase* s) {
 	InitFont_1(s);
 	InitFontFt_1(s);
 	InitAgcDriver_1(s);
+	InitHmd2_1(s);
 	InitLibKernel_1(s);
 	LibMouse::InitMouse_1(s);
 	LibKeyboard::InitKeyboard_1(s);
@@ -131,6 +141,7 @@ void InitAll(Loader::SymbolDatabase* s) {
 	InitUserService_1(s);
 	VideoDec2::InitVideoDec2_1(s);
 	LibGen5::InitVideoOut_1(s);
+	LibGen5::VrrStatus::InitVideoOutVrrStatus_1(s);
 	InitWebBrowserDialog_1(s);
 }
 

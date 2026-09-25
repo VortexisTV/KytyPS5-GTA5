@@ -9,12 +9,10 @@ namespace Libs::Graphics {
 
 MasterSemaphore::MasterSemaphore(GraphicContext& graphics): m_graphics(graphics) {
 	vk::SemaphoreTypeCreateInfo type_info {};
-	type_info.sType         = vk::StructureType::eSemaphoreTypeCreateInfo;
 	type_info.semaphoreType = vk::SemaphoreType::eTimeline;
 	type_info.initialValue  = 0;
 
 	vk::SemaphoreCreateInfo create_info {};
-	create_info.sType = vk::StructureType::eSemaphoreCreateInfo;
 	create_info.pNext = &type_info;
 
 	const auto result = m_graphics.device.createSemaphore(&create_info, nullptr, &m_semaphore);
@@ -59,7 +57,6 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	const auto            reason = GpuWaitScope::Reason();
 	PerfStats::Span       reason_span(reason, counted && reason != PerfStats::SpanId::Count);
 	vk::SemaphoreWaitInfo wait_info {};
-	wait_info.sType          = vk::StructureType::eSemaphoreWaitInfo;
 	wait_info.semaphoreCount = 1;
 	wait_info.pSemaphores    = &m_semaphore;
 	wait_info.pValues        = &tick;

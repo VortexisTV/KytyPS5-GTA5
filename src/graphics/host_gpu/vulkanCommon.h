@@ -15,6 +15,7 @@
 
 #include <cstdint>
 #include <fmt/format.h>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -23,14 +24,9 @@
 
 namespace Libs::Graphics {
 
-using VulkanMemoryBarrier = vk::MemoryBarrier;
-
-std::string VulkanToString(vk::Result value);
-std::string VulkanToString(vk::Format value);
-std::string VulkanToString(vk::ImageLayout value);
-std::string VulkanToString(vk::QueueFlags value);
 vk::Format  VulkanFormat(Prospero::BufferFormat guest_format);
 void        RequireVulkanSuccess(vk::Result result, const char* operation);
+vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device);
 
 template <typename Handle, typename... Args>
 void SetVulkanObjectNameF(vk::Device device, Handle handle, fmt::format_string<Args...> format,
@@ -42,7 +38,6 @@ void SetVulkanObjectNameF(vk::Device device, Handle handle, fmt::format_string<A
 
 	const auto                      name = fmt::format(format, std::forward<Args>(args)...);
 	vk::DebugUtilsObjectNameInfoEXT info {};
-	info.sType        = vk::StructureType::eDebugUtilsObjectNameInfoEXT;
 	info.objectType   = Handle::objectType;
 	info.objectHandle = static_cast<uint64_t>(
 	    reinterpret_cast<uintptr_t>(static_cast<typename Handle::CType>(handle)));

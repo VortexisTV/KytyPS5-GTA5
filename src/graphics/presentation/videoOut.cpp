@@ -21,6 +21,7 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "loader/systemContent.h"
 
 #include <algorithm>
 #include <array>
@@ -238,7 +239,9 @@ private:
 
 struct VideoOutDriver::Impl {
 public:
-	static constexpr int VIDEO_OUT_NUM_MAX = 4;
+	static constexpr std::array VIDEO_OUT_BUSES {
+	    VIDEO_OUT_BUS_TYPE_MAIN, VIDEO_OUT_BUS_TYPE_OVERLAY, VIDEO_OUT_BUS_TYPE_SUB};
+	static constexpr int VIDEO_OUT_NUM_MAX = VIDEO_OUT_BUSES.size() + 1;
 
 	Impl(uint32_t width, uint32_t height, Graphics::Presenter& presenter)
 	    : m_renderer(presenter.Renderer()), m_presenter(presenter), m_flip_queue(presenter) {
@@ -249,7 +252,7 @@ public:
 	~Impl();
 	KYTY_CLASS_NO_COPY(Impl);
 
-	int             Open(int bus_type);
+	int             Open(int bus_type, int index);
 	bool            Close(int handle);
 	VideoOutConfig* Get(int handle);
 	VideoOutConfig* Get(int handle, uint64_t& generation);
@@ -563,7 +566,12 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 	info.bgra16          = pixel_format.bgra16;
 	info.mip_layout[0]   = {0, total.size, pitch, attribute.height};
 	if (compression != Graphics::VideoOutCompression::Uncompressed) {
-		info.metadata.range       = {buffer.metadata_address, 0};
+		Graphics::TileSizeAlign dcc_size {};
+		if (!Graphics::TileGetDccSize(attribute.width, attribute.height, 1,
+		                              pixel_format.bytes_per_element, 1, tile_mode, dcc_size)) {
+			EXIT("invalid video-out DCC footprint\n");
+		}
+		info.metadata.range       = {buffer.metadata_address, dcc_size.size};
 		info.metadata.kind        = Graphics::ImageMetadataKind::Dcc;
 		info.metadata.control     = attribute.dcc_control;
 		info.metadata.compression = compression;
@@ -611,12 +619,17 @@ void VideoOutDriver::Impl::Init(uint32_t width, uint32_t height) {
 	}
 }
 
-int VideoOutDriver::Impl::Open(int bus_type) {
+int VideoOutDriver::Impl::Open(int bus_type, int index) {
+	const auto bus = std::find(VIDEO_OUT_BUSES.begin(), VIDEO_OUT_BUSES.end(), bus_type);
+	if (bus == VIDEO_OUT_BUSES.end()) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	EXIT_NOT_IMPLEMENTED(index != 0);
 	Common::LockGuard lock(m_mutex);
 
-	const int handle = bus_type + 1;
+	const int handle = static_cast<int>(bus - VIDEO_OUT_BUSES.begin()) + 1;
 	if (m_video_out_ctx[handle].opened) {
-		return -1;
+		return VIDEO_OUT_ERROR_RESOURCE_BUSY;
 	}
 	auto&             config = m_video_out_ctx[handle];
 	Common::LockGuard config_lock(config.mutex);
@@ -810,7 +823,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 
 		VblankBegin();
 		bool presented = m_flip_queue.Flip(0);
-		if (!presented && m_presenter.NeedsImeRefresh()) {
+		if (!presented && m_presenter.NeedsSystemOverlayRefresh()) {
 			if (auto* frame = m_presenter.PrepareLastFrame(); frame != nullptr) {
 				m_presenter.Present(*frame, true);
 				presented = true;
@@ -1127,7 +1140,6 @@ bool FlipQueue::Flip(uint32_t micros) {
 	KYTY_PROFILER_FRAME_MARK;
 	PerfStats::OnGuestFrame();
 	Graphics::PipelineCache::NoteGuestFrame();
-	Graphics::RenderDocOnGuestFlip();
 
 	m_mutex.Lock();
 	if (m_requests.empty() || m_requests.front().id != r.id ||
@@ -1154,8 +1166,10 @@ bool FlipQueue::Flip(uint32_t micros) {
 	m_mutex.Unlock();
 	r.cfg->mutex.Unlock();
 
+	Graphics::RenderDocOnGuestFlip(m_presenter.Renderer());
+
 	if (Config::GraphicsDebugDumpEnabled() &&
-	    Config::GetPrintfDirection() != Config::OutputDirection::Silent) {
+	    Config::GetPrintfDirection() != Config::LogDirection::Silent) {
 		LOGF("Flip done: %d\n", r.index);
 	}
 
@@ -1172,21 +1186,9 @@ KYTY_SYSV_ABI int VideoOutOpen(int user_id, int bus_type, int index, const void*
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(user_id != 255 && user_id != 0);
-	if (bus_type != VIDEO_OUT_BUS_TYPE_MAIN && bus_type != VIDEO_OUT_BUS_TYPE_OVERLAY &&
-	    bus_type != VIDEO_OUT_BUS_TYPE_SUB) {
-		return VIDEO_OUT_ERROR_INVALID_VALUE;
-	}
-	EXIT_NOT_IMPLEMENTED(index != 0);
-
 	LOGF("\t param = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(param));
 
-	int handle = DriverState().Open(bus_type);
-
-	if (handle < 0) {
-		return VIDEO_OUT_ERROR_RESOURCE_BUSY;
-	}
-
-	return handle;
+	return DriverState().Open(bus_type, index);
 }
 
 KYTY_SYSV_ABI int VideoOutClose(int handle) {
@@ -1662,8 +1664,12 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 		return VIDEO_OUT_ERROR_INVALID_HANDLE;
 	}
 
+	int32_t attribute3 = 0;
+	Loader::SystemContentParamSfoGetInt("ATTRIBUTE3", &attribute3);
 	ctx->mutex.Lock();
-	status->resolution   = (ctx->width >= 3840 || ctx->height >= 2160 ? 2u : 1u);
+	// Primary output reports 4K unless param.json Video-out Info enables resolution detection.
+	status->resolution =
+	    ((attribute3 & 4) != 0 && ctx->width < 3840 && ctx->height < 2160 ? 1u : 2u);
 	status->dynamicRange = 1;
 	status->refreshRate =
 	    (ctx->output_mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ || Config::GetVblankFrequency() >= 119
@@ -1675,6 +1681,21 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	status->reserved[2] = 0;
 	ctx->mutex.Unlock();
 
+	return OK;
+}
+
+KYTY_SYSV_ABI int VideoOutGetVrrStatus(int handle, int32_t* status) {
+	PRINT_NAME();
+
+	if (status == nullptr) {
+		return VIDEO_OUT_ERROR_INVALID_ADDRESS;
+	}
+	if (DriverState().Get(handle) == nullptr) {
+		return VIDEO_OUT_ERROR_INVALID_HANDLE;
+	}
+
+	// Kyty currently presents at a fixed refresh rate and does not negotiate VRR.
+	*status = 0;
 	return OK;
 }
 

@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.12...4.3)
+cmake_minimum_required(VERSION 3.16...4.3)
 
 if(CMAKE_VERSION VERSION_GREATER_EQUAL 4.0)
 	set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "Minimum policy version for bundled dependencies")
@@ -11,6 +11,22 @@ if(NOT KYTY_GENERATOR_IS_MULTI_CONFIG AND NOT CMAKE_BUILD_TYPE)
 endif()
 
 project(Kyty)
+
+find_program(SCCACHE_PROGRAM sccache)
+find_program(CCACHE_PROGRAM ccache)
+
+foreach(lang IN ITEMS C CXX)
+    # An explicitly empty launcher disables caching for this language.
+    if(NOT DEFINED CMAKE_${lang}_COMPILER_LAUNCHER)
+        if(SCCACHE_PROGRAM)
+            set(CMAKE_${lang}_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}")
+            message(STATUS "sccache enabled for ${lang}: ${SCCACHE_PROGRAM}")
+        elseif(CCACHE_PROGRAM)
+            set(CMAKE_${lang}_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+            message(STATUS "ccache enabled for ${lang}: ${CCACHE_PROGRAM}")
+        endif()
+    endif()
+endforeach()
 
 option(KYTY_ENABLE_IPO "Enable interprocedural optimization for release builds" ON)
 if(KYTY_ENABLE_IPO)
@@ -140,7 +156,7 @@ if (KYTY_LINKER STREQUAL LD AND NOT LINUX)
 	set(KYTY_LD_OPTIONS "-Wl,--image-base=0x100000000000")
 endif()
 
-project(Kyty${KYTY_PROJECT_NAME}${CMAKE_BUILD_TYPE}${KYTY_COMPILER} VERSION 0.2.2)
+project(Kyty${KYTY_PROJECT_NAME}${CMAKE_BUILD_TYPE}${KYTY_COMPILER} VERSION 0.3.0)
 
 include_directories(
 	${KYTY_THIRD_PARTY_DIR}/gtest/include
@@ -299,6 +315,8 @@ set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
 set(gpu_blit_shader_sources
 	"${gpu_tiler_shader_dir}/gpu_blit_fs_triangle.vert"
 	"${gpu_tiler_shader_dir}/gpu_blit_color_to_ms_depth.frag"
+	"${gpu_tiler_shader_dir}/gpu_dcc_clear_scan.comp"
+	"${gpu_tiler_shader_dir}/gpu_dcc_clear_fill.comp"
 )
 foreach(shader_source IN LISTS gpu_blit_shader_sources)
 	get_filename_component(shader_name "${shader_source}" NAME_WE)
@@ -329,33 +347,19 @@ if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
 
-set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL2-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak)
+set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak)
 
-# Linux system libraries required by the static FFmpeg archive.
+# Linux system libraries.
 if(LINUX)
 	find_package(Threads REQUIRED)
 	list(APPEND kyty_emulator_link_libraries m ${CMAKE_DL_LIBS} Threads::Threads)
-
-	# Optional FFmpeg dependencies.
-	find_package(ZLIB)
-	if(ZLIB_FOUND)
-		list(APPEND kyty_emulator_link_libraries ZLIB::ZLIB)
-	endif()
-	find_library(KYTY_BZ2_LIBRARY bz2)
-	if(KYTY_BZ2_LIBRARY)
-		list(APPEND kyty_emulator_link_libraries ${KYTY_BZ2_LIBRARY})
-	endif()
-	find_library(KYTY_LZMA_LIBRARY lzma)
-	if(KYTY_LZMA_LIBRARY)
-		list(APPEND kyty_emulator_link_libraries ${KYTY_LZMA_LIBRARY})
-	endif()
 endif()
 
 set(inc_headers
 	${KYTY_SOURCE_DIR}
-	${KYTY_THIRD_PARTY_DIR}/SDL2/include
 	${KYTY_THIRD_PARTY_DIR}/VulkanMemoryAllocator/include
 	${KYTY_THIRD_PARTY_DIR}/SPIRV-Tools/include
+	${KYTY_THIRD_PARTY_DIR}/SPIRV-Headers/include
 	${KYTY_THIRD_PARTY_DIR}/fmt/include
 	${KYTY_THIRD_PARTY_DIR}/xxHash
 	${KYTY_THIRD_PARTY_DIR}/cpuinfo/include
@@ -483,17 +487,16 @@ add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
 target_link_libraries(audio_out2_port_tests common fmt::fmt)
 target_include_directories(audio_out2_port_tests PRIVATE ${inc_headers})
 
+add_executable(save_data_memory_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SaveDataMemoryTests.cpp"
+)
+target_link_libraries(save_data_memory_tests common fmt::fmt)
+target_include_directories(save_data_memory_tests PRIVATE ${inc_headers})
+
 add_executable(shader_warm_up_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ShaderWarmUpTests.cpp"
 )
 target_include_directories(shader_warm_up_tests PRIVATE ${inc_headers})
-
-add_executable(save_data_files_tests EXCLUDE_FROM_ALL
-	"${KYTY_TESTS_DIR}/SaveDataFilesTests.cpp"
-	"${KYTY_SOURCE_DIR}/libs/saveDataFiles.cpp"
-)
-target_link_libraries(save_data_files_tests common fmt::fmt)
-target_include_directories(save_data_files_tests PRIVATE ${inc_headers})
 
 add_executable(event_queue_lifetime_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/EventQueueLifetimeTests.cpp"
@@ -580,11 +583,15 @@ if(BUILD_TESTING)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
-	add_test(NAME save_data_files COMMAND $<TARGET_FILE:save_data_files_tests>)
+	add_test(NAME save_data_memory COMMAND $<TARGET_FILE:save_data_memory_tests>)
 	add_test(NAME shader_warm_up COMMAND $<TARGET_FILE:shader_warm_up_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
+	add_test(NAME graphics_pipeline_rasterization
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --polygon-mode-only)
+	add_test(NAME graphics_draw_offsets
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-offset-only)
 	add_test(NAME virtual_memory_allocation
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
 	add_test(NAME guest_red_zone_patcher
@@ -602,6 +609,8 @@ if(BUILD_TESTING)
 
 	add_test(NAME texture_cache_layered_image
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --layered-image-only)
+	add_test(NAME host_image_allocation
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --host-image-allocation-only)
 	add_test(NAME texture_cache_image_views
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-view-cache-only)
 	add_test(NAME texture_cache_storage_sampled
@@ -614,8 +623,6 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
 	add_test(NAME bda_synchronization_skip
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-sync-only)
-	add_test(NAME vertex_buffer_mapped_extent
-		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --vertex-buffer-extent-only)
 
 	if(WIN32)
 		# These tests still depend on the Windows multisample-depth path.
@@ -645,11 +652,25 @@ if(BUILD_TESTING)
 		shader_recompiler_compute_tests
 		virtual_memory_allocation_tests
 		audio_out2_port_tests
-		save_data_files_tests
 		shader_warm_up_tests
 	)
 endif()
 
+# Test Darwin signal-context restoration for SSE4a instructions.
+if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR
+		(NOT CMAKE_OSX_ARCHITECTURES AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")))
+	add_executable(macos_sse4a_tests EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/macosSse4aTests.cpp"
+		"${KYTY_SOURCE_DIR}/loader/x64InstructionEmulator.cpp"
+	)
+	target_link_libraries(macos_sse4a_tests common fmt::fmt Zydis::Zydis)
+	target_include_directories(macos_sse4a_tests PRIVATE ${inc_headers})
+	if(BUILD_TESTING)
+		add_test(NAME macos_sse4a COMMAND $<TARGET_FILE:macos_sse4a_tests>)
+		set_tests_properties(macos_sse4a PROPERTIES TIMEOUT 15)
+		add_dependencies(kyty_tests macos_sse4a_tests)
+	endif()
+endif()
 
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
 configure_macos_guest_address_space(kyty_emulator)
@@ -690,6 +711,12 @@ if(KYTY_CLANG_CL)
 	add_custom_command(TARGET kyty_emulator POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" $<TARGET_FILE_DIR:kyty_emulator>/libwinpthread-1.dll)
 elseif(WIN32 OR LINUX)
 	set_target_properties(kyty_emulator PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS} -Wl,-Map=${KYTY_EMULATOR_MAP_LINK_PATH}")
+endif()
+
+if(LINUX)
+    target_link_options(kyty_emulator PRIVATE
+        $<$<CONFIG:Release>:-Wl,--strip-all>
+    )
 endif()
 
 if(APPLE)

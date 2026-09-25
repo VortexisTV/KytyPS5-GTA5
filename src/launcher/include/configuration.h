@@ -1,13 +1,13 @@
 #ifndef LAUNCHER_INCLUDE_CONFIGURATION_H_
 #define LAUNCHER_INCLUDE_CONFIGURATION_H_
 
-#include "common.h"
 #include "common/emulatorConfig.h"
 
 #include <QByteArray>
 #include <QChar>
 #include <QMetaEnum>
 #include <QMetaType>
+#include <QObject>
 #include <QSettings>
 #include <QString>
 #include <QStringList>
@@ -66,12 +66,6 @@ public:
 	enum class PresentMode { Fifo, Mailbox, Immediate };
 	Q_ENUM(PresentMode)
 
-	enum class ShaderLogDirection { Silent, Console, File };
-	Q_ENUM(ShaderLogDirection)
-
-	enum class ProfilerDirection { None, Network };
-	Q_ENUM(ProfilerDirection)
-
 	enum class LogDirection { Silent, Console, File };
 	Q_ENUM(LogDirection)
 
@@ -93,21 +87,26 @@ public:
 	Resolution             screen_resolution           = Resolution::R1280X720;
 	QString                user_name                   = "Kyty";
 	int                    user_id                     = Config::DEFAULT_USER_ID;
-	PresentMode            present_mode                = PresentMode::Fifo;
+	QString                audio_input_device;
+	PresentMode            present_mode                = PresentMode::Mailbox;
+	int                    gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
+	bool                   readback_linear_images      = false;
+	bool                   tessellation_enabled        = false;
 	int                    vblank_frequency            = 60;
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = true;
 	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::Performance;
-	ShaderLogDirection     shader_log_direction        = ShaderLogDirection::Silent;
+	LogDirection           shader_log_direction        = LogDirection::Silent;
 	QString                shader_log_folder           = "_Shaders";
 	bool                   command_buffer_dump_enabled = false;
 	QString                command_buffer_dump_folder  = "_Buffers";
 	LogDirection           printf_direction            = LogDirection::Silent;
 	QString                printf_output_file          = "_kyty.txt";
-	ProfilerDirection      profiler_direction          = ProfilerDirection::None;
+	bool                   profiler_enabled            = false;
 	bool                   renderdoc_enabled           = false;
+	bool                   amd_cpu_enabled             = false;
 #if defined(_WIN32)
 	bool red_zone_protection_enabled = false;
 #endif
@@ -119,8 +118,12 @@ public:
 		screen_resolution           = other.screen_resolution;
 		user_name                   = other.user_name;
 		user_id                     = other.user_id;
+		audio_input_device          = other.audio_input_device;
 		present_mode                = other.present_mode;
+		gpu_index                   = other.gpu_index;
 		fullscreen_enabled          = other.fullscreen_enabled;
+		readback_linear_images      = other.readback_linear_images;
+		tessellation_enabled        = other.tessellation_enabled;
 		vblank_frequency            = other.vblank_frequency;
 		console_language            = other.console_language;
 		vulkan_validation_enabled   = other.vulkan_validation_enabled;
@@ -132,15 +135,16 @@ public:
 		command_buffer_dump_folder  = other.command_buffer_dump_folder;
 		printf_direction            = other.printf_direction;
 		printf_output_file          = other.printf_output_file;
-		profiler_direction          = other.profiler_direction;
+		profiler_enabled            = other.profiler_enabled;
 		renderdoc_enabled           = other.renderdoc_enabled;
+		amd_cpu_enabled             = other.amd_cpu_enabled;
 #if defined(_WIN32)
 		red_zone_protection_enabled = other.red_zone_protection_enabled;
 #endif
 		host_input_mapping = other.host_input_mapping;
 	}
 
-	void CopyFrom(const Configuration& other) {
+	void CopyGameInfoFrom(const Configuration& other) {
 		name            = other.name;
 		title_id        = other.title_id;
 		gameVersion     = other.gameVersion;
@@ -150,8 +154,6 @@ public:
 		custom_settings = other.custom_settings;
 		game_status     = other.game_status;
 		game_comment    = other.game_comment;
-		CopyEmulatorSettingsFrom(other);
-		elf = other.elf;
 	}
 
 	void WriteSettings(QSettings* s) const {
@@ -162,8 +164,12 @@ public:
 		KYTY_CFG_SET(screen_resolution);
 		KYTY_CFG_SET(user_name);
 		KYTY_CFG_SET(user_id);
+		KYTY_CFG_SET(audio_input_device);
 		KYTY_CFG_SET(present_mode);
+		KYTY_CFG_SET(gpu_index);
 		KYTY_CFG_SET(fullscreen_enabled);
+		KYTY_CFG_SET(readback_linear_images);
+		KYTY_CFG_SET(tessellation_enabled);
 		KYTY_CFG_SET(vblank_frequency);
 		KYTY_CFG_SET(console_language);
 		KYTY_CFG_SET(vulkan_validation_enabled);
@@ -175,8 +181,9 @@ public:
 		KYTY_CFG_SET(command_buffer_dump_folder);
 		KYTY_CFG_SET(printf_direction);
 		KYTY_CFG_SET(printf_output_file);
-		KYTY_CFG_SET(profiler_direction);
+		KYTY_CFG_SET(profiler_enabled);
 		KYTY_CFG_SET(renderdoc_enabled);
+		KYTY_CFG_SET(amd_cpu_enabled);
 #if defined(_WIN32)
 		KYTY_CFG_SET(red_zone_protection_enabled);
 #endif
@@ -196,11 +203,15 @@ public:
 		user_id            = user_id_ok && Config::IsConfiguredUserIdValid(saved_user_id)
 		                         ? saved_user_id
 		                         : Config::DEFAULT_USER_ID;
+		audio_input_device = s->value("audio_input_device", audio_input_device).toString();
 		KYTY_CFG_GET(present_mode);
+		gpu_index = s->value("gpu_index", -1).toInt();
 		if (EnumToText(present_mode).isEmpty()) {
-			present_mode = PresentMode::Fifo;
+			present_mode = PresentMode::Mailbox;
 		}
 		KYTY_CFG_GET(fullscreen_enabled);
+		KYTY_CFG_GET(readback_linear_images);
+		KYTY_CFG_GET(tessellation_enabled);
 		vblank_frequency = s->value("vblank_frequency", vblank_frequency).toInt();
 		console_language = s->value("console_language", console_language).toInt();
 		if (console_language < 0 || console_language > MAX_CONSOLE_LANGUAGE) {
@@ -215,8 +226,9 @@ public:
 		KYTY_CFG_GET(command_buffer_dump_folder);
 		KYTY_CFG_GET(printf_direction);
 		KYTY_CFG_GET(printf_output_file);
-		KYTY_CFG_GET(profiler_direction);
+		KYTY_CFG_GET(profiler_enabled);
 		KYTY_CFG_GET(renderdoc_enabled);
+		amd_cpu_enabled = s->value("amd_cpu_enabled", false).toBool();
 #if defined(_WIN32)
 		red_zone_protection_enabled =
 		    s->value("red_zone_protection_enabled", red_zone_protection_enabled).toBool();

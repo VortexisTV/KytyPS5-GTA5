@@ -6,6 +6,7 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 // Per-interval performance statistics for finding the part of the emulator a slow scene loads.
 // Collection is off unless the environment variable KYTY_PERF_STATS=1 is set.
@@ -48,6 +49,8 @@ enum class SpanId : uint8_t {
 	BdaPrepare,         // synchronizing cached buffers for a DMA draw or dispatch (or skipping it)
 	HotPageHash,        // hashing hot pages for CPU changes, in BDA passes and buffer uploads
 	BufferDownload,     // GPU-to-guest buffer readback, including the GPU drain
+	BufferUpload,       // guest-to-GPU buffer upload: staging copy, render-pass break, recording
+	ReadbackGuestWait,  // a faulting guest thread waiting for its readback, off the GPU thread
 	QueueSubmit,
 	GpuWait,            // emulated GPU thread blocked on host GPU completion
 	GpuWaitReadback,    // part of GpuWait: reading GPU-written memory back into guest memory
@@ -101,6 +104,14 @@ enum class CounterId : uint8_t {
 	ReadbackShadowStale, // readbacks drained the GPU: its shadow was missing or too old
 	ReadbackRecentWrite, // readbacks drained the GPU: the GPU wrote the range after the shadow
 	ShadowsRecorded,     // shadow copies of readback-hot buffers taken at a flush
+	EagerShadowFlushes,  // submits right after a draw that wrote a buffer read back before its shadow
+	ReadbacksAsync,      // readbacks whose wait moved from the GPU thread to the faulting thread
+	ReadbacksRetried,    // of those, redone synchronously because the GPU rewrote the range meanwhile
+	IndirectDispatchesGpu, // indirect dispatches whose group counts the host GPU read itself
+	WritesBesideGpu,       // label stores into GPU-owned pages made without taking the page back
+	DccGpuScans,     // GPU-written DCC metadata checked for fast clears on the GPU
+	DccScansSkipped, // lookups of such metadata that had no GPU write since its last check
+	DccCpuReadbacks, // such metadata read back to the CPU because the GPU path could not run
 	BuffersEvicted,
 	ImageCreates,
 	ImageUploads,
@@ -228,6 +239,10 @@ struct Snapshot {
 
 // Present thread, after a guest flip is shown. Closes an interval once a second has passed.
 void OnGuestFrame() noexcept;
+
+// Appends one line, prefixed with the elapsed time, to _PerfNotes.txt: for events too detailed for
+// the CSV and too important to lose among console output. Does nothing unless collection is on.
+void Note(std::string_view line);
 
 void Initialize();
 void Shutdown();

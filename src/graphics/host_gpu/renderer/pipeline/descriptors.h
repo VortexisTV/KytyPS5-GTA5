@@ -16,15 +16,7 @@
 
 namespace Libs::Graphics {
 
-namespace ShaderRecompiler::IR {
-struct ResourceSnapshot;
-}
-
-struct BufferView {
-	vk::Buffer     buffer = nullptr;
-	vk::DeviceSize offset = 0;
-	vk::DeviceSize range  = VK_WHOLE_SIZE;
-};
+struct ShaderStageRuntime;
 
 struct TextureBinding {
 	ImageId                    image_id;
@@ -34,27 +26,25 @@ struct TextureBinding {
 	std::vector<vk::ImageView> mip_views;
 };
 
-struct NativeDescriptors {
-	std::vector<BufferView>     buffers;
-	std::vector<TextureBinding> images;
-	std::vector<vk::Sampler>    samplers;
-	BufferView                  gds;
-	BufferView                  flattened_srt;
-	BufferView                  shader_data;
-};
-
-struct PreparedBufferBinding {
-	ShaderBufferResource descriptor {};
-	BufferId             id {};
-	uint64_t             extent = 0;
-};
-
 struct PreparedBindings {
-	const ShaderRecompiler::IR::CompiledShaderInfo* program  = nullptr;
-	const ShaderRecompiler::IR::ResourceSnapshot* snapshot = nullptr;
-	NativeDescriptors                             resources;
-	std::vector<PreparedBufferBinding>            buffer_bindings;
-	std::vector<uint32_t>                         shader_data;
+	struct BufferSource {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+		BufferId id;
+	};
+
+	// The draw owns the immutable compiled-program/runtime-snapshot association through commit.
+	const ShaderStageRuntime* runtime = nullptr;
+	// Keep the resolved guest range through cache preparation; only the host buffer ID may
+	// become stale and need resolving again when bindings are rebound.
+	std::vector<BufferSource>             buffer_sources;
+	std::vector<vk::DescriptorBufferInfo> buffers;
+	std::vector<TextureBinding>           images;
+	std::vector<vk::Sampler>              samplers;
+	vk::DescriptorBufferInfo              gds {nullptr, 0, VK_WHOLE_SIZE};
+	vk::DescriptorBufferInfo              flattened_srt;
+	vk::DescriptorBufferInfo              shader_data_buffer;
+	std::vector<uint32_t>                 shader_data;
 };
 
 [[nodiscard]] vk::DescriptorType
@@ -74,23 +64,8 @@ template <typename T>
 	return result;
 }
 
-struct TargetTextureViewInfo {
-	vk::ImageViewType type        = static_cast<vk::ImageViewType>(VK_IMAGE_VIEW_TYPE_MAX_ENUM);
-	uint32_t          base_layer  = 0;
-	uint32_t          layer_count = 0;
-};
-
-[[nodiscard]] TargetTextureViewInfo
-ResolveTargetTextureView(const ShaderRecompiler::IR::ImageResource& resource,
-                         Prospero::ImageType type, uint32_t base_layer, uint32_t image_layers);
-
-[[nodiscard]] bool IsSupportedDepthTargetDescriptor(const ShaderTextureResource& descriptor,
-                                                    const Image& image, bool r128 = false);
 [[nodiscard]] bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor,
-                                                   const Image& image, bool r128 = false);
-[[nodiscard]] bool
-IsSupportedSampledVideoOutView(const ShaderRecompiler::IR::ImageResource& resource,
-                               const ShaderTextureResource& descriptor, const Image& image);
+                                                   bool r128 = false);
 void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
                             const ShaderTextureResource& descriptor, uint64_t size);
 

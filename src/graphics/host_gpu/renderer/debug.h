@@ -5,7 +5,6 @@
 
 #include <cstdint>
 #include <string>
-#include <vector>
 
 namespace Libs::Graphics {
 
@@ -13,7 +12,6 @@ class CommandBuffer;
 
 namespace HW {
 class Context;
-class Shader;
 class UserConfig;
 struct RenderTarget;
 struct ScanModeControl;
@@ -33,14 +31,13 @@ uint32_t                 render_target_first_bound_slot(const CommandBuffer& buf
 bool                     graphics_debug_dump_enabled();
 void                     uc_print(const char* func, const HW::UserConfig& uc);
 void                     uc_check(const HW::UserConfig& uc);
-void                     sh_print(const char* func, const HW::Shader& uc);
-std::vector<std::string> rt_print(const char* func, const HW::RenderTarget& rt);
+std::string              rt_print(const char* func, const HW::RenderTarget& rt);
 bool                     RenderIsColorTileModeLinear(Prospero::TileMode tile_mode);
 void                     hw_print(const CommandBuffer& buffer);
 void                     hw_check(const CommandBuffer& buffer);
 void                     LogDrawPhase(const char* draw_name, const char* phase);
 ScissorRect calc_final_scissor(const HW::ScreenViewport& vp, const HW::ScanModeControl& smc,
-                               vk::Extent2D extent);
+                               vk::Extent2D extent, uint32_t viewport_index);
 
 } // namespace Libs::Graphics
 

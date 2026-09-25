@@ -1,0 +1,37 @@
+#version 450
+
+// Writes the clear color the scan pass found into one image layer. It runs through an indirect
+// dispatch the scan sized, so a slice that held no clear costs nothing.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+struct Record {
+	uvec4 args;
+	vec4  color;
+};
+
+layout(std430, binding = 1) readonly buffer Records {
+	Record records[];
+} result;
+
+// No format qualifier: one shader serves every storage-capable color format.
+layout(binding = 2) uniform writeonly image2D target;
+
+layout(std430, push_constant) uniform Push {
+	vec4 colors[5];
+	uint valid_mask;
+	uint meta_base;
+	uint slice_dwords;
+	uint consume;
+	uint width;
+	uint height;
+	uint record;
+} push;
+
+void main() {
+	const uvec2 texel = gl_GlobalInvocationID.xy;
+	if (texel.x >= push.width || texel.y >= push.height) {
+		return;
+	}
+	imageStore(target, ivec2(texel), result.records[push.record].color);
+}

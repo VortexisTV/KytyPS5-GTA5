@@ -9,7 +9,6 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/vma.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
@@ -34,10 +33,7 @@ void CommandBuffer::Begin() {
 	auto buffer = Handle();
 
 	vk::CommandBufferBeginInfo begin_info {};
-	begin_info.sType            = vk::StructureType::eCommandBufferBeginInfo;
-	begin_info.pNext            = nullptr;
-	begin_info.flags            = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
-	begin_info.pInheritanceInfo = nullptr;
+	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
 
 	auto result = buffer.begin(&begin_info);
 
@@ -65,17 +61,16 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 }
 
 void CommandBuffer::BeginRendering(const RenderState& state) const {
-	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
-	        state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
 	if (m_rendering && m_render_state == state) {
 		return;
 	}
+	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
+	        state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
 	EndRendering();
 
 	std::array<vk::RenderingAttachmentInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
 	for (uint32_t i = 0; i < state.num_color_attachments; i++) {
 		const auto& attachment = state.color_attachments[i];
-		colors[i].sType        = vk::StructureType::eRenderingAttachmentInfo;
 		colors[i].imageView    = attachment.image_view;
 		colors[i].imageLayout  = attachment.image_layout;
 		colors[i].loadOp =
@@ -86,7 +81,6 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 
 	const auto&                 depth_stencil = state.depth_stencil_attachment;
 	vk::RenderingAttachmentInfo depth {};
-	depth.sType       = vk::StructureType::eRenderingAttachmentInfo;
 	depth.imageView   = depth_stencil.image_view;
 	depth.imageLayout = depth_stencil.image_layout;
 	depth.loadOp =
@@ -95,7 +89,6 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	depth.clearValue.depthStencil.depth = std::bit_cast<float>(depth_stencil.clear_value[0]);
 
 	vk::RenderingAttachmentInfo stencil {};
-	stencil.sType       = vk::StructureType::eRenderingAttachmentInfo;
 	stencil.imageView   = depth_stencil.image_view;
 	stencil.imageLayout = depth_stencil.image_layout;
 	stencil.loadOp =
@@ -104,7 +97,6 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	stencil.clearValue.depthStencil.stencil = depth_stencil.clear_value[1];
 
 	vk::RenderingInfo rendering {};
-	rendering.sType                = vk::StructureType::eRenderingInfo;
 	rendering.renderArea.extent    = {state.width, state.height};
 	rendering.layerCount           = state.num_layers;
 	rendering.colorAttachmentCount = state.num_color_attachments;

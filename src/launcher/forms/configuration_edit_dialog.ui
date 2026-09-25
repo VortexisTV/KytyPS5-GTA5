@@ -75,7 +75,25 @@
        </layout>
       </widget>
      </item>
-     <item row="0" column="1" rowspan="2">
+     <item row="2" column="0">
+      <widget class="QGroupBox" name="audio_group">
+       <property name="title"><string>Audio</string></property>
+       <layout class="QFormLayout" name="audioLayout">
+        <property name="fieldGrowthPolicy">
+         <enum>QFormLayout::AllNonFixedFieldsGrow</enum>
+        </property>
+        <item row="0" column="0">
+         <widget class="QLabel" name="label_audio_input_device">
+          <property name="text"><string>Microphone:</string></property>
+         </widget>
+        </item>
+        <item row="0" column="1">
+         <widget class="QComboBox" name="comboBox_audio_input_device"/>
+        </item>
+       </layout>
+      </widget>
+     </item>
+     <item row="0" column="1" rowspan="3">
       <widget class="QGroupBox" name="graphics_group">
        <property name="title">
         <string>Graphics &amp;&amp; display</string>
@@ -127,16 +145,38 @@
           <property name="toolTip"><string>Optimize shaders for code size or performance</string></property>
          </widget>
         </item>
+        <item row="4" column="0">
+         <widget class="QLabel" name="label_gpu">
+          <property name="text"><string>GPU:</string></property>
+         </widget>
+        </item>
         <item row="4" column="1">
+         <widget class="QComboBox" name="comboBox_gpu">
+          <property name="toolTip"><string>Graphics device used by the emulator</string></property>
+         </widget>
+        </item>
+        <item row="5" column="1">
          <widget class="QCheckBox" name="checkBox_fullscreen">
           <property name="toolTip"><string>Run in borderless desktop fullscreen</string></property>
           <property name="text"><string>Fullscreen</string></property>
          </widget>
         </item>
+        <item row="6" column="1">
+         <widget class="QCheckBox" name="checkBox_readback">
+          <property name="toolTip"><string>Read back writable linear images</string></property>
+          <property name="text"><string>Enable readback</string></property>
+         </widget>
+        </item>
+        <item row="7" column="1">
+         <widget class="QCheckBox" name="checkBox_tessellation">
+          <property name="toolTip"><string>Draw tessellated geometry. Disabled by default; unsupported tessellation may cause crashes.</string></property>
+          <property name="text"><string>Enable tessellation support (experimental)</string></property>
+         </widget>
+        </item>
        </layout>
       </widget>
      </item>
-     <item row="2" column="0" colspan="2">
+     <item row="3" column="0" colspan="2">
       <widget class="QGroupBox" name="debug_group">
        <property name="title">
         <string>Debugging &amp;&amp; logs</string>
@@ -213,13 +253,9 @@
          </widget>
         </item>
         <item row="4" column="0">
-         <widget class="QLabel" name="label_profiler_direction">
-          <property name="text"><string>Profiler:</string></property>
-         </widget>
-        </item>
-        <item row="4" column="1">
-         <widget class="QComboBox" name="comboBox_profiler_direction">
-          <property name="toolTip"><string>Enable or disable profiler. If enabled may decrease emulator performance</string></property>
+         <widget class="QCheckBox" name="checkBox_profiler">
+          <property name="toolTip"><string>Enable the Tracy profiler. Profiling may decrease emulator performance</string></property>
+          <property name="text"><string>Tracy profiler</string></property>
          </widget>
         </item>
         <item row="4" column="2">
@@ -241,20 +277,18 @@
        <property name="title">
         <string>Compatibility</string>
        </property>
-       <layout class="QHBoxLayout" name="compatibilityLayout">
+       <layout class="QVBoxLayout" name="compatibilityLayout">
         <item>
-         <widget class="QCheckBox" name="checkBox_red_zone_protection">
-          <property name="toolTip"><string>Helps prevent crashes in some games on Windows</string></property>
-          <property name="text"><string>Windows SysV red zone crash protection (Experimental)</string></property>
+         <widget class="QCheckBox" name="checkBox_amd_cpu">
+          <property name="toolTip"><string>Patch CPU instructions that differ between AMD and the host CPU.</string></property>
+          <property name="text"><string>AMD CPU patch (experimental)</string></property>
          </widget>
         </item>
         <item>
-         <spacer name="compatibilitySpacer">
-          <property name="orientation"><enum>Qt::Horizontal</enum></property>
-          <property name="sizeHint" stdset="0">
-           <size><width>40</width><height>20</height></size>
-          </property>
-         </spacer>
+         <widget class="QCheckBox" name="checkBox_red_zone_protection">
+          <property name="toolTip"><string>Helps prevent crashes in some games on Windows</string></property>
+          <property name="text"><string>Windows SysV red zone crash protection (experimental)</string></property>
+         </widget>
         </item>
        </layout>
       </widget>
@@ -301,12 +335,4 @@
   </customwidget>
  </customwidgets>
  <resources/>
- <connections>
-  <connection>
-   <sender>cancel_button</sender>
-   <signal>clicked()</signal>
-   <receiver>ConfigurationEditDialog</receiver>
-   <slot>reject()</slot>
-  </connection>
- </connections>
 </ui>

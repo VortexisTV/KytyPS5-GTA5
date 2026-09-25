@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_IMAGE_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_IMAGE_H_
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/slotVector.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -35,11 +36,13 @@ struct ImageUsage {
 };
 
 struct ImageBinding {
-	bool is_bound      = false;
-	bool is_target     = false;
-	bool needs_rebind  = false;
-	bool force_general = false;
-	bool shader_write  = false;
+	vk::ImageLayout  attachment_layout = vk::ImageLayout::eUndefined;
+	vk::AccessFlags2 attachment_access;
+	bool             is_bound      = false;
+	bool             is_target     = false;
+	bool             needs_rebind  = false;
+	bool             force_general = false;
+	bool             shader_write  = false;
 };
 
 class Image final {
@@ -49,7 +52,6 @@ public:
 	KYTY_CLASS_NO_COPY(Image);
 
 	[[nodiscard]] vk::ImageView FindView(const ImageViewInfo& view_info);
-	void                        AssociateDepth(ImageId image_id) { depth_id = image_id; }
 	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
 	[[nodiscard]] Barriers GetBarriers(vk::ImageLayout                      destination_layout,
 	                                   vk::AccessFlags2                     destination_access,
@@ -127,15 +129,12 @@ public:
 		return pages ? ImagePageRangesOverlap(info.data.address, info.data.size, address, size)
 		             : ImageRangeOverlaps(info.data.address, info.data.size, address, size);
 	}
-	[[nodiscard]] bool GpuOverlaps(uint64_t address, uint64_t size) const noexcept {
-		return IsGpuModified() && Overlaps(address, size);
-	}
 	[[nodiscard]] bool SafeToDownload() const noexcept {
 		return IsGpuModified() && !IsBufferModified() && !IsCpuDirty();
 	}
 	[[nodiscard]] bool IsTracked() const noexcept { return track_addr != 0 && track_addr_end != 0; }
 	[[nodiscard]] uint64_t AccountedSize() const noexcept {
-		return backing.image == nullptr ? 0 : (info.data.size + 1023) & ~uint64_t {1023};
+		return backing.image == nullptr ? 0 : Common::AlignUp(info.data.size, 1024);
 	}
 	[[nodiscard]] uint64_t HashGuestEdges() const;
 
@@ -161,8 +160,8 @@ private:
 	[[nodiscard]] static std::pair<uint32_t, uint32_t>
 	SanitizeCopyLayers(const Image& source, const Image& destination, uint32_t depth);
 
-	GraphicContext*   m_graphics         = nullptr;
-	CommandScheduler* m_scheduler        = nullptr;
+	GraphicContext&   m_graphics;
+	CommandScheduler& m_scheduler;
 	uint64_t          m_maybe_cpu_hash   = 0;
 	bool              m_cpu_dirty        = false;
 	bool              m_maybe_cpu_dirty  = false;

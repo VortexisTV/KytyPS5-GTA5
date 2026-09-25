@@ -89,10 +89,10 @@ void Translator::V_CVT_16_F16(const Decoder::Instruction& inst, bool signed_valu
 	if (signed_value) {
 		const auto converted =
 		    ConvertF32ToI32Saturated(value, -32768.0f, 32768.0f, 32767.0f, 0xffff8000u, 0x7fffu);
-		WriteU16(DestinationOperand(inst), ir.BitwiseAnd(converted, IR::U32(IR::Value(0xffffu))));
+		Write16Bits(DestinationOperand(inst), ir.BitwiseAnd(converted, IR::U32(IR::Value(0xffffu))));
 		return;
 	}
-	WriteU16(DestinationOperand(inst),
+	Write16Bits(DestinationOperand(inst),
 	         ConvertF32ToU32Saturated(value, 65536.0f, 65535.0f, 0xffffu));
 }
 
@@ -166,9 +166,9 @@ void Translator::V_CVT_PK_U8_F32(const Decoder::Instruction& inst) {
 }
 
 void Translator::V_PACK_B32_F16(const Decoder::Instruction& inst) {
-	const auto low = ReadF16LaneBits(inst.src0, false);
+	const auto low = Read16LaneBits(inst.src0, false);
 	const auto high =
-	    ir.ShiftLeftLogical(ReadF16LaneBits(inst.src1, false), IR::U32(IR::Value(16u)));
+	    ir.ShiftLeftLogical(Read16LaneBits(inst.src1, false), IR::U32(IR::Value(16u)));
 	WriteOperand(DestinationOperand(inst), ir.BitwiseOr(low, high));
 }
 

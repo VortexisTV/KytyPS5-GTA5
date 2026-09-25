@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/perfStats.h"
@@ -14,12 +15,12 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
-#include <array>
-#include <atomic>
 #include <cinttypes>
-#include <cstdio>
 #include <cstring>
+#include <map>
 #include <memory>
+#include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -29,6 +30,48 @@ namespace {
 
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
+// Eager shadow flushes a readback-hot buffer may spend before a shadow has to prove useful again.
+constexpr uint32_t EagerShadowBudget = 8;
+// Readbacks up to this size are waited for by the faulting thread; bigger ones keep the old path.
+constexpr uint64_t AsyncReadbackMax = 1024 * 1024;
+// How long download ring contents stay valid, the bound the shadow path already relies on.
+constexpr uint64_t ReadbackMaxAgeTicks = 64;
+// Buffers up to this size get a host-visible shadow once the CPU has read them back.
+constexpr uint64_t MaxHotReadbackSize = 1024 * 1024;
+
+// GPU-written ranges that readbacks had to wait for, oldest first, so the writes that dirty them
+// again can be named. Only the GPU thread touches it, so it needs no lock.
+std::vector<std::pair<uint64_t, uint64_t>> g_read_back_dirty;
+constexpr size_t                           ReadBackDirtyWatched = 16;
+
+std::string DescribePacket(uint32_t packet) {
+	return packet == GuestGpu::NoPacket
+	           ? std::string("outside a packet")
+	           : fmt::format("in PM4 op 0x{:02x} r {}", packet >> 8u, packet & 0xffu);
+}
+
+// A range the GPU rewrites every frame is read back every frame. Note the write that does it, the
+// first time per writer and every 500th time after.
+void NoteReadBackDirtied(uint64_t vaddr, uint64_t size) {
+	const auto watched = std::find_if(
+	    g_read_back_dirty.begin(), g_read_back_dirty.end(), [&](const auto& range) {
+		    return vaddr < range.first + range.second && range.first < vaddr + size;
+	    });
+	if (watched == g_read_back_dirty.end()) {
+		return;
+	}
+	static std::map<std::tuple<uint64_t, uint64_t, uint32_t>, uint64_t> writers;
+	const auto packet = GuestGpu::CurrentPacket();
+	auto&      seen   = writers[{vaddr, size, packet}];
+	seen++;
+	if ((seen == 1 && writers.size() <= 256) || seen % 500 == 0) {
+		PerfStats::Note(fmt::format(
+		    "gpu write {} ({}x this writer) 0x{:010x}+0x{:x} {} dirties read-back bytes "
+		    "0x{:010x}+0x{:x}",
+		    seen == 1 ? "first" : "sample", seen, vaddr, size, DescribePacket(packet),
+		    watched->first, watched->second));
+	}
+}
 
 } // namespace
 
@@ -45,13 +88,6 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* 
 		size -= chunk;
 	}
 }
-
-struct BufferCache::DownloadCopy {
-	Buffer*  buffer        = nullptr;
-	uint64_t source_offset = 0;
-	uint64_t address       = 0;
-	uint64_t size          = 0;
-};
 
 void BufferCache::Register(BufferId id) {
 	ChangeRegister<true>(id);
@@ -112,8 +148,7 @@ void BufferCache::TouchBuffer(const Buffer& buffer) {
 }
 
 void BufferCache::DeleteBuffer(BufferId id) {
-	auto* buffer = m_slot_buffers.try_get(id);
-	if (buffer == nullptr || buffer->is_deleted) {
+	if (IsBufferInvalid(id)) {
 		return;
 	}
 	Unregister(id);
@@ -124,26 +159,41 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	}
 }
 
-std::pair<uint64_t, uint64_t> BufferCache::DownloadEnvelope(const DownloadCopy& copy) {
-	if (copy.buffer == nullptr || copy.size == 0 || copy.source_offset > copy.buffer->Size() ||
-	    copy.size > copy.buffer->Size() - copy.source_offset) {
-		EXIT("BufferCache: invalid download copy\n");
+bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	std::vector<vk::BufferCopy> copies;
+	uint64_t                    total_size     = 0;
+	const auto                  buffer_address = buffer.CpuAddress();
+	m_memory_tracker.ForEachDownloadRange<false>(
+	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
+		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
+		                                           "buffer download");
+		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
+			    copies.emplace_back(start - buffer_address, total_size, end - start);
+			    // Keep packed ranges on separate cache lines, as in shadPS4.
+			    total_size += Common::AlignUp(end - start, 64);
+		    });
+		    m_gpu_modified_ranges.Subtract(address, bytes);
+	    });
+	if (copies.empty()) {
+		return false;
 	}
-	const auto begin = copy.source_offset & ~uint64_t {3};
-	if (copy.source_offset > UINT64_MAX - copy.size ||
-	    copy.source_offset + copy.size > UINT64_MAX - 3) {
-		EXIT("BufferCache: download copy alignment overflow\n");
-	}
-	const auto end = (copy.source_offset + copy.size + 3) & ~uint64_t {3};
-	if (end > copy.buffer->Size()) {
-		EXIT("BufferCache: aligned download copy exceeds its owner\n");
-	}
-	return {begin, end - begin};
+
+	const auto [mapped, offset] = RecordDownload(buffer, copies, total_size);
+	m_scheduler.DeferPriorityOperation([this, mapped, offset, total_size, buffer_address,
+	                                    copies = std::move(copies)] {
+		m_download_buffer.Invalidate(offset, total_size);
+		for (const auto& copy: copies) {
+			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
+			                                      mapped + (copy.dstOffset - offset), copy.size);
+		}
+	});
+	return true;
 }
 
-void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
-	PerfStats::Span    span(PerfStats::SpanId::BufferDownload);
-	const GpuWaitScope wait_scope(PerfStats::SpanId::GpuWaitReadback);
+std::pair<uint8_t*, uint64_t> BufferCache::RecordDownload(Buffer&                      buffer,
+                                                          std::vector<vk::BufferCopy>& copies,
+                                                          uint64_t total_size) {
+	PerfStats::Span span(PerfStats::SpanId::BufferDownload);
 	if (PerfStats::Enabled()) {
 		uint64_t bytes = 0;
 		for (const auto& copy: copies) {
@@ -151,76 +201,57 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 		}
 		PerfStats::Add(PerfStats::CounterId::BufferDownloadBytes, bytes);
 	}
-	std::vector<DownloadCopy> batch;
-	batch.reserve(copies.size());
-	uint64_t                  packed_size = 0;
-	auto&                     download    = m_download_buffer;
-	const auto flush = [&] {
-		const auto [mapped, base_offset] = download.Map(packed_size, DOWNLOAD_ALIGNMENT);
-		EXIT_IF(mapped == nullptr);
-		uint64_t cursor = 0;
-		for (const auto& copy: batch) {
-			const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
-			download.CopyFrom(m_scheduler.Current(), *copy.buffer, source_begin, base_offset + cursor,
-			                  envelope_size, vk::AccessFlagBits::eMemoryWrite, vk::AccessFlags {},
-			                  vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
-			                  vk::AccessFlagBits::eHostRead);
-			cursor += AlignDownload(envelope_size);
-		}
-		download.Commit();
-		const auto completion_tick = m_scheduler.CurrentTick();
-		m_scheduler.Finish();
-		m_scheduler.WaitPriorityOperations(completion_tick);
-		cursor = 0;
-		for (const auto& copy: batch) {
-			const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
-			const auto offset = cursor + copy.source_offset - source_begin;
-			download.Invalidate(base_offset + offset, copy.size);
-			Libs::LibKernel::Memory::WriteBacking(copy.address, mapped + offset, copy.size);
-			cursor += AlignDownload(envelope_size);
-		}
-		batch.clear();
-		packed_size = 0;
-	};
-	for (auto copy: copies) {
-		while (copy.size != 0) {
-			const auto available = download.Size() - packed_size;
-			const auto prefix    = copy.source_offset & 3u;
-			const auto bytes     = std::min(copy.size, available - prefix);
-			DownloadCopy part {copy.buffer, copy.source_offset, copy.address, bytes};
-			const auto [source_begin, envelope_size] = DownloadEnvelope(part);
-			(void)source_begin;
-			packed_size += AlignDownload(envelope_size);
-			batch.push_back(part);
-			copy.source_offset += bytes;
-			copy.address += bytes;
-			copy.size -= bytes;
-			if (packed_size == download.Size()) {
-				flush();
-			}
-		}
+	const auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
+	if (mapped == nullptr) {
+		EXIT("BufferCache: download exceeds 64 MiB staging buffer capacity\n");
 	}
-	if (!batch.empty()) {
-		flush();
+	m_download_buffer.Commit();
+	for (auto& copy: copies) {
+		copy.dstOffset += offset;
 	}
-	for (const auto& copy: copies) {
-		m_gpu_modified_ranges.Subtract(copy.address, copy.size);
-	}
+
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto              native = command.Handle();
+	vk::BufferMemoryBarrier before {};
+	before.srcAccessMask       = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
+	before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.buffer              = buffer.Handle();
+	before.offset              = 0;
+	before.size                = buffer.Size();
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
+	                       nullptr);
+	native.copyBuffer(buffer.Handle(), m_download_buffer.Handle(),
+	                  static_cast<uint32_t>(copies.size()), copies.data());
+
+	auto after          = before;
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	after.buffer        = m_download_buffer.Handle();
+	after.offset        = offset;
+	after.size          = total_size;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eAllCommands |
+	                           vk::PipelineStageFlagBits::eHost,
+	                       {}, 0, nullptr, 1, &after, 0, nullptr);
+	return {mapped, offset};
 }
 
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                          PageManager& page_manager, TextureCache& texture_cache)
-	: m_graphics(graphics), m_scheduler(scheduler),
-	  m_fault_manager(graphics, scheduler, *this, CACHING_PAGEBITS, CACHING_NUMPAGES),
-	  m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
-	  m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-	                         BDA_PAGETABLE_SIZE),
-	  m_memory_tracker(page_manager),
-	  m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
-	  m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
-	  m_download_buffer(graphics, scheduler, MemoryUsage::Download, 32 * MiB),
-	  m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
-	  m_texture_cache(texture_cache) {
+    : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
+      m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
+      m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
+                             BDA_PAGETABLE_SIZE),
+      m_memory_tracker(page_manager),
+      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
+      m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
+      m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
+      m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
+      m_texture_cache(texture_cache) {
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
@@ -271,89 +302,83 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	m_scheduler.Context().GetGpu().SendCommandSync(
-	    [this, vaddr, size, is_write] { ReadMemoryOnGpu(vaddr, size, is_write); });
+	auto& gpu = m_scheduler.Context().GetGpu();
+	if (GuestGpu::IsGpuThread()) {
+		(void)ReadMemoryOnGpu(vaddr, size, is_write);
+		return;
+	}
+	// Only recording and submitting the copy happen on the emulated GPU thread; this faulting
+	// thread waits for the host GPU itself. Command translation keeps going meanwhile instead of
+	// stalling until the host GPU has caught up with everything already recorded.
+	ReadbackTicket ticket;
+	gpu.SendCommandSync([&] { ticket = ReadMemoryOnGpu(vaddr, size, is_write, true); });
+	if (ticket.id == 0) {
+		return;
+	}
+	{
+		PerfStats::Span wait(PerfStats::SpanId::ReadbackGuestWait);
+		m_scheduler.GetMasterSemaphore().Wait(ticket.tick);
+	}
+	gpu.SendCommandSync([this, id = ticket.id] { FinishReadback(id); });
 }
 
-void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) {
+BufferCache::ReadbackTicket BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size,
+                                                         bool is_write, bool allow_async) {
 	const GpuWaitScope wait_scope(PerfStats::SpanId::GpuWaitReadback);
-	// CPU invalidation reaches this point only for a GPU-owned tracker page. Resolve the exact
-	// Buffer owner on the GPU thread so the cache index remains single-thread-owned.
 	if (is_write && !IsRegionRegistered(vaddr, size)) {
-		return;
+		return {};
 	}
-	// Every download here costs a full GPU drain. A CPU that touches one dword of a GPU-written
-	// buffer usually goes on to touch the rest of it (polling several counters, clearing a
-	// buffer page by page), so hand the whole owning buffer back to the CPU in one drain instead
-	// of one drain per 4 KB page. Downloading more than was asked for is always safe.
-	constexpr uint64_t MaxWidenedReadback = 8ull * 1024 * 1024;
-	Buffer*            hot_owner          = nullptr;
-	if (const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
-	    owner != nullptr && *owner) {
-		auto& buffer = m_slot_buffers[*owner];
-		if (!buffer.is_deleted && buffer.IsInBounds(vaddr, 1) &&
-		    buffer.Size() <= MaxWidenedReadback) {
-			const auto end = std::max(vaddr + size, buffer.CpuAddress() + buffer.Size());
-			vaddr          = buffer.CpuAddress();
-			size           = end - vaddr;
-			hot_owner      = &buffer;
-		}
-	}
-	std::vector<DownloadCopy> copies;
+	const auto fault_vaddr = vaddr;
+	const auto fault_size  = size;
+	auto&      buffer      = m_slot_buffers[FindBuffer(vaddr, size)];
+
+	// Widen nearby CPU reads so they share one GPU drain.
+	constexpr uint64_t WindowSize   = 512 * 1024;
+	const auto         buffer_begin = buffer.CpuAddress();
+	const auto         buffer_end   = buffer_begin + buffer.Size();
+	const auto window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
+	const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
+	const auto window_size = window_end - window_begin;
+
+	struct Range {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+	};
+	std::vector<Range> ranges;
+	uint64_t           download_bytes = 0;
 	m_memory_tracker.ForEachDownloadRange<false>(
-	    vaddr, size,
-	    [&](uint64_t address, uint64_t bytes) noexcept {
+	    window_begin, window_size, [&](uint64_t address, uint64_t bytes) noexcept {
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
-		                                           "memory invalidation");
-	    },
-		[&](uint64_t address, uint64_t bytes) noexcept {
-		    for (const auto range: m_gpu_modified_ranges.Intersections(address, bytes)) {
-			    for (uint64_t copied = 0; copied < range.size;) {
-				    const auto copy_address = range.address + copied;
-				    const auto* owner = m_page_table.Find(copy_address >> PageTable::kPageBits);
-				    if (owner == nullptr || !*owner) {
-					    EXIT("BufferCache: invalidation readback has no buffer owner\n");
-				    }
-				    auto& buffer = m_slot_buffers[*owner];
-				    if (!buffer.IsInBounds(copy_address, 1)) {
-					    EXIT("BufferCache: invalidation readback is outside its buffer owner\n");
-				    }
-				    const auto copy_size = std::min(
-				        range.size - copied, buffer.CpuAddress() + buffer.Size() - copy_address);
-				    copies.push_back(
-				        {&buffer, buffer.Offset(copy_address), copy_address, copy_size});
-				    copied += copy_size;
-			    }
-		    }
+		                                           "buffer readback");
+		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
+			    ranges.push_back({start, end - start});
+			    download_bytes += end - start;
+		    });
 	    });
-	if (copies.empty()) {
-		if (!is_write) {
-			return;
+	if (ranges.empty()) {
+		if (is_write) {
+			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 		}
-		// A preceding read fault can consume the last GPU-owned copy after this write invalidation
-		// has already chosen to flush. Complete the CPU ownership handoff even though this callback
-		// no longer has bytes to download.
-		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
-		return;
+		return {};
 	}
+
 	// A buffer the CPU keeps reading back (GPU counters, query results) gets a host-visible
 	// shadow recorded at the end of every slice that writes it. When that shadow is at least as
 	// new as the last GPU write, the read only has to wait for a tick that usually finished long
 	// ago instead of draining the whole GPU.
-	constexpr uint64_t MaxHotReadbackSize = 1024 * 1024;
-	const auto overlaps_recent_write = [&](const DownloadCopy& copy) {
+	Buffer*    hot_owner = buffer.Size() <= MaxHotReadbackSize ? &buffer : nullptr;
+	const bool async     = allow_async && download_bytes <= AsyncReadbackMax;
+	const auto overlaps_recent_write = [&](const Range& range) {
 		return std::ranges::any_of(hot_owner->writes_since_shadow, [&](const auto& write) {
-			return copy.address < write.address + write.size &&
-			       write.address < copy.address + copy.size;
+			return range.address < write.address + write.size &&
+			       write.address < range.address + range.size;
 		});
 	};
 	const bool shadow_usable =
 	    hot_owner != nullptr && hot_owner->readback_hot && hot_owner->shadow_valid &&
 	    hot_owner->writes_since_shadow.size() < 64 &&
-	    m_scheduler.CurrentTick() - hot_owner->shadow_tick < 64 &&
-	    std::ranges::all_of(copies, [&](const DownloadCopy& copy) {
-		    return copy.buffer == hot_owner && !overlaps_recent_write(copy);
-	    });
+	    m_scheduler.CurrentTick() - hot_owner->shadow_tick < ReadbackMaxAgeTicks &&
+	    std::ranges::none_of(ranges, overlaps_recent_write);
 	if (PerfStats::Enabled()) {
 		// Which of the conditions above sent this readback down the draining path.
 		PerfStats::Add([&] {
@@ -367,51 +392,165 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 				return PerfStats::CounterId::ReadbackNotHot;
 			}
 			if (!hot_owner->shadow_valid || hot_owner->writes_since_shadow.size() >= 64 ||
-			    m_scheduler.CurrentTick() - hot_owner->shadow_tick >= 64) {
+			    m_scheduler.CurrentTick() - hot_owner->shadow_tick >= ReadbackMaxAgeTicks) {
 				return PerfStats::CounterId::ReadbackShadowStale;
 			}
 			return PerfStats::CounterId::ReadbackRecentWrite;
 		}());
 	}
+	// Each readback stalls whoever waits for it, so the few that repeat every frame matter far more
+	// than their byte count suggests. Note each distinct range the first time it is read back and
+	// every 500th readback as a sample, with the thread and packet that asked: loading screens read
+	// a range back once, while the ranges gameplay reads every frame keep reappearing in the
+	// samples. Only the GPU thread runs this, so the statics need no lock.
+	if (PerfStats::Enabled()) {
+		static std::map<std::pair<uint64_t, uint64_t>, uint64_t> read_back;
+		static uint64_t                                          readbacks = 0;
+		auto& seen = read_back[{window_begin, window_size}];
+		seen++;
+		readbacks++;
+		std::string dirty;
+		for (const auto& range: ranges) {
+			const std::pair watched {range.address, range.size};
+			if (std::find(g_read_back_dirty.begin(), g_read_back_dirty.end(), watched) ==
+			    g_read_back_dirty.end()) {
+				if (g_read_back_dirty.size() == ReadBackDirtyWatched) {
+					g_read_back_dirty.erase(g_read_back_dirty.begin());
+				}
+				g_read_back_dirty.push_back(watched);
+			}
+			if (dirty.size() < 64) {
+				dirty += fmt::format(" 0x{:010x}+0x{:x}", range.address, range.size);
+			}
+		}
+		if ((seen == 1 && read_back.size() <= 256) || readbacks % 500 == 0) {
+			const auto asker = allow_async
+			                       ? std::string("a game thread")
+			                       : "the GPU thread " + DescribePacket(GuestGpu::CurrentPacket());
+			PerfStats::Note(fmt::format(
+			    "readback {} {} #{} ({}x this range) by {}: {} 0x{:010x}+0x{:x}, fault at "
+			    "0x{:010x}, {} ranges, {} bytes:{} | owner 0x{:010x}+0x{:x} | {}",
+			    shadow_usable ? "shadow" : "drain", seen == 1 ? "first" : "sample", readbacks, seen,
+			    asker, is_write ? "write" : "read", window_begin, window_size, fault_vaddr,
+			    ranges.size(), download_bytes, dirty, buffer.CpuAddress(), buffer.Size(),
+			    hot_owner == nullptr
+			        ? std::string("too big for a shadow")
+			        : fmt::format("hot {} shadow {} writes since shadow {} shadow age {} ticks",
+			                      hot_owner->readback_hot, hot_owner->shadow_valid,
+			                      hot_owner->writes_since_shadow.size(),
+			                      m_scheduler.CurrentTick() - hot_owner->shadow_tick)));
+		}
+	}
+
+	const auto queue = [&](uint64_t tick, bool downloaded,
+	                       std::vector<PendingReadback::Part>&& parts) {
+		PerfStats::Add(PerfStats::CounterId::ReadbacksAsync);
+		const auto id = m_next_readback_id++;
+		m_pending_readbacks.push_back({.id          = id,
+		                               .tick        = tick,
+		                               .after_tick  = m_scheduler.CurrentTick(),
+		                               .fault_vaddr = fault_vaddr,
+		                               .fault_size  = fault_size,
+		                               .vaddr       = window_begin,
+		                               .size        = window_size,
+		                               .is_write    = is_write,
+		                               .downloaded  = downloaded,
+		                               .valid       = true,
+		                               .parts       = std::move(parts)});
+		return ReadbackTicket {.id = id, .tick = tick};
+	};
 	if (shadow_usable) {
+		hot_owner->eager_budget = EagerShadowBudget;
+		if (async) {
+			std::vector<PendingReadback::Part> parts;
+			parts.reserve(ranges.size());
+			for (const auto& range: ranges) {
+				parts.push_back({range.address,
+				                 hot_owner->shadow_offset + (range.address - buffer_begin),
+				                 range.size});
+			}
+			if (hot_owner->shadow_tick >= m_scheduler.CurrentTick()) {
+				m_scheduler.Flush();
+			}
+			return queue(hot_owner->shadow_tick, false, std::move(parts));
+		}
 		m_scheduler.Wait(hot_owner->shadow_tick);
 		m_download_buffer.Invalidate(hot_owner->shadow_offset, hot_owner->Size());
 		const auto* shadow = m_download_buffer.Mapped().data() + hot_owner->shadow_offset;
-		for (const auto& copy: copies) {
-			Libs::LibKernel::Memory::WriteBacking(copy.address, shadow + copy.source_offset,
-			                                      copy.size);
+		for (const auto& range: ranges) {
+			Libs::LibKernel::Memory::WriteBacking(range.address,
+			                                      shadow + (range.address - buffer_begin), range.size);
+			m_gpu_modified_ranges.Subtract(range.address, range.size);
 		}
 	} else {
-		// Each of these costs a full GPU round trip, so the handful that repeat every frame matter
-		// far more than their byte count suggests. Name them once so the ranges can be identified
-		// without a debugger; capped because a drain per frame would otherwise fill the console.
-		if (PerfStats::Enabled()) {
-			static std::atomic<uint32_t> reported = 0;
-			if (reported.fetch_add(1, std::memory_order_relaxed) < 64) {
-				uint64_t bytes = 0;
-				for (const auto& copy: copies) {
-					bytes += copy.size;
-				}
-				std::printf(
-				    "[readback] drain %s 0x%016" PRIx64 "+0x%" PRIx64 ", %zu copies, %" PRIu64
-				    " bytes, owner %s size 0x%" PRIx64 ", hot %d, shadow %d, writes %zu\n",
-				    is_write ? "write" : "read", vaddr, size, copies.size(), bytes,
-				    hot_owner != nullptr ? "yes" : "no",
-				    hot_owner != nullptr ? hot_owner->Size() : uint64_t {0},
-				    hot_owner != nullptr ? int {hot_owner->readback_hot} : -1,
-				    hot_owner != nullptr ? int {hot_owner->shadow_valid} : -1,
-				    hot_owner != nullptr ? hot_owner->writes_since_shadow.size() : size_t {0});
+		if (hot_owner != nullptr) {
+			if (hot_owner->readback_hot && hot_owner->shadow_valid) {
+				// The shadow existed but writes recorded after it were still unsubmitted.
+				hot_owner->eager_budget = EagerShadowBudget;
 			}
-		}
-		if (hot_owner != nullptr && hot_owner->Size() <= MaxHotReadbackSize) {
 			hot_owner->readback_hot = true;
 		}
-		DownloadBufferMemory(copies);
+		if (async) {
+			// The dirty ranges stay until FinishReadback publishes the bytes, so a fault that
+			// overlaps this one meanwhile still sees tracker pages and dirty bytes agree.
+			std::vector<vk::BufferCopy> copies;
+			uint64_t                    total_size = 0;
+			for (const auto& range: ranges) {
+				copies.emplace_back(range.address - buffer_begin, total_size, range.size);
+				// Keep packed ranges on separate cache lines, as DownloadBufferMemory does.
+				total_size += Common::AlignUp(range.size, 64);
+			}
+			const auto [mapped, offset] = RecordDownload(buffer, copies, total_size);
+			(void)mapped;
+			std::vector<PendingReadback::Part> parts;
+			parts.reserve(copies.size());
+			for (const auto& copy: copies) {
+				parts.push_back({buffer_begin + copy.srcOffset, copy.dstOffset, copy.size});
+			}
+			const auto tick = m_scheduler.CurrentTick();
+			m_scheduler.Flush();
+			return queue(tick, true, std::move(parts));
+		}
+		EXIT_IF(!DownloadBufferMemory(buffer, window_begin, window_size));
+		const auto tick = m_scheduler.CurrentTick();
+		m_scheduler.Wait(tick);
+		m_scheduler.WaitPriorityOperations(tick);
 	}
-	// The enumeration above covered whole dirty pages and every exact interval on them.
-	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+	m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_size);
 	if (is_write) {
 		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+	}
+	return {};
+}
+
+void BufferCache::FinishReadback(uint64_t id) {
+	const auto it = std::ranges::find(m_pending_readbacks, id, &PendingReadback::id);
+	EXIT_IF(it == m_pending_readbacks.end());
+	auto pending = std::move(*it);
+	m_pending_readbacks.erase(it);
+	// The bytes were copied when the fault arrived. A GPU write to the range since, or a copy old
+	// enough for the download ring to have wrapped over it, means they may not be the latest: redo
+	// the readback the synchronous way.
+	if (!pending.valid || m_scheduler.CurrentTick() - pending.after_tick >= ReadbackMaxAgeTicks) {
+		PerfStats::Add(PerfStats::CounterId::ReadbacksRetried);
+		(void)ReadMemoryOnGpu(pending.fault_vaddr, pending.fault_size, pending.is_write);
+		return;
+	}
+	m_scheduler.WaitPriorityOperations(pending.tick);
+	for (const auto& part: pending.parts) {
+		// Another fault on the same range may have completed first and handed the page to the
+		// CPU, which may already have written it.
+		if (!m_memory_tracker.IsRegionGpuModified(part.address, part.size)) {
+			continue;
+		}
+		m_download_buffer.Invalidate(part.offset, part.size);
+		Libs::LibKernel::Memory::WriteBacking(
+		    part.address, m_download_buffer.Mapped().data() + part.offset, part.size);
+		m_gpu_modified_ranges.Subtract(part.address, part.size);
+	}
+	m_memory_tracker.UnmarkRegionAsGpuModified(pending.vaddr, pending.size);
+	if (pending.is_write) {
+		m_memory_tracker.MarkRegionAsCpuModified(pending.fault_vaddr, pending.fault_size);
 	}
 }
 
@@ -432,38 +571,83 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	return CreateBuffer(vaddr, size);
 }
 
-BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
-	auto& command = m_scheduler.Current();
-	EXIT_IF(command.IsInvalid());
-	auto       begin = vaddr & ~(CACHING_PAGESIZE - 1);
-	auto       end   = (vaddr + size + CACHING_PAGESIZE - 1) & ~(CACHING_PAGESIZE - 1);
-	auto       first = m_buffers.lower_bound(begin);
-	if (first != m_buffers.begin()) {
-		const auto previous = std::prev(first);
-		if (const auto& buffer = m_slot_buffers[previous->second];
-		    buffer.CpuAddress() + buffer.Size() > begin) {
-			first = previous;
+BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t size) {
+	static constexpr int      StreamLeapThreshold = 16;
+	static constexpr uint64_t StreamLeapSize      = CACHING_PAGESIZE * 128;
+
+	auto       begin      = vaddr;
+	auto       end        = vaddr + size;
+	const auto find_first = [&](uint64_t address) {
+		auto first = m_buffers.lower_bound(address);
+		if (first != m_buffers.begin()) {
+			const auto  previous = std::prev(first);
+			const auto& buffer   = m_slot_buffers[previous->second];
+			if (buffer.CpuAddress() + buffer.Size() > address) {
+				first = previous;
+			}
+		}
+		return first;
+	};
+	auto first           = find_first(begin);
+	auto last            = first;
+	int  stream_score    = 0;
+	bool has_stream_leap = false;
+	for (; last != m_buffers.end() && last->first < end; ++last) {
+		const auto& buffer        = m_slot_buffers[last->second];
+		const auto  buffer_begin  = buffer.CpuAddress();
+		const auto  buffer_end    = buffer_begin + buffer.Size();
+		const bool  expands_left  = buffer_begin < begin;
+		const bool  expands_right = buffer_end > end;
+		begin                     = std::min(begin, buffer_begin);
+		end                       = std::max(end, buffer_end);
+		if (!has_stream_leap && (stream_score += buffer.StreamScore()) > StreamLeapThreshold) {
+			has_stream_leap = true;
+			// Reserve space in the incoming stream's direction of growth.
+			// The old buffer extending left of the request predicts growth to the right, and vice versa.
+			if (expands_left) {
+				end += std::min(StreamLeapSize, PageTable::kAddressSpaceSize - end);
+			}
+			if (expands_right) {
+				const auto minimum = CACHING_PAGESIZE * 2;
+				if (begin > minimum) {
+					begin -= std::min(StreamLeapSize, begin - minimum);
+				}
+				first = find_first(begin);
+				begin = std::min(begin, first->first);
+			}
 		}
 	}
-	auto last = first;
-	for (; last != m_buffers.end() && last->first < end; ++last) {
-		const auto& buffer = m_slot_buffers[last->second];
-		begin              = std::min(begin, buffer.CpuAddress());
-		end                = std::max(end, buffer.CpuAddress() + buffer.Size());
+	return {first, last, begin, end, has_stream_leap};
+}
+
+void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score) {
+	auto& new_buffer = m_slot_buffers[new_id];
+	auto& overlap    = m_slot_buffers[overlap_id];
+	if (accumulate_stream_score) {
+		new_buffer.IncreaseStreamScore(overlap.StreamScore() + 1);
 	}
+	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
+	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
+	DeleteBuffer(overlap_id);
+}
+
+BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
+	EXIT_IF(m_scheduler.Current().IsInvalid());
+	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
+	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
+	size               = end - vaddr;
+	const auto overlap = ResolveOverlaps(vaddr, size);
 
 	const auto id = m_slot_buffers.insert(
-	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, begin,
-	    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, end - begin);
-	auto&      buffer = m_slot_buffers[id];
+	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin,
+	    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, overlap.end - overlap.begin);
+	const auto& buffer = m_slot_buffers[id];
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
-	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", begin, end - begin);
-	for (auto overlap = first; overlap != last;) {
-		const auto current = overlap++;
-		const auto old_id  = current->second;
-		const auto& old    = m_slot_buffers[old_id];
-		buffer.CopyFrom(command, old, 0, old.CpuAddress() - begin, old.Size());
-		DeleteBuffer(old_id);
+	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", overlap.begin,
+	                     overlap.end - overlap.begin);
+	for (auto it = overlap.first; it != overlap.last;) {
+		const auto old_id = (it++)->second;
+		JoinOverlap(id, old_id, !overlap.has_stream_leap);
 	}
 	Register(id);
 	PerfStats::Add(PerfStats::CounterId::BufferCreates);
@@ -475,13 +659,18 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
+	uint64_t                    upload_start = 0;
 	m_memory_tracker.ForEachUploadRange(
 	    vaddr, size, is_written,
 	    [&](uint64_t address, uint64_t bytes) noexcept {
 		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
 		    total_size += bytes;
 	    },
-	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+	    [&]() noexcept {
+		    // Started here rather than above so the hot-page hashing in the range walk stays out.
+		    upload_start = PerfStats::Enabled() ? PerfStats::Now() : 0;
+		    source       = UploadCopies(buffer, copies, total_size);
+	    });
 	if (source) {
 		PerfStats::Add(PerfStats::CounterId::BufferUploads);
 		PerfStats::Add(PerfStats::CounterId::BufferUploadBytes, total_size);
@@ -489,7 +678,6 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		command.EndRendering();
 		const auto native = command.Handle();
 		vk::BufferMemoryBarrier before {};
-		before.sType         = vk::StructureType::eBufferMemoryBarrier;
 		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
 		                       vk::AccessFlagBits::eTransferRead |
 		                       vk::AccessFlagBits::eTransferWrite;
@@ -510,6 +698,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 		                       vk::PipelineStageFlagBits::eAllCommands,
 		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
+		if (PerfStats::Enabled()) {
+			PerfStats::Record(PerfStats::SpanId::BufferUpload, PerfStats::Now() - upload_start);
+		}
 	}
 	if (is_texel_buffer && !is_written) {
 		return SynchronizeBufferFromImage(buffer, vaddr, size);
@@ -568,27 +759,56 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		}
 	}
 
-	auto* buffer = m_slot_buffers.try_get(id);
-	if (buffer == nullptr || buffer->is_deleted || !buffer->IsInBounds(vaddr, size)) {
-		id     = FindBuffer(vaddr, size);
-		buffer = &m_slot_buffers[id];
+	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
+		id = FindBuffer(vaddr, size);
 	}
-	TouchBuffer(*buffer);
-	(void)SynchronizeBuffer(*buffer, vaddr, size, is_written, is_texel_buffer);
+	auto& buffer = m_slot_buffers[id];
+	TouchBuffer(buffer);
+	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
+		if (PerfStats::Enabled()) {
+			NoteReadBackDirtied(vaddr, size);
+		}
 		m_gpu_modified_ranges.Add(vaddr, size);
-		buffer->last_gpu_write_tick = m_scheduler.CurrentTick();
-		if (buffer->readback_hot) {
-			if (buffer->writes_since_shadow.size() < 64) {
-				buffer->writes_since_shadow.push_back({vaddr, size});
+		if (!m_write_watches.empty()) {
+			// No watch starting before this bound can reach vaddr.
+			const auto lowest = vaddr >= m_write_watch_span ? vaddr - m_write_watch_span + 1 : 0;
+			for (auto it = m_write_watches.lower_bound(lowest);
+			     it != m_write_watches.end() && it->first < vaddr + size; ++it) {
+				if (it->first + it->second.size > vaddr) {
+					it->second.writes++;
+				}
 			}
-			if (!buffer->shadow_pending) {
-				buffer->shadow_pending = true;
+		}
+		// A readback copied before this write no longer holds the latest bytes of the range.
+		for (auto& pending: m_pending_readbacks) {
+			if (vaddr < pending.vaddr + pending.size && pending.vaddr < vaddr + size) {
+				pending.valid = false;
+			}
+		}
+		buffer.last_gpu_write_tick = m_scheduler.CurrentTick();
+		if (buffer.readback_hot) {
+			if (buffer.writes_since_shadow.size() < 64) {
+				buffer.writes_since_shadow.push_back({vaddr, size});
+			}
+			if (!buffer.shadow_pending) {
+				buffer.shadow_pending = true;
 				m_hot_written.push_back(id);
+			}
+			if (buffer.eager_budget != 0) {
+				buffer.eager_budget--;
+				m_eager_shadow_pending = true;
 			}
 		}
 	}
-	return {buffer, buffer->Offset(vaddr)};
+	return {&buffer, buffer.Offset(vaddr)};
+}
+
+uint64_t BufferCache::GpuWriteCount(uint64_t vaddr, uint64_t size) {
+	auto& watch        = m_write_watches[vaddr];
+	watch.size         = std::max(watch.size, size);
+	m_write_watch_span = std::max(m_write_watch_span, watch.size);
+	return watch.writes;
 }
 
 void BufferCache::RecordHotShadows() {
@@ -602,7 +822,7 @@ void BufferCache::RecordHotShadows() {
 			continue;
 		}
 		buffer->shadow_pending = false;
-		const auto [mapped, offset] = m_download_buffer.Map(buffer->Size(), DOWNLOAD_ALIGNMENT);
+		const auto [mapped, offset] = m_download_buffer.Map(buffer->Size(), 64);
 		if (mapped == nullptr) {
 			buffer->shadow_valid = false;
 			continue;
@@ -623,6 +843,7 @@ void BufferCache::RecordHotShadows() {
 		m_scheduler.DeferOperation([this, id, tick] { WriteBackShadow(id, tick); });
 	}
 	m_hot_written.clear();
+	m_eager_shadow_pending = false;
 }
 
 void BufferCache::WriteBackShadow(BufferId id, uint64_t tick) {
@@ -631,20 +852,22 @@ void BufferCache::WriteBackShadow(BufferId id, uint64_t tick) {
 	    buffer->shadow_tick != tick || !buffer->writes_since_shadow.empty()) {
 		return;
 	}
-	const auto                base = buffer->CpuAddress();
-	const auto                size = buffer->Size();
-	std::vector<DownloadCopy> copies;
+	const auto base = buffer->CpuAddress();
+	const auto size = buffer->Size();
+	struct Copy {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+	};
+	std::vector<Copy> copies;
 	m_memory_tracker.ForEachDownloadRange<false>(
-	    base, size,
-	    [](uint64_t, uint64_t) noexcept {},
-	    [&](uint64_t address, uint64_t bytes) noexcept {
-		    for (const auto range: m_gpu_modified_ranges.Intersections(address, bytes)) {
-			    const auto start = std::max(range.address, base);
-			    const auto end   = std::min(range.address + range.size, base + size);
+	    base, size, [&](uint64_t address, uint64_t bytes) noexcept {
+		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
+			    start = std::max(start, base);
+			    end   = std::min(end, base + size);
 			    if (start < end) {
-				    copies.push_back({buffer, start - base, start, end - start});
+				    copies.push_back({start, end - start});
 			    }
-		    }
+		    });
 	    });
 	if (copies.empty()) {
 		return;
@@ -652,46 +875,29 @@ void BufferCache::WriteBackShadow(BufferId id, uint64_t tick) {
 	m_download_buffer.Invalidate(buffer->shadow_offset, size);
 	const auto* shadow = m_download_buffer.Mapped().data() + buffer->shadow_offset;
 	for (const auto& copy: copies) {
-		Libs::LibKernel::Memory::WriteBacking(copy.address, shadow + copy.source_offset, copy.size);
+		Libs::LibKernel::Memory::WriteBacking(copy.address, shadow + (copy.address - base),
+		                                      copy.size);
 		m_gpu_modified_ranges.Subtract(copy.address, copy.size);
 	}
 	m_memory_tracker.UnmarkRegionAsGpuModified(base, size);
+	buffer->eager_budget = EagerShadowBudget;
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid image source\n");
 	}
-	auto find_owner = [&]() -> Buffer* {
-		const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
-		if (owner == nullptr || !*owner) {
-			return nullptr;
-		}
+	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	if (owner != nullptr && *owner) {
 		auto& buffer = m_slot_buffers[*owner];
-		return buffer.IsInBounds(vaddr, size) ? &buffer : nullptr;
-	};
-
-	{
-		const bool cpu_modified            = m_memory_tracker.IsRegionCpuModified(vaddr, size);
-		const bool gpu_modified            = m_memory_tracker.IsRegionGpuModified(vaddr, size);
-		const bool has_dirty_buffer_source = m_gpu_modified_ranges.Intersects(vaddr, size);
-		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, vaddr, size,
-		                                           "image source");
-
-		auto* owner = find_owner();
-		if (has_dirty_buffer_source && owner == nullptr) {
-			if (!IsRegionRegistered(vaddr, size)) {
-				EXIT("BufferCache: GPU-dirty image source has no native buffer\n");
-			}
-			owner = &m_slot_buffers[FindBuffer(vaddr, size)];
+		if (buffer.IsInBounds(vaddr, size)) {
+			TouchBuffer(buffer);
+			(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
+			return {&buffer, buffer.Offset(vaddr)};
 		}
-		if (owner != nullptr && !cpu_modified && (!gpu_modified || has_dirty_buffer_source)) {
-			TouchBuffer(*owner);
-			return {owner, owner->Offset(vaddr)};
-		}
-		if (has_dirty_buffer_source && owner == nullptr) {
-			EXIT("BufferCache: GPU-dirty image source could not resolve its native owner\n");
-		}
+	}
+	if (IsRegionGpuModified(vaddr, size)) {
+		return ObtainBuffer(vaddr, size, false, false);
 	}
 
 	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
@@ -700,52 +906,50 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		EXIT("BufferCache: failed to read mapped guest image backing\n");
 	}
 	m_staging_buffer.Commit();
-
-	const bool has_dirty_buffer_source = m_gpu_modified_ranges.Intersects(vaddr, size);
-	auto*      owner                   = find_owner();
-	if (has_dirty_buffer_source && owner == nullptr) {
-		EXIT("BufferCache: GPU-dirty image source lost its native owner\n");
-	}
-	if (owner == nullptr ||
-	    (m_memory_tracker.IsRegionGpuModified(vaddr, size) && !has_dirty_buffer_source)) {
-		return {&m_staging_buffer, stage_offset};
-	}
-
-	TouchBuffer(*owner);
-	std::vector<std::pair<uint64_t, uint64_t>> uploads;
-	m_memory_tracker.ForEachUploadRange(
-	    vaddr, size, false,
-	    [&](uint64_t address, uint64_t upload_size) noexcept {
-		    uploads.emplace_back(address, upload_size);
-	    },
-	    [&]() noexcept {
-		    for (const auto& [address, upload_size]: uploads) {
-			    owner->CopyFrom(m_scheduler.Current(), m_staging_buffer,
-			                    stage_offset + address - vaddr, owner->Offset(address), upload_size,
-			                    vk::AccessFlagBits::eHostWrite);
-		    }
-	    });
-	return {owner, owner->Offset(vaddr)};
+	return {&m_staging_buffer, stage_offset};
 }
 
+// Guest memory and every cached copy of it take the bytes directly, without the fault that a store
+// through the guest mapping would take on a protected page.
 void BufferCache::WriteHostMemory(uint64_t vaddr, std::span<const uint8_t> data) {
 	if (vaddr == 0 || data.empty() || data.size() > UINT64_MAX - vaddr) {
-		EXIT("BufferCache: invalid host DMA write\n");
+		EXIT("BufferCache: invalid host write\n");
 	}
 	Libs::LibKernel::Memory::WriteBacking(vaddr, data.data(), data.size());
 
-	const auto end = vaddr + data.size();
-	for (const auto& [address, id]: m_buffers) {
-		auto&      buffer     = m_slot_buffers[id];
-		const auto buffer_end = address + buffer.Size();
-		const auto begin      = std::max(vaddr, address);
-		const auto range_end  = std::min(end, buffer_end);
+	const auto end   = vaddr + data.size();
+	auto       first = m_buffers.upper_bound(vaddr);
+	if (first != m_buffers.begin()) {
+		first = std::prev(first);
+	}
+	for (auto it = first; it != m_buffers.end() && it->first < end; ++it) {
+		auto&      buffer    = m_slot_buffers[it->second];
+		const auto begin     = std::max(vaddr, buffer.CpuAddress());
+		const auto range_end = std::min(end, buffer.CpuAddress() + buffer.Size());
 		if (begin >= range_end) {
 			continue;
 		}
-		WriteDataBuffer(buffer, begin, data.data() + begin - vaddr, range_end - begin);
+		WriteDataBuffer(buffer, begin, data.data() + (begin - vaddr), range_end - begin);
 		TouchBuffer(buffer);
 	}
+}
+
+// A plain store into a page holding GPU-written bytes faults, and the page can only change hands
+// once the GPU has finished writing them. When the stored bytes are not among them, guest memory is
+// already the only copy of those bytes that matters: write it and every cached copy directly and
+// leave the GPU's bytes and the page's protection alone.
+bool BufferCache::TryWriteBesideGpu(uint64_t vaddr, std::span<const uint8_t> data) {
+	if (data.empty() || !IsRegionGpuModified(vaddr, data.size()) ||
+	    HasGpuDirtyBytes(vaddr, data.size())) {
+		return false;
+	}
+	if (m_texture_cache.FindImageFromRange(vaddr, data.size(), false) ||
+	    m_texture_cache.IsRegionGpuModified(vaddr, data.size())) {
+		return false;
+	}
+	PerfStats::Add(PerfStats::CounterId::WritesBesideGpu);
+	WriteHostMemory(vaddr, data);
+	return true;
 }
 
 void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds) {
@@ -762,32 +966,16 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	if (vaddr == 0) {
 		EXIT("BufferCache: invalid fill memory address\n");
 	}
-	uint8_t clear_code = DCC_CODE_UNCOMPRESSED;
-	(void)DecodeDccFillCode(value, clear_code);
-	(void)m_texture_cache.ClearMeta(vaddr, clear_code);
-	{
-		const auto region = m_texture_cache.QueryRegion(vaddr, size);
-		if (!HasGpuDirtyBytes(vaddr, size) && !region.gpu_image_bytes) {
-			if (region.image_bytes) {
-				m_texture_cache.InvalidateMemory(vaddr, size);
-			}
-			std::array<uint32_t, 4096> values;
-			values.fill(value);
-			const std::span<const uint8_t> bytes {reinterpret_cast<const uint8_t*>(values.data()),
-			                                      sizeof(values)};
-			for (uint64_t offset = 0; offset < size;) {
-				const auto chunk = std::min<uint64_t>(size - offset, bytes.size());
-				WriteHostMemory(vaddr + offset, bytes.first(chunk));
-				offset += chunk;
-			}
-			return;
-		}
+	(void)m_texture_cache.ClearMeta(vaddr);
+	if (!IsRegionGpuModified(vaddr, size)) {
+		// Access the guest mapping so write faults invalidate cached buffers and images.
+		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
+		std::fill(destination, destination + size / sizeof(uint32_t), value);
+		return;
 	}
 
 	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
-	const auto id          = FindBuffer(vaddr, size);
-	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true, id);
-	EXIT_IF(dst == nullptr);
+	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
 	dst->Fill(dst_offset, size, value);
 }
 
@@ -804,29 +992,11 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		     " size=0x%016" PRIx64 " src_gds=%d dst_gds=%d\n",
 		     src_vaddr, dst_vaddr, size, static_cast<int>(src_gds), static_cast<int>(dst_gds));
 	}
-	if (src_memory || dst_memory) {
-		const auto src_region =
-		    src_memory ? m_texture_cache.QueryRegion(src_vaddr, size) : TextureCache::RegionInfo {};
-		const auto dst_region =
-		    dst_memory ? m_texture_cache.QueryRegion(dst_vaddr, size) : TextureCache::RegionInfo {};
-		if (src_memory && dst_memory && !HasGpuDirtyBytes(src_vaddr, size) &&
-		    !HasGpuDirtyBytes(dst_vaddr, size) && !src_region.gpu_image_bytes &&
-		    !dst_region.gpu_image_bytes) {
-			if (dst_region.image_bytes) {
-				m_texture_cache.InvalidateMemory(dst_vaddr, size);
-			}
-			std::array<uint8_t, 64 * 1024> bytes;
-			for (uint64_t offset = 0; offset < size;) {
-				const auto chunk = std::min<uint64_t>(size - offset, bytes.size());
-				if (!Libs::LibKernel::Memory::TryReadBacking(src_vaddr + offset, bytes.data(),
-				                                             chunk)) {
-					EXIT("BufferCache: host DMA source has no direct backing\n");
-				}
-				WriteHostMemory(dst_vaddr + offset, std::span {bytes}.first(chunk));
-				offset += chunk;
-			}
-			return;
-		}
+	if (src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
+	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
+		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
+		            size);
+		return;
 	}
 
 	auto& command = m_scheduler.Current();
@@ -839,10 +1009,6 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	                                    : std::pair {&m_gds_buffer, src_vaddr};
 	auto [dst, dst_offset] = dst_memory ? ObtainBuffer(dst_vaddr, size, true, true, dst_id)
 	                                    : std::pair {&m_gds_buffer, dst_vaddr};
-	EXIT_IF(src == nullptr || dst == nullptr);
-	if (src == dst && src_offset < dst_offset + size && dst_offset < src_offset + size) {
-		EXIT("BufferCache: resolved Vulkan copy ranges overlap\n");
-	}
 	dst->CopyFrom(command, *src, src_offset, dst_offset, size);
 }
 
@@ -890,8 +1056,7 @@ void BufferCache::RunGarbageCollector() {
 	const size_t   limit      = aggressive ? 64 : 32;
 
 	std::vector<BufferId> dirty_buffers;
-	std::vector<DownloadCopy> copies;
-	size_t                    retire_count = 0;
+	size_t                retire_count = 0;
 	m_lru_cache.ForEachItemBelow(tick - age, [&](BufferId id) {
 		auto& buffer = m_slot_buffers[id];
 		EXIT_IF(buffer.is_deleted);
@@ -902,19 +1067,7 @@ void BufferCache::RunGarbageCollector() {
 			return false;
 		}
 		if (dirty) {
-			m_memory_tracker.ForEachDownloadRange<false>(
-			    buffer.CpuAddress(), buffer.Size(),
-			    [&](uint64_t dirty_address, uint64_t dirty_size) noexcept {
-				    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, dirty_address,
-				                                           dirty_size, "garbage collection");
-			    },
-			    [&](uint64_t dirty_address, uint64_t dirty_size) noexcept {
-				    m_gpu_modified_ranges.ForEachIntersection(
-				        dirty_address, dirty_size, [&](RangeSet::Range range) {
-					    copies.push_back({&buffer, range.address - buffer.CpuAddress(),
-					                      range.address, range.size});
-				        });
-				});
+			EXIT_IF(!DownloadBufferMemory(buffer, buffer.CpuAddress(), buffer.Size()));
 			dirty_buffers.push_back(id);
 		} else {
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
@@ -927,8 +1080,10 @@ void BufferCache::RunGarbageCollector() {
 		return;
 	}
 
-	EXIT_IF(copies.empty());
-	DownloadBufferMemory(copies);
+	// Publish all queued downloads before releasing their tracked pages and owners.
+	const auto completion_tick = m_scheduler.CurrentTick();
+	m_scheduler.Wait(completion_tick);
+	m_scheduler.WaitPriorityOperations(completion_tick);
 	for (const auto id: dirty_buffers) {
 		auto& buffer = m_slot_buffers[id];
 		m_memory_tracker.UnmarkRegionAsGpuModified(buffer.CpuAddress(), buffer.Size());
@@ -948,8 +1103,8 @@ void BufferCache::ProcessFaultBuffer() {
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
-	uint64_t visited = 0;
-	const auto end = vaddr + size;
+	uint64_t   visited = 0;
+	const auto end     = vaddr + size;
 	auto       first   = m_buffers.upper_bound(vaddr);
 	if (first != m_buffers.begin()) {
 		const auto previous = std::prev(first);

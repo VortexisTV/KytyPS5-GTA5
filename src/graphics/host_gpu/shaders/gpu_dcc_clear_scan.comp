@@ -1,0 +1,76 @@
+#version 450
+
+// Decides on the GPU whether one DCC metadata slice holds a fast clear, so the CPU never has to
+// read GPU-written metadata back. A slice is a clear when every byte carries one of the codes the
+// CPU could decode for this image; the matching color and the fill dispatch size go to a record
+// that the fill pass reads, and a matched slice is consumed the way the CPU path consumes it.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Metadata {
+	uint words[];
+} metadata;
+
+struct Record {
+	uvec4 args; // VkDispatchIndirectCommand, zero groups when the slice is not a clear
+	vec4  color;
+};
+
+layout(std430, binding = 1) buffer Records {
+	Record records[];
+} result;
+
+layout(std430, push_constant) uniform Push {
+	vec4 colors[5]; // indexed like CODES
+	uint valid_mask;
+	uint meta_base; // first dword of the slice within binding 0
+	uint slice_dwords;
+	uint consume;
+	uint width;
+	uint height;
+	uint record;
+} push;
+
+const uint CODES[5] = uint[](0x00000000u, 0x20202020u, 0x40404040u, 0x80808080u, 0xc0c0c0c0u);
+
+shared uint mismatch;
+
+void main() {
+	const uint lane  = gl_LocalInvocationIndex;
+	const uint first = metadata.words[push.meta_base];
+	if (lane == 0u) {
+		mismatch = 0u;
+	}
+	memoryBarrierShared();
+	barrier();
+	for (uint i = lane; i < push.slice_dwords; i += gl_WorkGroupSize.x) {
+		if (metadata.words[push.meta_base + i] != first) {
+			atomicOr(mismatch, 1u);
+		}
+	}
+	memoryBarrierShared();
+	barrier();
+
+	int match = -1;
+	if (mismatch == 0u) {
+		for (int k = 0; k < 5; k++) {
+			if ((push.valid_mask & (1u << uint(k))) != 0u && CODES[k] == first) {
+				match = k;
+			}
+		}
+	}
+	// Every read above happened before the barrier, so overwriting the slice is safe.
+	if (match >= 0 && push.consume != 0u) {
+		for (uint i = lane; i < push.slice_dwords; i += gl_WorkGroupSize.x) {
+			metadata.words[push.meta_base + i] = 0xffffffffu;
+		}
+	}
+	if (lane == 0u) {
+		const bool clear                    = match >= 0;
+		result.records[push.record].args =
+		    clear ? uvec4((push.width + 7u) / 8u, (push.height + 7u) / 8u, 1u, 0u) : uvec4(0u);
+		if (clear) {
+			result.records[push.record].color = push.colors[match];
+		}
+	}
+}

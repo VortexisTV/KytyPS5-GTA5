@@ -121,6 +121,13 @@ public:
 	[[nodiscard]] Block*                  PhiBlock(size_t index) const;
 	[[nodiscard]] Block*                  Parent() const;
 	[[nodiscard]] const std::vector<Use>& Uses() const;
+	// Runtime indices belong to the resource plan that owns this instruction.
+	[[nodiscard]] uint32_t EvaluationIndex(uint32_t& count) const {
+		if (evaluation_index == UINT32_MAX) {
+			evaluation_index = count++;
+		}
+		return evaluation_index;
+	}
 
 	void SetParent(Block* block);
 	void SetArg(size_t index, Value value);
@@ -144,24 +151,18 @@ public:
 		std::memcpy(&flags, &value, sizeof(value));
 	}
 
-	// Dense index assigned to the values of an extracted ResourcePlan so per-draw evaluation can
-	// memoize in a flat array. Unset (NoEvalSlot) for ordinary program instructions.
-	static constexpr uint32_t NoEvalSlot = 0xffffffffu;
-	[[nodiscard]] uint32_t    GetEvalSlot() const { return eval_slot; }
-	void                      SetEvalSlot(uint32_t slot) { eval_slot = slot; }
-
 private:
 	void AddUse(Inst* used, size_t operand);
 	void RemoveUse(Inst* used, size_t operand);
 	void ClearArgs();
 
 	ValueOpcode         opcode;
-	uint32_t            eval_slot = NoEvalSlot;
 	uint64_t            flags;
 	Block*              parent = nullptr;
 	std::vector<Value>  args;
 	std::vector<Block*> phi_blocks;
 	std::vector<Use>    uses;
+	mutable uint32_t    evaluation_index = UINT32_MAX;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

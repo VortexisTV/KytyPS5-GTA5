@@ -10,6 +10,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/frameDump.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
@@ -23,60 +24,37 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
-#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <span>
 #include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
-// The metadata fill this title uses: one written buffer, no other resources, and a user data that is
-// nothing but that buffer's own descriptor. Deliberately strict, because matching it lets a dispatch
-// register a speculative metadata address, and a generic "fill a dword buffer" shader must not.
-template <typename Program, typename Resources>
-static bool IsSingleBufferFillShape(const Program& program, const Resources& resources) {
-	if (program.info.buffers.size() != 1 || resources.buffers.size() != 1 ||
-	    !program.info.images.empty() || !program.info.samplers.empty() || program.info.uses_dma ||
-	    program.info.has_bitwise_xor || program.user_data_base != 0 ||
-	    resources.user_data.size() != 4) {
-		return false;
-	}
-	const auto& resource = program.info.buffers.front();
-	if (!resource.written || resource.read || resource.atomic || resource.scalar) {
-		return false;
-	}
-	const auto& raw = resources.buffers.front();
-	if (raw.dword_count != 4) {
-		return false;
-	}
-	for (uint32_t i = 0; i < raw.dword_count; i++) {
-		if (raw.dwords[i] != resources.user_data[i]) {
+static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
+                                 GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
+	for (uint32_t i = 0; i < sources.size(); ++i) {
+		if (i == output_buffer) continue;
+		const auto source = DecodeNativeDescriptor<ShaderBufferResource>(sources[i]);
+		const auto bytes  = source.GetSize();
+		if (source.Base48() < destination.End() && destination.address < source.Base48() + bytes)
 			return false;
-		}
 	}
-	return DecodeNativeDescriptor<ShaderBufferResource>(raw).Stride() == sizeof(uint32_t);
-}
-
-static uint64_t BufferDescriptorSize(const ShaderBufferResource& descriptor) {
-	const uint64_t records = descriptor.NumRecords();
-	const uint64_t stride  = descriptor.Stride();
-	if (stride != 0 && records > UINT64_MAX / stride) {
-		EXIT("compute buffer descriptor footprint overflow\n");
-	}
-	return stride == 0 ? records : records * stride;
+	return true;
 }
 
 bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
                                                 const CommandBuffer&          buffer) {
 	const auto& program   = *input.stage.program;
-	const auto& resources = input.stage.resources;
+	const auto& resources = *input.stage.resources;
 	if (resources.buffers.size() != program.info.buffers.size()) {
 		EXIT("compute runtime buffer count does not match shader metadata\n");
 	}
@@ -86,173 +64,128 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 		const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
 		// A metadata resource that is also read is not proven to be a full overwrite. Execute it
 		// conservatively instead of replacing the dispatch with a coarse full-surface clear.
-		if (cache.IsMeta(descriptor.Base48()) && (!resource.written || resource.read)) {
+		if ((!resource.written || resource.read) && cache.IsMeta(descriptor.Base48())) {
 			return false;
 		}
 	}
 
-	if (program.info.has_bitwise_xor) {
-		return false;
-	}
-
-	uint64_t meta_address = 0;
-	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-		if (!program.info.buffers[i].written) {
-			continue;
-		}
-		const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-		if (cache.IsMeta(descriptor.Base48())) {
-			meta_address = descriptor.Base48();
-			break;
+	if (!program.info.has_bitwise_xor) {
+		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+			const auto& resource = program.info.buffers[i];
+			if (resource.written) {
+				const auto descriptor =
+				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+				if (cache.ClearMeta(descriptor.Base48())) {
+					return true;
+				}
+			}
 		}
 	}
-	if (meta_address == 0) {
-		// Nothing has claimed this address as metadata yet, so the fill cannot be applied - but
-		// discarding it means a surface bound later never learns it was cleared. Measured: four
-		// 1024x1024 surfaces were filled at frame 2, first bound at frame 871, and stayed uncleared
-		// for the remaining 150 frames because the guest never re-filled them.
-		//
-		// Park it instead, matching what TryConsumeDccFill does for the other fill path, and return
-		// false so the dispatch still runs. Restricted to the exact shape of the single-buffer fill
-		// (its whole user data is the written descriptor, stride 4, no other resources) so an ordinary
-		// buffer-writing dispatch cannot plant a speculative metadata entry.
-		if (IsSingleBufferFillShape(program, resources)) {
-			cache.ParkMetaFill(
-			    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers.front()).Base48());
-		}
-		return false;
-	}
-
-	// DCC_CODE_UNCOMPRESSED doubles as this function's "no code found" fallback and as the guest's
-	// real uncompressed code, so failing to recover a value is indistinguishable from the guest
-	// asking for a decompress - and silently not a clear. Both sources below therefore have to be
-	// tried before settling for it.
-	uint8_t  clear_code = DCC_CODE_UNCOMPRESSED;
-	bool     recovered  = false;
-	uint32_t scanned    = 0;
-
-	// A two-buffer fill splats a dword sourced from a companion read-only buffer. The guest value
-	// sits at that descriptor's base address; the index the recompiled shader applies is only Kyty's
-	// own host alignment adjustment on top of guest offset 0. A DCC clear code is byte-replicated by
-	// construction, which is what makes that test sufficient.
-	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-		if (program.info.buffers[i].written) {
-			continue;
-		}
-		const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-		uint32_t   value      = 0;
-		scanned++;
-		if (LibKernel::Memory::TryReadBacking(descriptor.Base48(), &value, sizeof(value)) &&
-		    DecodeDccFillCode(value, clear_code)) {
-			recovered = true;
-			break;
-		}
-		clear_code = DCC_CODE_UNCOMPRESSED;
-	}
-
-	// A single-buffer fill carries its code as a literal compiled into the shader, so there is
-	// nothing in the dispatch to decode: user data holds four dwords and all four are the written
-	// buffer's own descriptor. Its IR is a bare `StoreBufferU32 <resource>, <linear index>,
-	// 0x00000000`, and because the constant is compiled in, a different code would be a different
-	// shader.
-	//
-	// The value is still observable in the one place the shader puts it - the metadata allocation
-	// itself. This shape is not recognized before the surface registers its metadata, because it
-	// fails ResolveComputeImageClear's stride==16 / R32G32B32A32_UINT gates, so the fill executes for
-	// real at least once and leaves its code in guest memory. Reading it back models DCC honestly:
-	// the metadata *is* guest memory the shader wrote.
-	//
-	// Requiring a byte-replicated value other than the uncompressed code stops this inventing a clear
-	// out of an allocation that merely reads zero-initialised, and DecodeDccConstantClear still has to
-	// accept the result downstream.
-	if (!recovered && scanned == 0) {
-		uint32_t present = 0;
-		if (!LibKernel::Memory::TryReadBacking(meta_address, &present, sizeof(present)) ||
-		    !DecodeDccFillCode(present, clear_code) || clear_code == DCC_CODE_UNCOMPRESSED) {
-			clear_code = DCC_CODE_UNCOMPRESSED;
-		}
-	}
-
-	return cache.ClearMeta(meta_address, clear_code);
+	return false;
 }
 
-bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t group_x,
+bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t group_x,
                               uint32_t group_y, uint32_t group_z, uint32_t mode,
                               ShaderBufferResource& resolved_descriptor, uint32_t& resolved_clear,
                               uint64_t& resolved_size) {
-	const auto& program   = *input.stage.program;
-	const auto& resources = input.stage.resources;
-	if (program.info.buffers.size() != 1 || resources.buffers.size() != 1 ||
-	    !program.info.images.empty() || !program.info.samplers.empty() || program.info.uses_dma ||
-	    !resources.images.empty() || !resources.samplers.empty()) {
+	const auto& resources = *input.stage.resources;
+	const auto& fill      = resources.uniform_fill;
+	if (fill.kind != ShaderRecompiler::IR::UniformFillKind::Buffer) {
 		return false;
 	}
-	const auto& resource   = program.info.buffers.front();
-	const auto& raw        = resources.buffers.front();
-	const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(raw);
-	if (!resource.formatted || !resource.written || resource.read || resource.atomic ||
-	    resource.scalar || resource.max_byte_extent != 16 || descriptor.Stride() != 16 ||
-	    descriptor.Format() != Prospero::BufferFormat::k32_32_32_32UInt ||
+	const auto element_size = fill.words * sizeof(uint32_t);
+	const auto descriptor =
+	    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[fill.resource]);
+	constexpr std::array formats {
+	    Prospero::BufferFormat::k32UInt, Prospero::BufferFormat::k32_32UInt,
+	    Prospero::BufferFormat::k32_32_32UInt, Prospero::BufferFormat::k32_32_32_32UInt};
+	if (descriptor.Stride() != element_size || descriptor.Format() != formats[fill.words - 1] ||
 	    descriptor.SwizzleEnabled() || descriptor.IndexStride() != 0 || descriptor.AddTid() ||
-	    resource.packed_stride != descriptor.PackedStride() || raw.dword_count != 4 ||
-	    program.user_data_base != 0 || resources.user_data.size() != 8) {
+	    descriptor.Base48() == 0) {
 		return false;
 	}
-	for (uint32_t i = 0; i < raw.dword_count; i++) {
-		if (raw.dwords[i] != resources.user_data[i]) {
-			return false;
-		}
-	}
-	const uint32_t clear = resources.user_data[4];
-	if (resources.user_data[5] != clear || resources.user_data[6] != clear ||
-	    resources.user_data[7] != clear) {
+	if (input.threads_num[0] == 0 || input.threads_num[0] != fill.group_stride[0] ||
+	    input.threads_num[1] != 1 || input.threads_num[2] != 1 || group_x == 0 || group_y != 1 ||
+	    group_z != 1 || mode != (input.dispatch_thread_dimensions ? 0x61u : 0x41u)) {
 		return false;
 	}
-	const bool full_dispatch =
-	    input.dispatch_thread_dimensions && input.threads_num[0] == 64 &&
-	    input.threads_num[1] == 1 && input.threads_num[2] == 1 && group_x != 0 && group_y == 1 &&
-	    group_z == 1 && input.dispatch_threads_num[0] == group_x &&
-	    input.dispatch_threads_num[1] == 1 && input.dispatch_threads_num[2] == 1 &&
-	    input.group_id[0] && !input.group_id[1] && !input.group_id[2] &&
-	    input.thread_ids_num == 1 && input.wave_size == 64 && !input.tg_size_en && mode == 0x61u &&
-	    group_x % input.threads_num[0] == 0 && descriptor.NumRecords() == group_x;
-	const auto size = BufferDescriptorSize(descriptor);
-	if (!full_dispatch || size == 0) {
+	const uint64_t invocations = input.dispatch_thread_dimensions
+	                                 ? group_x
+	                                 : static_cast<uint64_t>(group_x) * input.threads_num[0];
+	const auto     size        = descriptor.GetSize();
+	if (invocations != descriptor.NumRecords() || size == 0 || size > UINT32_MAX ||
+	    (input.dispatch_thread_dimensions &&
+	     (group_x % input.threads_num[0] != 0 || input.dispatch_threads_num[0] != group_x ||
+	      input.dispatch_threads_num[1] != 1 || input.dispatch_threads_num[2] != 1))) {
 		return false;
 	}
+	if (!FillSourcesDisjoint(resources.buffers, {descriptor.Base48(), size}, fill.resource))
+		return false;
 	resolved_descriptor = descriptor;
-	resolved_clear      = clear;
+	resolved_clear      = fill.value;
 	resolved_size       = size;
 	return true;
 }
 
-static bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input, CommandBuffer& command,
-                                        uint32_t group_x, uint32_t group_y, uint32_t group_z,
-                                        uint32_t mode) {
+bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
+                                                CommandBuffer& command, uint32_t group_x,
+                                                uint32_t group_y, uint32_t group_z, uint32_t mode) {
+	const auto& program   = *input.stage.program;
+	const auto& resources = *input.stage.resources;
+	const auto& fill      = resources.uniform_fill;
+	auto&       cache     = command.GetContext().GetTextureCache();
+	if (fill.kind == ShaderRecompiler::IR::UniformFillKind::Image) {
+		if (mode != 0x41u || input.dispatch_thread_dimensions || fill.value > 255 ||
+		    input.threads_num[2] != 1)
+			return false;
+		const auto  descriptor = DecodeNativeDescriptor<ShaderTextureResource>(resources.images[0]);
+		const auto& resource   = program.info.images[0];
+		if (descriptor.IsNull() || descriptor.Format() != Prospero::BufferFormat::k8UInt ||
+		    descriptor.Type() != Prospero::ImageType::kColor2DArray || descriptor.MetaCompress() ||
+		    descriptor.WriteCompress() || descriptor.BaseLevel() > descriptor.LastLevel() ||
+		    descriptor.BaseLevel() > descriptor.MaxMip() ||
+		    descriptor.BaseArray5() > descriptor.Depth() || descriptor.DstSelX() != 4)
+			return false;
+		const std::array extents {
+		    std::max(1u, (descriptor.Width5() + 1u) >> descriptor.BaseLevel()),
+		    std::max(1u, (descriptor.Height5() + 1u) >> descriptor.BaseLevel()),
+		    descriptor.Depth() - descriptor.BaseArray5() + 1u};
+		const std::array groups {group_x, group_y, group_z};
+		for (uint32_t axis = 0; axis < 3; ++axis) {
+			const uint64_t threads = input.threads_num[axis];
+			// Guest image writes outside the descriptor dimensions are discarded. Only the
+			// final workgroup may extend beyond the selected image view.
+			if (threads == 0 || threads != fill.group_stride[axis] ||
+			    groups[axis] != (extents[axis] + threads - 1) / threads ||
+			    groups[axis] * threads > UINT32_MAX) return false;
+		}
+		const auto  binding     = ResolveTexture(resource, resources.images[0]);
+		const auto& destination = binding.desc.info.data;
+		if (!FillSourcesDisjoint(resources.buffers, destination)) return false;
+		std::scoped_lock lock {cache.m_lock};
+		const auto&      image = cache.GetImage(binding.image_id);
+		const auto&      view  = binding.desc.view_info;
+		if (image.backing.format != vk::Format::eD32SfloatS8Uint || image.info.samples != 1 ||
+		    image.info.stencil != destination || view.base_level >= image.backing.mip_levels ||
+		    view.base_layer >= image.backing.layers || view.layer_count != extents[2] ||
+		    view.layer_count > image.backing.layers - view.base_layer ||
+		    std::max(1u, image.info.extent.width >> view.base_level) != extents[0] ||
+		    std::max(1u, image.info.extent.height >> view.base_level) != extents[1]) return false;
+		const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eStencil, view.base_level,
+		                                       1, view.base_layer, view.layer_count};
+		vk::ClearValue clear {};
+		clear.depthStencil = vk::ClearDepthStencilValue {0.0f, fill.value};
+		cache.ClearImage(command, binding.image_id, image.backing.format, range, clear);
+		return true;
+	}
 	ShaderBufferResource descriptor;
 	uint32_t             packed_clear = 0;
 	uint64_t             size         = 0;
-	if (!ResolveComputeImageClear(input, group_x, group_y, group_z, mode, descriptor, packed_clear,
+	if (!ResolveComputeBufferFill(input, group_x, group_y, group_z, mode, descriptor, packed_clear,
 	                              size)) {
 		return false;
 	}
-	auto& cache = command.GetContext().GetTextureCache();
 	if (!cache.ClearImageFromBuffer(command, descriptor.Base48(), size, packed_clear)) {
-		// Recognized metadata-fill shaders access DCC as an ordinary storage buffer and may run
-		// before the render target is bound. TryConsumeDccFill either consumes registered state
-		// or retains a PendingDcc fill while allowing the dispatch to run.
-		const bool registered_metadata =
-		    cache.TryConsumeDccFill(descriptor.Base48(), size, packed_clear);
-		static std::atomic<uint32_t> logged_metadata_clears {0};
-		if (logged_metadata_clears.fetch_add(1, std::memory_order_relaxed) < 32) {
-			LOGF("GraphicsRenderDispatchDirect: %s metadata clear shader=0x%016" PRIx64
-			     " addr=0x%016" PRIx64 " size=0x%016" PRIx64 " value=0x%08" PRIx32 "\n",
-			     registered_metadata ? "tracked" : "deferred", input.stage.program->shader_hash,
-			     descriptor.Base48(), size, packed_clear);
-		}
-		if (registered_metadata) {
-			return true;
-		}
 		return false;
 	}
 	static std::atomic<uint32_t> logged_clears {0};
@@ -277,6 +210,17 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	                    thread_group_x, thread_group_y, thread_group_z, mode,
 	                    sh_ctx.GetCs().cs_regs.data_addr);
 
+	if (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0) {
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+			LOGF("GraphicsRenderDispatchDirect: skipping zero-sized dispatch groups=%ux%ux%u "
+			     "mode=0x%08" PRIx32 " shader=0x%016" PRIx64 "\n",
+			     thread_group_x, thread_group_y, thread_group_z, mode,
+			     sh_ctx.GetCs().cs_regs.data_addr);
+		}
+		return;
+	}
+
 	Common::LockGuard lock(m_context.GetMutex());
 	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
 		LOGF("GraphicsRenderDispatchDirect: temporary: ignoring dispatch with null CS shader, "
@@ -285,7 +229,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
-	if (!ShaderAddressValid(sh_ctx.GetCs().cs_regs.data_addr)) {
+	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
 		return;
 	}
 
@@ -321,11 +265,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		input_info.dispatch_threads_num[2]    = thread_group_z;
 	}
 
-	const uint32_t frame_num = static_cast<uint32_t>(m_context.GetGpu().GetFrameNum());
-	const bool     large_workgroup =
-	    (input_info.threads_num[0] * input_info.threads_num[1] * input_info.threads_num[2] >= 512);
 	const auto& program   = *input_info.stage.program;
-	const auto& resources = input_info.stage.resources;
+	const auto& resources = *input_info.stage.resources;
 	if (TryConsumeComputeMetaClear(input_info, buffer)) {
 		ResetBindings();
 		return;
@@ -335,14 +276,17 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		ResetBindings();
 		return;
 	}
-	const auto sampled_images = std::count_if(
-	    program.info.images.begin(), program.info.images.end(), [](const auto& image) {
-		    return image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
-	    });
+	const bool large_workgroup =
+	    (input_info.threads_num[0] * input_info.threads_num[1] * input_info.threads_num[2] >= 512);
 	const bool                   has_sampler = !program.info.samplers.empty();
 	static std::atomic<uint32_t> dispatch_log_count {0};
 	if ((large_workgroup || has_sampler) &&
 	    dispatch_log_count.fetch_add(1, std::memory_order_relaxed) < 512) {
+		const auto sampled_images = std::count_if(
+		    program.info.images.begin(), program.info.images.end(), [](const auto& image) {
+			    return image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
+		    });
+		const uint32_t frame_num = static_cast<uint32_t>(m_context.GetGpu().GetFrameNum());
 		LOGF("GraphicsRenderDispatchDirect: frame=%u shader=0x%016" PRIx64
 		     " groups=%ux%ux%u mode=0x%08" PRIx32 " local=%ux%ux%u "
 		     "buffers=%zu textures=%zu sampled=%zu storage=%zu samplers=%zu push=%u\n",
@@ -418,28 +362,18 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
-	if (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
-			LOGF("GraphicsRenderDispatchDirect: skipping zero-sized dispatch groups=%ux%ux%u "
-			     "mode=0x%08" PRIx32 " shader=0x%016" PRIx64 "\n",
-			     thread_group_x, thread_group_y, thread_group_z, mode,
-			     sh_ctx.GetCs().cs_regs.data_addr);
-		}
-		return;
-	}
-
 	buffer.EndRendering();
 	auto& pipeline =
-	    m_context.GetPipelineCache().CreateComputePipeline(input_info, compute_program);
-	auto bindings = PrepareBindings(input_info.stage);
+	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	auto& bindings = m_compute_bindings;
+	PrepareBindings(input_info.stage, bindings);
 	FindBuffers(bindings);
 	if (program.info.uses_dma) {
 		PrepareDmaSources(bindings);
-		m_context.GetGpuResources().PrepareBda();
+		m_context.PrepareBda();
 	}
-	RebindBuffers(bindings);
 	RebindImages(bindings);
+	RebindBuffers(bindings);
 
 	auto              vk_buffer        = buffer.Handle();
 	PreparedBindings* descriptor_stage = &bindings;
@@ -469,22 +403,20 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			return image != nullptr ? image->info.data.address : 0;
 		};
 		const bool writes_watched =
-		    std::any_of(bindings.resources.images.begin(), bindings.resources.images.end(),
-		                [&](const auto& binding) {
-			                return binding.desc.type == TextureCache::BindingType::Storage &&
-			                       address_of(binding.image_id) == watched;
-		                });
+		    std::any_of(bindings.images.begin(), bindings.images.end(), [&](const auto& binding) {
+			    return binding.desc.type == TextureCache::BindingType::Storage &&
+			           address_of(binding.image_id) == watched;
+		    });
 		if (writes_watched) {
 			// What it read matters as much as what it wrote: an input that already holds nonsense
 			// moves the question one pass upstream.
 			std::string details = "buffers:";
-			for (const auto& buffer_binding: bindings.buffer_bindings) {
-				details += fmt::format(" 0x{:010x}/{}", buffer_binding.descriptor.Base48(),
-				                       buffer_binding.extent);
+			for (const auto& source: bindings.buffer_sources) {
+				details += fmt::format(" 0x{:010x}/{}", source.address, source.size);
 			}
 			FrameDumpWatchOperation(m_context, watched, "Dispatch",
 			                        sh_ctx.GetCs().cs_regs.data_addr, 0, details);
-			for (const auto& binding: bindings.resources.images) {
+			for (const auto& binding: bindings.images) {
 				const auto address = address_of(binding.image_id);
 				if (address == 0 || address == watched) {
 					continue;
@@ -498,6 +430,65 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	// The removed host fence also ordered read-only dispatches before later writers.
+	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	ResetBindings();
+}
+
+void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
+                                      uint64_t args_addr, uint32_t mode) {
+	PerfStats::Span dispatch_span(PerfStats::SpanId::Dispatch);
+	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
+	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
+	m_context.GetCommandScheduler().PopPendingOperations();
+	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchIndirect), submit_id,
+	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
+	                    0, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);
+	Common::LockGuard lock(m_context.GetMutex());
+	const auto& cs_regs = buffer.GetShaders().GetCs();
+	if (cs_regs.cs_regs.data_addr == 0) {
+		return;
+	}
+	ShaderComputeInputInfo input_info {};
+	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
+	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	buffer.EndRendering();
+	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	auto& bindings = m_compute_bindings;
+	PrepareBindings(input_info.stage, bindings);
+	FindBuffers(bindings);
+	const auto& program = *input_info.stage.program;
+	if (program.info.uses_dma) {
+		PrepareDmaSources(bindings);
+		m_context.PrepareBda();
+	}
+	RebindImages(bindings);
+	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
+	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
+	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
+	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
+	RebindBuffers(bindings);
+	PreparedBindings* descriptor_stage = &bindings;
+	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
+	               std::span {&descriptor_stage, 1u});
+	const auto vk_buffer = buffer.Handle();
+	const bool has_storage_writes = HasShaderBufferWrites(input_info.stage) ||
+	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& image) {
+		    return image.written && image.resource_class ==
+		                                ShaderRecompiler::IR::ImageResourceClass::Storage;
+	    });
+	if (has_storage_writes) {
+		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	}
+	vk::MemoryBarrier barrier {};
+	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
+	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
+	                              vk::PipelineStageFlagBits::eComputeShader |
+	                              vk::PipelineStageFlagBits::eTransfer,
+	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
+	                          1, &barrier, 0, nullptr, 0, nullptr);
+	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
 }

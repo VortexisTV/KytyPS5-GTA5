@@ -26,7 +26,8 @@ namespace PerfStats {
 
 namespace {
 
-constexpr const char* CsvFileName = "_PerfStats.csv";
+constexpr const char* CsvFileName   = "_PerfStats.csv";
+constexpr const char* NotesFileName = "_PerfNotes.txt";
 
 constexpr std::array<std::string_view, SpanCount> SpanNames = {
     "gpu_thread_busy",       "gpu_thread_idle",      "gpu_thread_blocked",
@@ -41,7 +42,8 @@ constexpr std::array<std::string_view, SpanCount> SpanNames = {
     "draw_vertex_index",     "draw_pipeline",
     "draw_record",           "dispatch",             "bda_prepare",
     "hot_page_hash",
-    "buffer_download",       "queue_submit",         "gpu_wait",
+    "buffer_download",       "buffer_upload",        "readback_guest_wait",
+    "queue_submit",          "gpu_wait",
     "gpu_wait_readback",     "gpu_wait_faults",      "gpu_wait_stream",
     "gpu_wait_predicate",
     "flip_wait",             "present",              "page_fault",
@@ -63,6 +65,9 @@ constexpr std::array<std::string_view, CounterCount> CounterNames = {
     "stream_upload_bytes",  "buffer_creates",         "buffer_download_bytes",
     "readbacks_shadow",     "readback_no_owner",      "readback_not_hot",
     "readback_shadow_stale", "readback_recent_write", "shadows_recorded",
+    "eager_shadow_flushes", "readbacks_async",        "readbacks_retried",
+    "indirect_dispatches_gpu", "writes_beside_gpu",
+    "dcc_gpu_scans",        "dcc_scans_skipped",      "dcc_cpu_readbacks",
     "buffers_evicted",      "image_creates",          "image_uploads",
     "image_upload_bytes",   "images_evicted",         "write_faults",
     "read_faults",          "shaders_compiled",       "pipelines_created",
@@ -110,6 +115,8 @@ struct Report {
 	uint64_t     cpu_start_ns     = 0;
 	Common::File csv;
 	bool         csv_open = false;
+	Common::File notes;
+	bool         notes_open = false;
 };
 
 Report& GetReport() {
@@ -196,6 +203,11 @@ void CloseCsv(Report& report) {
 		report.csv.Flush();
 		report.csv.Close();
 		report.csv_open = false;
+	}
+	if (report.notes_open) {
+		report.notes.Flush();
+		report.notes.Close();
+		report.notes_open = false;
 	}
 }
 
@@ -345,13 +357,18 @@ std::string FormatSummary(const Snapshot& snapshot, uint64_t ticks_per_second) {
 	    it,
 	    "[perf] per frame: readbacks: {:.1f} from a shadow, {:.1f} drained the GPU "
 	    "({:.1f} unowned, {:.1f} not hot yet, {:.1f} stale shadow, {:.1f} rewritten) | "
-	    "{:.1f} shadows recorded\n",
+	    "{:.1f} shadows recorded ({:.1f} eager flushes) | {:.1f} waited off the GPU thread, "
+	    "{:.1f} ms ({:.1f} retried) | avoided: {:.1f} indirect dispatches read on the GPU, "
+	    "{:.1f} labels written beside GPU data\n",
 	    per_frame(CounterId::ReadbacksShadow),
 	    per_frame(CounterId::ReadbackNoOwner) + per_frame(CounterId::ReadbackNotHot) +
 	        per_frame(CounterId::ReadbackShadowStale) + per_frame(CounterId::ReadbackRecentWrite),
 	    per_frame(CounterId::ReadbackNoOwner), per_frame(CounterId::ReadbackNotHot),
 	    per_frame(CounterId::ReadbackShadowStale), per_frame(CounterId::ReadbackRecentWrite),
-	    per_frame(CounterId::ShadowsRecorded));
+	    per_frame(CounterId::ShadowsRecorded), per_frame(CounterId::EagerShadowFlushes),
+	    per_frame(CounterId::ReadbacksAsync), ms(SpanId::ReadbackGuestWait),
+	    per_frame(CounterId::ReadbacksRetried), per_frame(CounterId::IndirectDispatchesGpu),
+	    per_frame(CounterId::WritesBesideGpu));
 	fmt::format_to(it,
 	               "[perf] per frame: GPU waits {:.1f} ms: readback {:.1f} ms ({:.1f}), faults "
 	               "{:.1f} ms ({:.1f}), stream buffer {:.1f} ms ({:.1f}), predicates {:.1f} ms "
@@ -492,6 +509,23 @@ void OnGuestFrame() noexcept {
 	std::fflush(stdout);
 }
 
+void Note(std::string_view line) {
+	if (!Enabled()) {
+		return;
+	}
+	auto&           report = GetReport();
+	std::lock_guard lock(report.mutex);
+	if (!report.notes_open) {
+		return;
+	}
+	const auto text = fmt::format("{:.1f}s {}\n",
+	                              static_cast<double>(Now() - report.start) /
+	                                  static_cast<double>(report.ticks_per_second),
+	                              line);
+	report.notes.Write(text.data(), static_cast<uint32_t>(text.size()));
+	report.notes.Flush();
+}
+
 void Initialize() {
 	if (!Config::PerfStatsEnabled() && !EnvironmentRequestsStats()) {
 		return;
@@ -508,6 +542,7 @@ void Initialize() {
 		report.csv.Write(header.data(), static_cast<uint32_t>(header.size()));
 		report.csv.Flush();
 	}
+	report.notes_open = report.notes.Create(NotesFileName);
 	std::printf("Performance statistics enabled: a summary follows every second of guest frames%s\n",
 	            report.csv_open ? "; intervals are written to _PerfStats.csv"
 	                            : "; _PerfStats.csv could not be created");

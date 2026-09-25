@@ -21,11 +21,11 @@ void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint3
                        uint32_t arg3, uint64_t arg4) {
 	LOGF("%s failed: %s (%d), tick=%" PRIu64 " debug_op=%u debug_submit=%" PRIu64
 	     " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
-	     what, VulkanToString(result).c_str(), static_cast<int>(result), tick, debug_op,
+	     what, vk::to_string(result).c_str(), static_cast<int>(result), tick, debug_op,
 	     debug_submit, arg0, arg1, arg2, arg3, arg4);
 	std::printf("%s failed: %s (%d), tick=%" PRIu64 " debug_op=%u debug_submit=%" PRIu64
 	            " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
-	            what, VulkanToString(result).c_str(), static_cast<int>(result), tick, debug_op,
+	            what, vk::to_string(result).c_str(), static_cast<int>(result), tick, debug_op,
 	            debug_submit, arg0, arg1, arg2, arg3, arg4);
 	std::fflush(stdout);
 }
@@ -36,7 +36,6 @@ CommandScheduler::CommandPool::CommandPool(GraphicContext& graphics, MasterSemap
     : m_graphics(graphics), m_master(master) {
 	EXIT_IF(graphics.queue_family == static_cast<uint32_t>(-1));
 	vk::CommandPoolCreateInfo create {};
-	create.sType            = vk::StructureType::eCommandPoolCreateInfo;
 	create.queueFamilyIndex = graphics.queue_family;
 	create.flags            = vk::CommandPoolCreateFlagBits::eTransient |
 	                          vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
@@ -54,7 +53,6 @@ size_t CommandScheduler::CommandPool::Grow() {
 	m_buffers.resize(first + GrowStep);
 
 	vk::CommandBufferAllocateInfo allocate {};
-	allocate.sType              = vk::StructureType::eCommandBufferAllocateInfo;
 	allocate.commandPool        = m_pool;
 	allocate.level              = vk::CommandBufferLevel::ePrimary;
 	allocate.commandBufferCount = static_cast<uint32_t>(GrowStep);
@@ -89,10 +87,7 @@ vk::CommandBuffer CommandScheduler::CommandPool::Commit() {
 		m_ticks[*found] = m_master.CurrentTick();
 	}
 
-	m_hint = *found + 1;
-	if (m_hint == m_ticks.size()) {
-		m_hint = 0;
-	}
+	m_hint = (*found + 1) % m_ticks.size();
 	return m_buffers[*found];
 }
 
@@ -133,7 +128,7 @@ void CommandScheduler::Shutdown() {
 		Submit();
 	}
 	m_master.Wait(CurrentTick() - 1);
-	PopPendingOperations();
+	PopPendingOperations(true);
 	DrainPriorityOperations();
 	m_priority_thread.request_stop();
 	m_operation_available.notify_all();
@@ -155,14 +150,10 @@ void CommandScheduler::Begin(HW::Context& registers, HW::UserConfig& user_config
 		std::lock_guard lock(m_operation_mutex);
 		EXIT_IF(m_operation_state != OperationState::Open);
 	}
-	m_registers   = &registers;
-	m_user_config = &user_config;
-	m_shaders     = &shaders;
+	m_command.Bind(registers, user_config, shaders);
 
 	if (m_command.IsInvalid()) {
 		BeginNext();
-	} else {
-		BindCurrent();
 	}
 }
 
@@ -199,7 +190,7 @@ void CommandScheduler::Finish() {
 	}
 	m_master.Wait(CurrentTick() - 1);
 	BeginNext();
-	PopPendingOperations();
+	PopPendingOperations(true);
 }
 
 void CommandScheduler::Wait(uint64_t tick) {
@@ -377,11 +368,6 @@ CommandBuffer& CommandScheduler::Current() {
 	return m_command;
 }
 
-void CommandScheduler::BindCurrent() {
-	EXIT_IF(m_registers == nullptr || m_user_config == nullptr || m_shaders == nullptr);
-	m_command.Bind(*m_registers, *m_user_config, *m_shaders);
-}
-
 CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
@@ -408,14 +394,12 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit.AddSignal(m_master.Handle(), tick);
 
 		vk::TimelineSemaphoreSubmitInfo timeline_info {};
-		timeline_info.sType                     = vk::StructureType::eTimelineSemaphoreSubmitInfo;
 		timeline_info.waitSemaphoreValueCount   = submit.num_wait_semaphores;
 		timeline_info.pWaitSemaphoreValues      = submit.wait_ticks.data();
 		timeline_info.signalSemaphoreValueCount = submit.num_signal_semaphores;
 		timeline_info.pSignalSemaphoreValues    = submit.signal_ticks.data();
 
 		vk::SubmitInfo submit_info {};
-		submit_info.sType                = vk::StructureType::eSubmitInfo;
 		submit_info.pNext                = &timeline_info;
 		submit_info.waitSemaphoreCount   = submit.num_wait_semaphores;
 		submit_info.pWaitSemaphores      = submit.wait_semaphores.data();
@@ -441,8 +425,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 }
 
 void CommandScheduler::BeginNext() {
-	EXIT_IF(!m_command.IsInvalid());
-	BindCurrent();
+	CheckActive();
 	BeginCommand();
 }
 

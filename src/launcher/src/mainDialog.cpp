@@ -1,6 +1,5 @@
 #include "mainDialog.h"
 
-#include "common.h"
 #include "configuration.h"
 #include "configurationItem.h"
 #include "configurationListWidget.h"
@@ -17,6 +16,7 @@
 #include <QIODevice>
 #include <QLabel>
 #include <QMessageBox>
+#include <QObject>
 #include <QPointer>
 #include <QProcess>
 #include <QRadioButton>
@@ -26,6 +26,8 @@
 #include <QTextStream>
 #include <QVariant>
 #include <QtCore>
+
+#include <cstdint>
 
 #include "ui_main_dialog.h"
 
@@ -58,20 +60,8 @@ constexpr char SETTINGS_MAIN_DIALOG[]        = "MainDialog";
 constexpr char SETTINGS_MAIN_LAST_GEOMETRY[] = "geometry";
 constexpr char SETTINGS_CHECK_UPDATES[]       = "check_updates_on_startup";
 
-class DetachableProcess: public QProcess {
-	Q_OBJECT;
-
-public:
-	explicit DetachableProcess(QObject* parent = nullptr): QProcess(parent) {}
-	void Detach() {
-		this->waitForStarted();
-		setProcessState(QProcess::NotRunning);
-	}
-};
-
 class MainDialogPrivate: public QObject {
 	Q_OBJECT
-	KYTY_QT_CLASS_NO_COPY(MainDialogPrivate);
 
 public:
 	explicit MainDialogPrivate(QObject* parent = nullptr): QObject(parent) {}
@@ -99,7 +89,7 @@ private:
 	UpdateChecker*  m_update_checker = nullptr;
 	QString         m_interpreter;
 
-	/*DetachableProcess*/ QProcess m_process;
+	QProcess m_process;
 
 	QPointer<ConfigurationItem> m_running_item;
 };
@@ -121,7 +111,6 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 
 	m_main_dialog = main_dialog;
 	m_update_checker = new UpdateChecker(main_dialog);
-	m_ui->widget->SetMainDialog(main_dialog);
 	m_ui->check_updates_on_startup->setChecked(g_check_updates_on_startup);
 	m_ui->check_updates_link->setVisible(UpdateChecker::IsSupported());
 	m_ui->check_updates_on_startup->setVisible(UpdateChecker::IsSupported());
@@ -153,8 +142,6 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 		        }
 		        Update();
 	        });
-
-	// connect(main_dialog, &MainDialog::Quit, [=]() { m_process.Detach(); });
 
 	m_ui->label_settings_file->setText(tr("Settings file: ") + m_ui->widget->GetSettingsFile());
 
@@ -228,9 +215,19 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--screen-height" << r.at(1);
 	args << "--user-name" << info.user_name;
 	args << "--user-id" << QString::number(info.user_id);
+	if (!info.audio_input_device.isEmpty()) {
+		args << "--mic" << info.audio_input_device;
+	}
 	args << "--present-mode" << EnumToText(info.present_mode);
+	if (info.gpu_index >= 0) {
+		args << "--gpu" << QString::number(info.gpu_index);
+	}
 	if (info.fullscreen_enabled) {
 		args << "--fullscreen";
+	}
+	args << "--readback-linear-images" << BoolArg(info.readback_linear_images);
+	if (info.tessellation_enabled) {
+		args << "--tessellation";
 	}
 	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
 	args << "--console-language" << QString::number(info.console_language);
@@ -243,8 +240,13 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--command-buffer-dump-folder" << info.command_buffer_dump_folder;
 	args << "--printf-direction" << EnumToText(info.printf_direction);
 	args << "--printf-output-file" << info.printf_output_file;
-	args << "--profiler-direction" << EnumToText(info.profiler_direction);
+	if (info.profiler_enabled) {
+		args << "--profile";
+	}
 	args << "--spirv-debug-printf" << "false";
+	if (info.amd_cpu_enabled) {
+		args << "--amd-cpu";
+	}
 #if defined(_WIN32)
 	if (info.red_zone_protection_enabled) {
 		args << "--redzone";
@@ -497,10 +499,8 @@ void MainDialogPrivate::Run() {
 
 	m_running_item->SetRunning(true);
 
-	Configuration info;
-	info.CopyFrom(m_running_item->GetInfo());
-	info.host_input_mapping = m_ui->widget->GetHostInputMapping();
-	m_main_dialog->RunInterpreter(&m_process, info);
+	auto info = m_ui->widget->CreateConfiguration(*m_running_item);
+	m_main_dialog->RunInterpreter(&m_process, *info);
 
 	Update();
 }

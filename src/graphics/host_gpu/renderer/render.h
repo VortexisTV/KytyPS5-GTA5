@@ -4,8 +4,6 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
-#include "graphics/host_gpu/renderer/colorRenderTarget.h"
-#include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -47,6 +45,7 @@ enum class CommandBufferDebugOp : uint32_t {
 	EopFlip,
 	EopWriteBackFlip,
 	EopOnlyFlip,
+	DispatchIndirect,
 	Unknown,
 };
 
@@ -158,8 +157,10 @@ public:
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
+	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
+	                      uint32_t mode);
 
-	[[nodiscard]] PreparedBindings PrepareBindings(const ShaderStageRuntime& runtime);
+	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	void                           FindBuffers(PreparedBindings& bindings);
 	void                           PrepareDmaSources(const PreparedBindings& bindings);
 	void                           RebindBuffers(PreparedBindings& bindings);
@@ -173,97 +174,56 @@ private:
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
 
 	struct GraphicsBindings {
-		PreparedBindings                vertex;
+		std::array<PreparedBindings, 3> vertex;
 		std::optional<PreparedBindings> pixel;
 	};
 
-	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
-	[[nodiscard]] GraphicsBindings& PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
-	                                                        const ShaderStageRuntime& pixel,
-	                                                        bool                      pixel_active);
-	void ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer& buffer,
-	                              RenderColorInfo& target, uint32_t render_target_slice_offset = 0,
-	                              uint32_t render_target_slot = UINT32_MAX,
+	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
+	                             std::span<RenderColorInfo> colors);
+	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
+	                              uint32_t render_target_slice_offset, uint32_t render_target_slot,
 	                              bool ignore_target_mask = false, bool exact_format = false);
-	void ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer& buffer,
-	                              RenderDepthInfo& target);
-	[[nodiscard]] bool PrepareDrawRenderState(uint64_t submit_id, CommandBuffer& buffer,
+	void ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target);
+	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
+	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer,
 	                                          const DrawCallInfo& draw,
 	                                          uint32_t            render_target_slice_offset,
-	                                          bool log_setup_phases, DrawRenderState& state);
+	                                          DrawRenderState& state);
 	void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
 	                         DrawRenderState& state, vk::PrimitiveTopology topology,
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
-	                         bool primitive_restart_enable, bool log_pipeline_phase,
-	                         bool set_bind_debug, bool set_auto_debug);
+	                         bool primitive_restart_enable);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
-	                                               uint32_t color_count, RenderDepthInfo& depth);
-	[[nodiscard]] bool        ResolveColorTargets(uint64_t submit_id, CommandBuffer& buffer,
+	                                               uint32_t color_count, RenderDepthInfo& depth,
+	                                               vk::ImageAspectFlags& feedback_aspects,
+	                                               std::span<PreparedBindings* const> stages = {});
+	[[nodiscard]] bool        ResolveColorTargets(CommandBuffer& buffer,
 	                                              uint32_t render_target_slice_offset);
 	void                      BindImage(ImageId id, bool storage);
 	void                      BindRenderTarget(ImageId id);
-	void                      TrackImageBinding(ImageId id);
 	void                      ResetBindings();
 	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
 	                                                     const CommandBuffer&          buffer);
-
-	// Consecutive draws overwhelmingly share render targets and fixed-function state. Both caches
-	// are keyed on register-block version stamps (see HW::Context), so a hit means the registers
-	// that fed the cached result are byte-identical; the texture-cache epoch and scheduler tick
-	// guard against image ids going stale.
-	struct RenderStateCache {
-		struct Key {
-			uint64_t rt_version       = 0;
-			uint64_t state_version    = 0;
-			uint64_t sh_version       = 0;
-			uint64_t shader_version   = 0;
-			uint64_t texture_epoch    = 0;
-			uint64_t scheduler_tick   = 0;
-			uint32_t slice_offset     = 0;
-			bool     operator==(const Key&) const = default;
-		};
-		bool            valid = false;
-		Key             key;
-		RenderColorInfo color_info[RENDER_COLOR_ATTACHMENTS_MAX];
-		uint32_t        color_count = 0;
-		RenderDepthInfo depth_info;
-	};
-
-	struct PipelinePointerCache {
-		struct Key {
-			uint64_t                 rt_version     = 0;
-			uint64_t                 state_version  = 0;
-			uint64_t                 sh_version     = 0;
-			uint64_t                 shader_version = 0;
-			uint64_t                 vertex_id      = 0;
-			uint64_t                 pixel_id       = 0;
-			vk::PrimitiveTopology    topology       = vk::PrimitiveTopology::ePointList;
-			bool                     primitive_restart = false;
-			bool                     ps_active         = false;
-			PipelineVertexInputState vertex_input;
-			bool                     operator==(const Key&) const = default;
-		};
-		Key                              key;
-		PipelineCache::GraphicsPipeline* pipeline = nullptr;
-	};
+	[[nodiscard]] bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
+	                                              CommandBuffer& command, uint32_t group_x,
+	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
 
 	RenderContext&                        m_context;
+	GraphicsBindings                     m_graphics_bindings;
+	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::vector<uint32_t>                 m_image_occurrences;
-	GraphicsBindings                      m_graphics_bindings;
-	RenderStateCache                      m_render_state_cache;
-	PipelinePointerCache                  m_pipeline_pointer_cache;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;
 };
 
-[[nodiscard]] bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t group_x,
+[[nodiscard]] bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t group_x,
                                             uint32_t group_y, uint32_t group_z, uint32_t mode,
                                             ShaderBufferResource& descriptor,
                                             uint32_t& packed_clear, uint64_t& size);

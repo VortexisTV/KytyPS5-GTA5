@@ -246,7 +246,7 @@ struct CommandBuffer {
 
 	void DbgDump() const {
 		if (!Config::GraphicsDebugDumpEnabled() ||
-		    Config::GetPrintfDirection() == Config::OutputDirection::Silent) {
+		    Config::GetPrintfDirection() == Config::LogDirection::Silent) {
 			return;
 		}
 		static std::atomic<uint32_t> log_count {0};
@@ -267,35 +267,25 @@ struct CommandBuffer {
 		     reserved_dw);
 	}
 
-	[[nodiscard]] KYTY_SYSV_ABI uint32_t GetAvailableSizeDW() const {
-		if (cursor_up == nullptr || cursor_down == nullptr || cursor_down <= cursor_up) {
-			return 0;
-		}
-
-		auto available = static_cast<uint64_t>(cursor_down - cursor_up);
+	[[nodiscard]] KYTY_SYSV_ABI uint64_t GetAvailableSizeDW() const {
+		// Interpret the signed cursor distance as an unsigned 64-bit DWORD count.
+		const auto distance = static_cast<int64_t>(reinterpret_cast<uintptr_t>(cursor_down) -
+		                                           reinterpret_cast<uintptr_t>(cursor_up));
+		const auto available = static_cast<uint64_t>(distance >> 2);
 		if (available <= reserved_dw) {
 			return 0;
 		}
-		if (available - reserved_dw > UINT32_MAX) {
-			LOGF_COLOR(
-			    Log::Color::Red,
-			    "\t command buffer has suspiciously large free space: cursor_up = 0x%016" PRIx64
-			    ", cursor_down = 0x%016" PRIx64 ", reserved_dw = %" PRIu32 "\n",
-			    reinterpret_cast<uint64_t>(cursor_up), reinterpret_cast<uint64_t>(cursor_down),
-			    reserved_dw);
-			return UINT32_MAX;
-		}
-		return static_cast<uint32_t>(available - reserved_dw);
+		return available - reserved_dw;
 	}
 
 	KYTY_SYSV_ABI bool ReserveDW(uint32_t num_dw) {
-		uint32_t remaining = GetAvailableSizeDW();
+		const uint64_t remaining = GetAvailableSizeDW();
 		if (num_dw > remaining) {
 			if (callback == nullptr) {
 				LOGF_COLOR(
 				    Log::Color::Red,
 				    "\t command buffer exhausted and has no grow callback: requested = %" PRIu32
-				    ", remaining = %" PRIu32 ", reserved_dw = %" PRIu32 "\n",
+				    ", remaining = %" PRIu64 ", reserved_dw = %" PRIu32 "\n",
 				    num_dw, remaining, reserved_dw);
 				DbgDump();
 				return false;
@@ -305,7 +295,7 @@ struct CommandBuffer {
 			if (!result) {
 				LOGF_COLOR(Log::Color::Red,
 				           "\t command buffer grow callback failed: requested = %" PRIu32
-				           ", remaining = %" PRIu32 ", reserved_dw = %" PRIu32 "\n",
+				           ", remaining = %" PRIu64 ", reserved_dw = %" PRIu32 "\n",
 				           num_dw, remaining, reserved_dw);
 				DbgDump();
 				return false;
@@ -313,7 +303,7 @@ struct CommandBuffer {
 			if (GetAvailableSizeDW() < num_dw) {
 				LOGF_COLOR(Log::Color::Red,
 				           "\t command buffer grow callback did not provide enough space: "
-				           "requested = %" PRIu32 ", remaining = %" PRIu32
+				           "requested = %" PRIu32 ", remaining = %" PRIu64
 				           ", reserved_dw = %" PRIu32 "\n",
 				           num_dw, GetAvailableSizeDW(), reserved_dw);
 				DbgDump();
@@ -667,6 +657,7 @@ int KYTY_SYSV_ABI AgcCreateShader(Shader** dst, void* header, const volatile voi
 	LOGF("\t base   = 0x%016" PRIx64 "\n", base);
 
 	ShaderMappedData map;
+	map.type                = static_cast<Prospero::ShaderBinaryType>(h->type);
 	map.user_data           = h->user_data;
 	map.input_semantics     = h->input_semantics;
 	map.num_input_semantics = h->num_input_semantics;
@@ -719,78 +710,6 @@ int KYTY_SYSV_ABI AgcUnknownGetFusedShaderSize(SizeAlign* dst, const Shader* fro
 	return OK;
 }
 
-int KYTY_SYSV_ABI AgcUnknownFuseShaderHalves(Shader* fused_result, const Shader* front,
-                                             const Shader* back, void* scratch_mem) {
-	PRINT_NAME();
-
-	LOGF("\t fused_result = 0x%016" PRIx64 "\n"
-	     "\t front        = 0x%016" PRIx64 "\n"
-	     "\t back         = 0x%016" PRIx64 "\n"
-	     "\t scratch_mem  = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(fused_result), reinterpret_cast<uint64_t>(front),
-	     reinterpret_cast<uint64_t>(back), reinterpret_cast<uint64_t>(scratch_mem));
-
-	EXIT_NOT_IMPLEMENTED(fused_result == nullptr);
-	EXIT_NOT_IMPLEMENTED(front == nullptr);
-	EXIT_NOT_IMPLEMENTED(back == nullptr);
-
-	const auto front_type = static_cast<Prospero::ShaderBinaryType>(front->type);
-	const auto back_type  = static_cast<Prospero::ShaderBinaryType>(back->type);
-	if (!((front_type == Prospero::ShaderBinaryType::kGsFront &&
-	       back_type == Prospero::ShaderBinaryType::kGsBack) ||
-	      (front_type == Prospero::ShaderBinaryType::kHsFront &&
-	       back_type == Prospero::ShaderBinaryType::kHsBack))) {
-		return GRAPHICS5_ERROR_INVALID_SHADER_HALVES;
-	}
-
-	*fused_result      = *back;
-	fused_result->type = static_cast<uint8_t>(front_type == Prospero::ShaderBinaryType::kGsFront
-	                                              ? Prospero::ShaderBinaryType::kGs
-	                                              : Prospero::ShaderBinaryType::kHs);
-
-	if (front->specials != nullptr && back->specials != nullptr) {
-		const auto front_stages = front->specials->vgt_shader_stages_en.value;
-		const auto back_stages  = back->specials->vgt_shader_stages_en.value;
-		const auto mismatch_bit =
-		    (front_type == Prospero::ShaderBinaryType::kGsFront ? (1u << 22u) : (1u << 21u));
-		if (((front_stages ^ back_stages) & mismatch_bit) != 0) {
-			return GRAPHICS5_ERROR_INVALID_SHADER_HALVES;
-		}
-	}
-
-	if (scratch_mem != nullptr && back->sh_registers != nullptr && back->num_sh_registers != 0) {
-		auto* sh_registers = static_cast<ShaderRegister*>(scratch_mem);
-		memcpy(sh_registers, back->sh_registers,
-		       static_cast<size_t>(back->num_sh_registers) * sizeof(ShaderRegister));
-		fused_result->sh_registers = sh_registers;
-	}
-
-	auto*      fused_regs      = fused_result->sh_registers;
-	const auto fused_reg_count = static_cast<uint32_t>(fused_result->num_sh_registers);
-	const auto front_reg_count = static_cast<uint32_t>(front->num_sh_registers);
-
-	if (front_type == Prospero::ShaderBinaryType::kGsFront) {
-		for (uint32_t occurrence = 0; occurrence < 2; occurrence++) {
-			auto*       dst = find_shader_register(fused_regs, fused_reg_count,
-			                                       Pm4::SPI_SHADER_PGM_CHKSUM_GS, occurrence);
-			const auto* src = find_shader_register(front->sh_registers, front_reg_count,
-			                                       Pm4::SPI_SHADER_PGM_CHKSUM_GS, occurrence);
-			if (dst != nullptr && src != nullptr) {
-				dst->value = src->value;
-			}
-		}
-		patch_shader_register_address(fused_regs, fused_reg_count, Pm4::SPI_SHADER_PGM_LO_ES,
-		                              reinterpret_cast<uint64_t>(front->code));
-	} else {
-		patch_shader_register_address(fused_regs, fused_reg_count, Pm4::SPI_SHADER_PGM_LO_LS,
-		                              reinterpret_cast<uint64_t>(front->code));
-	}
-
-	fused_result->user_data = nullptr;
-
-	return OK;
-}
-
 static void merge_shader_register_max_field(ShaderRegister* dst, const ShaderRegister* src,
                                             uint32_t shift, uint32_t mask) {
 	const auto dst_field = (dst->value >> shift) & mask;
@@ -801,16 +720,19 @@ static void merge_shader_register_max_field(ShaderRegister* dst, const ShaderReg
 	dst->value |= field << shift;
 }
 
-int KYTY_SYSV_ABI AgcUnknownNApJjpKNBl4(Shader* fused_result, const Shader* front,
-                                        const Shader* back, void* scratch_mem) {
-	PRINT_NAME();
-
+static int fuse_shader_halves(Shader* fused_result, const Shader* front,
+                              const Shader* back, void* scratch_mem,
+                              bool recompute_shared_vgprs) {
 	LOGF("\t fused_result = 0x%016" PRIx64 "\n"
 	     "\t front        = 0x%016" PRIx64 "\n"
 	     "\t back         = 0x%016" PRIx64 "\n"
 	     "\t scratch_mem  = 0x%016" PRIx64 "\n",
 	     reinterpret_cast<uint64_t>(fused_result), reinterpret_cast<uint64_t>(front),
 	     reinterpret_cast<uint64_t>(back), reinterpret_cast<uint64_t>(scratch_mem));
+
+	EXIT_NOT_IMPLEMENTED(fused_result == nullptr);
+	EXIT_NOT_IMPLEMENTED(front == nullptr);
+	EXIT_NOT_IMPLEMENTED(back == nullptr);
 
 	const auto front_type = static_cast<Prospero::ShaderBinaryType>(front->type);
 	const auto is_gs      = front_type == Prospero::ShaderBinaryType::kGsFront;
@@ -844,14 +766,12 @@ int KYTY_SYSV_ABI AgcUnknownNApJjpKNBl4(Shader* fused_result, const Shader* fron
 	const auto front_reg_count = static_cast<uint32_t>(front->num_sh_registers);
 	const auto checksum_offset =
 	    is_gs ? Pm4::SPI_SHADER_PGM_CHKSUM_GS : Pm4::SPI_SHADER_PGM_CHKSUM_HS;
-	const auto* front_checksum0 =
-	    find_shader_register(front->sh_registers, front_reg_count, checksum_offset, 0);
-	const auto* front_checksum1 =
-	    find_shader_register(front->sh_registers, front_reg_count, checksum_offset, 1);
-	auto* fused_checksum0  = find_shader_register(fused_regs, fused_reg_count, checksum_offset, 0);
-	auto* fused_checksum1  = find_shader_register(fused_regs, fused_reg_count, checksum_offset, 1);
-	fused_checksum0->value = front_checksum0->value;
-	fused_checksum1->value = front_checksum1->value;
+	for (uint32_t occurrence = 0; occurrence < 2; occurrence++) {
+		const auto* src = find_shader_register(front->sh_registers, front_reg_count,
+		                                       checksum_offset, occurrence);
+		auto* dst = find_shader_register(fused_regs, fused_reg_count, checksum_offset, occurrence);
+		dst->value = src->value;
+	}
 
 	const auto  rsrc1_offset = is_gs ? Pm4::SPI_SHADER_PGM_RSRC1_GS : Pm4::SPI_SHADER_PGM_RSRC1_HS;
 	const auto  rsrc2_offset = is_gs ? Pm4::SPI_SHADER_PGM_RSRC2_GS : Pm4::SPI_SHADER_PGM_RSRC2_HS;
@@ -862,31 +782,49 @@ int KYTY_SYSV_ABI AgcUnknownNApJjpKNBl4(Shader* fused_result, const Shader* fron
 	auto* fused_rsrc1 = find_shader_register(fused_regs, fused_reg_count, rsrc1_offset);
 	auto* fused_rsrc2 = find_shader_register(fused_regs, fused_reg_count, rsrc2_offset);
 
+	if (recompute_shared_vgprs) {
+		const auto front_vgprs = ((front_rsrc1->value & 0x3fu) + 1u) * 4u;
+		const auto back_vgprs  = ((fused_rsrc1->value & 0x3fu) + 1u) * 4u;
+		const auto front_total = front_vgprs + (front_rsrc2->value >> 28u) * 8u;
+		const auto back_total  = back_vgprs + (fused_rsrc2->value >> 28u) * 8u;
+		const auto max_total   = std::max(front_total, back_total);
+		// sceAgcFuseShaderHalves reallocates shared VGPRs; the older export takes the maximum.
+		const auto shared = std::max(front_vgprs, back_vgprs) >= max_total
+		                        ? 0u
+		                        : (max_total - std::min(front_total, back_total) + 7u) / 64u;
+		fused_rsrc2->value = (fused_rsrc2->value & 0x0fffffffu) | ((shared & 0xfu) << 28u);
+	} else {
+		merge_shader_register_max_field(fused_rsrc2, front_rsrc2, 28, 0x0fu);
+	}
 	merge_shader_register_max_field(fused_rsrc1, front_rsrc1, 0, 0x3fu);
-	merge_shader_register_max_field(fused_rsrc2, front_rsrc2, 28, 0x0fu);
 	if (is_gs) {
 		merge_shader_register_max_field(fused_rsrc1, front_rsrc1, 29, 0x03u);
 		merge_shader_register_max_field(fused_rsrc2, front_rsrc2, 16, 0x03u);
 		fused_rsrc2->value =
-		    (fused_rsrc2->value & 0xf7ffffc1u) | (front_rsrc2->value & 0x0800003eu);
-		fused_rsrc2->value =
 		    (fused_rsrc2->value & 0xfffbffffu) | (front_rsrc2->value & 0x00040000u);
 	} else {
 		merge_shader_register_max_field(fused_rsrc1, front_rsrc1, 28, 0x03u);
-		fused_rsrc2->value =
-		    (fused_rsrc2->value & 0xf7ffffc1u) | (front_rsrc2->value & 0x0800003eu);
 	}
+	fused_rsrc2->value =
+	    (fused_rsrc2->value & 0xf7ffffc1u) | (front_rsrc2->value & 0x0800003eu);
 
-	const auto program_lo_offset = is_gs ? Pm4::SPI_SHADER_PGM_LO_ES : Pm4::SPI_SHADER_PGM_LO_LS;
-	auto*      program_lo = find_shader_register(fused_regs, fused_reg_count, program_lo_offset);
-	const auto address    = reinterpret_cast<uint64_t>(front->code);
-	program_lo->value     = static_cast<uint32_t>(address >> 8u);
-	(program_lo + 1)->value &= 0xffffff00u;
-	(program_lo + 1)->value |= static_cast<uint32_t>((address >> 40u) & 0xffu);
-
-	fused_result->user_data = front->user_data;
-
+	patch_shader_register_address(fused_regs, fused_reg_count,
+	                              is_gs ? Pm4::SPI_SHADER_PGM_LO_ES : Pm4::SPI_SHADER_PGM_LO_LS,
+	                              reinterpret_cast<uint64_t>(front->code));
+	fused_result->user_data = recompute_shared_vgprs ? nullptr : front->user_data;
 	return OK;
+}
+
+int KYTY_SYSV_ABI AgcUnknownFuseShaderHalves(Shader* fused_result, const Shader* front,
+                                           const Shader* back, void* scratch_mem) {
+	PRINT_NAME();
+	return fuse_shader_halves(fused_result, front, back, scratch_mem, true);
+}
+
+int KYTY_SYSV_ABI AgcUnknownNApJjpKNBl4(Shader* fused_result, const Shader* front,
+                                      const Shader* back, void* scratch_mem) {
+	PRINT_NAME();
+	return fuse_shader_halves(fused_result, front, back, scratch_mem, false);
 }
 
 static constexpr int GRAPHICS5_ERROR_INVALID_PACKET = static_cast<int>(0x8a6c000cu);

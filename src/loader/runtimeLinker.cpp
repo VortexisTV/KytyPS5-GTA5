@@ -6,7 +6,6 @@
 #include "common/file.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
-#include "common/magicEnum.h"
 #include "common/platform/sysDbg.h"
 #include "common/profiler.h"
 #include "common/singleton.h"
@@ -29,6 +28,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
+#include <magic_enum.hpp>
 #include <memory>
 #include <vector>
 
@@ -301,9 +301,9 @@ static KYTY_SYSV_ABI uint64_t ResolveImportStubWithId(uint64_t record_id) {
 	if (record_id < g_stubbed_imports.size()) {
 		auto& record = g_stubbed_imports[record_id];
 		auto  nid    = record.name;
-		auto  pos    = Common::FindIndex(nid, "[");
-		if (Common::IndexValid(nid, pos)) {
-			nid = Common::Left(nid, pos);
+		auto  pos    = nid.find('[');
+		if (pos != std::string::npos) {
+			nid.resize(pos);
 		}
 
 		SymbolRecord resolved {};
@@ -330,7 +330,7 @@ static KYTY_SYSV_ABI uint64_t ResolveImportStubWithId(uint64_t record_id) {
 			LOGF("Unresolved import stub called [%u]: patch_vaddr=0x%016" PRIx64
 			     " jmprela_index=%" PRIu32 " symbol=%s type=%s bind=%s program=%s\n",
 			     log_index, record.patch_vaddr, record.index, record.name.c_str(),
-			     Common::EnumName(record.type).c_str(), Common::EnumName(record.bind).c_str(),
+			     magic_enum::enum_name(record.type), magic_enum::enum_name(record.bind),
 			     record.program.c_str());
 		} else {
 			printf("Unresolved import stub called: <bad-record>\n");
@@ -840,8 +840,12 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		// are the usual source - and on Windows it runs before the faulting module's own
 		// __except. A fault outside the guest address space is that module's to handle, so
 		// decline it here without touching any emulator state or lock. Should nothing else
-		// handle it either, it comes back through KytyFinalExceptionHandler.
+		// handle it either, it comes back through KytyFinalExceptionHandler. Guest code is the
+		// exception: no other module handles its faults, so those are reported at once.
 		if (!Libs::LibKernel::Memory::IsGuestAddress(info->access_violation_vaddr)) {
+			if (Libs::LibKernel::Memory::IsGuestAddress(info->exception_address)) {
+				ReportFatalException(exception_info);
+			}
 			return false;
 		}
 		// A page is briefly inaccessible while a memory operation on another thread rebuilds its
@@ -1073,8 +1077,8 @@ static void RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 			patched = PatchGuestMemory64(ri.vaddr, value);
 		} else {
 			auto dbg_str = fmt::format("[{:016x}] <- {:016x}, {}, {}, {}, {}", ri.vaddr, ri.value,
-			                           ri.name.c_str(), Common::EnumName(ri.type).c_str(),
-			                           Common::EnumName(ri.bind).c_str(), ri.dbg_name.c_str());
+			                           ri.name.c_str(), magic_enum::enum_name(ri.type),
+			                           magic_enum::enum_name(ri.bind), ri.dbg_name.c_str());
 
 			if (unresolved != nullptr) {
 				unresolved->push_back(dbg_str);
@@ -1104,23 +1108,23 @@ static void RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 		const auto thunk = RegisterStubbedImport(index, program, ri);
 		LOGF("Relocate: unresolved PLT import patched to stub [%u] [%016" PRIx64 "] <- %016" PRIx64
 		     ", %s, %s, %s, %s\n",
-		     index, ri.vaddr, thunk, ri.name.c_str(), Common::EnumName(ri.type).c_str(),
-		     Common::EnumName(ri.bind).c_str(), Common::PathToString(program->file_name).c_str());
+		     index, ri.vaddr, thunk, ri.name.c_str(), magic_enum::enum_name(ri.type),
+		     magic_enum::enum_name(ri.bind), Common::PathToString(program->file_name).c_str());
 	} else if (patched && stubbed_func) {
 		const auto thunk = RegisterStubbedImport(index, program, ri);
 		LOGF("Relocate: unresolved non-PLT function patched to stub [%u] [%016" PRIx64
 		     "] <- %016" PRIx64 ", %s, %s, %s, %s\n",
-		     index, ri.vaddr, thunk, ri.name.c_str(), Common::EnumName(ri.type).c_str(),
-		     Common::EnumName(ri.bind).c_str(), Common::PathToString(program->file_name).c_str());
+		     index, ri.vaddr, thunk, ri.name.c_str(), magic_enum::enum_name(ri.type),
+		     magic_enum::enum_name(ri.bind), Common::PathToString(program->file_name).c_str());
 	}
 
 	if (program->dbg_print_reloc) {
-		if (/* !dbg_str.ContainsStr("libc_") && */ patched && !ri.bind_self &&
+		if (patched && !ri.bind_self &&
 		    (ri.bind == BindType::Global || ri.bind == BindType::Weak ||
 		     ri.type == SymbolType::TlsModule)) {
 			auto dbg_str = fmt::format("[{:016x}] <- {:016x}, {}, {}, {}, {}", ri.vaddr, ri.value,
-			                           ri.name.c_str(), Common::EnumName(ri.type).c_str(),
-			                           Common::EnumName(ri.bind).c_str(), ri.dbg_name.c_str());
+			                           ri.name.c_str(), magic_enum::enum_name(ri.type),
+			                           magic_enum::enum_name(ri.bind), ri.dbg_name.c_str());
 
 			LOGF("Relocate: %s\n", dbg_str.c_str());
 		}
@@ -1351,7 +1355,7 @@ void RuntimeLinker::RelocateProgram(Program* program) {
 	EXIT_IF(program == nullptr);
 	EXIT_IF(std::find(m_programs.begin(), m_programs.end(), program) == m_programs.end());
 
-	Relocate(program);
+	RelocateAll();
 	if (!GamePatch::ApplyPending(program)) {
 		EXIT("Failed to apply pending game cheat\n");
 	}
@@ -1417,9 +1421,8 @@ Program* RuntimeLinker::LoadProgram(const std::filesystem::path& elf_name) {
 		Libs::LibKernel::SetProgName(elf_name.filename().string());
 	}
 
-	if (Common::EndsWith(Common::ToLower(Common::DirectoryWithoutFilename(
-	                         Common::PathToGenericString(elf_name))),
-	                     "_module/")) {
+	if (Common::ToLower(Common::DirectoryWithoutFilename(Common::PathToGenericString(elf_name)))
+	        .ends_with("_module/")) {
 		program->fail_if_global_not_resolved = false;
 	}
 
@@ -1845,7 +1848,7 @@ void RuntimeLinker::StopAllModules() {
 
 static bool IsAdjacentModuleFile(const std::string& name) {
 	auto lower = Common::ToLower(name);
-	return Common::EndsWith(lower, ".prx") || Common::EndsWith(lower, ".sprx");
+	return lower.ends_with(".prx") || lower.ends_with(".sprx");
 }
 
 static bool SkipAdjacentModuleFile(const std::string& name) {
@@ -2041,9 +2044,11 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	uint64_t tls_handler_size = is_shared ? 0 : Jit::SafeCall::GetSize();
 	EXIT_IF(tls_handler_size > UINT64_MAX - program->base_size_aligned);
 	program->mapped_size = program->base_size_aligned + tls_handler_size;
+	const bool emulate_rsqrt = Config::AmdCpuEnabled();
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	const bool         use_red_zone_protection  = Config::RedZoneProtectionEnabled();
+	const bool         protect_memory_faults   = Config::RedZoneProtectionEnabled();
+	const bool         use_red_zone_protection = protect_memory_faults || emulate_rsqrt;
 	constexpr uint64_t RED_ZONE_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
 	if (use_red_zone_protection) {
 		EXIT_IF(RED_ZONE_TRAMPOLINE_SIZE > UINT64_MAX - program->mapped_size);
@@ -2089,9 +2094,8 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		EXIT("Failed to install the required vectored exception handler\n");
 	}
 
-	// program->elf->SetBaseVAddr(program->base_vaddr);
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	std::vector<std::pair<uint64_t, uint64_t>> executable_segments;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	uint64_t                                   eh_frame_header_addr = 0;
 	uint64_t                                   eh_frame_header_size = 0;
 #endif
@@ -2108,7 +2112,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			     "[%d] memory_size = %" PRIu64 "\n"
 			     "[%d] mode        = %s\n",
 			     i, segment_addr, i, segment_file_size, i, segment_memory_size, i,
-			     Common::EnumName(mode).c_str());
+			     magic_enum::enum_name(mode));
 
 			program->elf->LoadSegment(segment_addr, phdr[i].p_offset, segment_file_size);
 
@@ -2117,11 +2121,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 
 			if (Common::VirtualMemory::IsExecute(mode)) {
 				PatchProgram(program, segment_addr, segment_memory_size);
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-				if (use_red_zone_protection) {
-					executable_segments.emplace_back(segment_addr, segment_file_size);
-				}
-#endif
+				executable_segments.emplace_back(segment_addr, segment_file_size);
 			}
 
 			if (!skip_protect) {
@@ -2166,16 +2166,22 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	std::vector<uintptr_t> function_starts;
 	if (use_red_zone_protection) {
-		std::vector<uintptr_t> function_starts;
 		if (!DecodeEhFrameFunctionStarts(eh_frame_header_addr, eh_frame_header_size,
 		                                 &function_starts)) {
 			LOGF("Windows guest red-zone patching could not decode function boundaries for %s\n",
 			     Common::PathToString(program->file_name).c_str());
 		}
-		for (const auto& [segment_addr, segment_size]: executable_segments) {
+	}
+#endif
+	for (const auto& [segment_addr, segment_size]: executable_segments) {
+		uint64_t reciprocal_sqrt_count = 0;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (use_red_zone_protection) {
 			const auto result =
-			    PatchRedZoneMemoryInstructions(segment_addr, segment_size, function_starts);
+			    PatchGuestInstructions(segment_addr, segment_size, function_starts,
+			                           protect_memory_faults, emulate_rsqrt);
 			LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
 			     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
 			     ", control=%" PRIu64 ", unrelocatable=%" PRIu64 "\n",
@@ -2185,12 +2191,20 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			     result.stack_dependent_memory_instruction_count,
 			     result.control_flow_memory_instruction_count,
 			     result.unrelocatable_memory_instruction_count);
+			reciprocal_sqrt_count = result.reciprocal_sqrt_instruction_count;
+		}
+#else
+		if (emulate_rsqrt) {
+			reciprocal_sqrt_count =
+			    X64InstructionEmulator::PatchReciprocalSquareRoots(segment_addr, segment_size);
 			Common::VirtualMemory::FlushInstructionCache(segment_addr, segment_size);
 		}
-		Common::VirtualMemory::FlushInstructionCache(program->red_zone_trampoline_vaddr,
-		                                             program->red_zone_trampoline_size);
-	}
 #endif
+		if (reciprocal_sqrt_count != 0) {
+			LOGF("Guest VRSQRTPS emulation: %s, instructions=%" PRIu64 "\n",
+			     Common::PathToString(program->file_name.filename()).c_str(), reciprocal_sqrt_count);
+		}
+	}
 
 	if (!is_shared) {
 		SetupTlsHandler(program);

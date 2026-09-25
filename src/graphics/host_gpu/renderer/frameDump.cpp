@@ -300,7 +300,7 @@ void WriteImage(const DumpMeta& meta, const uint8_t* data) {
 	const double mean_luminance = luminance_count != 0 ? luminance_sum / luminance_count : 0.0;
 
 	std::string stats = fmt::format("{} fmt={} extent={}x{}x{} meanlum={:.6g}", meta.name,
-	                                VulkanToString(meta.format), meta.width, meta.height,
+	                                vk::to_string(meta.format), meta.width, meta.height,
 	                                meta.depth, mean_luminance);
 	static constexpr std::array channel_names {'R', 'G', 'B', 'A'};
 	for (uint32_t c = 0; c < layout.channels; c++) {
@@ -627,7 +627,7 @@ void FrameDumpOnFlip(RenderContext& context, uint64_t surface_address) {
 		}
 		const auto name = fmt::format(
 		    "{:03}_{:010x}_{}x{}x{}_{}{}{}{}{}{}", ordinal++, image.info.data.address,
-		    backing.extent.width, backing.extent.height, depth, VulkanToString(backing.format),
+		    backing.extent.width, backing.extent.height, depth, vk::to_string(backing.format),
 		    image.usage.render_target ? "_rt" : "", image.usage.storage ? "_storage" : "",
 		    image.usage.texture ? "_tex" : "", image.usage.video_out ? "_videoout" : "",
 		    image.info.data.address == surface_address ? "_PRESENTED" : "");

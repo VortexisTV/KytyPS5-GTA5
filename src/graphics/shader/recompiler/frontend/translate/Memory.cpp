@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
+#include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 
 #include <algorithm>
 #include <array>
@@ -33,6 +34,7 @@ Decoder::Operand OffsetDecodedRegister(const Decoder::Operand& operand, uint32_t
 	result.negate_hi          = false;
 	result.absolute           = false;
 	result.dpp_ctrl           = 0;
+	result.dpp8               = false;
 	result.dpp_row_mask       = 0xf;
 	result.dpp_bank_mask      = 0xf;
 	result.explicit_sdwa_dst  = false;
@@ -70,16 +72,22 @@ ResourceKind FlatSegmentResourceKind(uint32_t segment) {
 	}
 }
 
+bool IsScalarAddressLoad(Decoder::Opcode opcode) {
+	switch (opcode) {
+		case Decoder::Opcode::S_LOAD_DWORD:
+		case Decoder::Opcode::S_LOAD_DWORDX2:
+		case Decoder::Opcode::S_LOAD_DWORDX4:
+		case Decoder::Opcode::S_LOAD_DWORDX8:
+		case Decoder::Opcode::S_LOAD_DWORDX16: return true;
+		default: return false;
+	}
+}
+
 ResourceKind MemoryKind(const Decoder::Instruction& decoded) {
 	switch (decoded.family) {
 		case Decoder::Family::SMEM:
-			return decoded.opcode == Decoder::Opcode::S_LOAD_DWORD ||
-			               decoded.opcode == Decoder::Opcode::S_LOAD_DWORDX2 ||
-			               decoded.opcode == Decoder::Opcode::S_LOAD_DWORDX4 ||
-			               decoded.opcode == Decoder::Opcode::S_LOAD_DWORDX8 ||
-			               decoded.opcode == Decoder::Opcode::S_LOAD_DWORDX16
-			           ? ResourceKind::ScalarAddress
-			           : ResourceKind::ScalarBuffer;
+			return IsScalarAddressLoad(decoded.opcode) ? ResourceKind::ScalarAddress
+			                                          : ResourceKind::ScalarBuffer;
 		case Decoder::Family::MUBUF:
 		case Decoder::Family::MTBUF: return ResourceKind::Buffer;
 		case Decoder::Family::FLAT: return FlatSegmentResourceKind(decoded.memory_segment);
@@ -104,11 +112,6 @@ IR::MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded) {
 	memory.image_sample_flags       = decoded.image_sample_flags;
 	memory.image_dimension          = decoded.image_dimension;
 	memory.image_address_components = decoded.image_address_components;
-	memory.image_nsa_dwords         = decoded.image_nsa_dwords;
-	for (uint32_t index = 0; index < Decoder::MaxImageNsaAddressComponents; index++) {
-		memory.image_nsa_addr[index] = decoded.image_nsa_addr[index];
-	}
-	memory.memory_segment = decoded.memory_segment;
 	memory.address_is_full =
 	    memory.kind == ResourceKind::Flat ||
 	    (memory.kind == ResourceKind::Global && decoded.src1.kind == Decoder::OperandKind::Vgpr);
@@ -118,8 +121,6 @@ IR::MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded) {
 	memory.image_has_mip = decoded.opcode == Decoder::Opcode::IMAGE_LOAD_MIP ||
 	                       decoded.opcode == Decoder::Opcode::IMAGE_STORE_MIP;
 	memory.image_r128    = decoded.image_r128;
-	memory.glc           = decoded.glc;
-	memory.slc           = decoded.slc;
 	memory.idxen         = decoded.idxen;
 	memory.offen         = decoded.offen;
 	memory.resource      = ResourceIndexFromOperand(decoded.src1);
@@ -145,16 +146,6 @@ IR::MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded) {
 	return memory;
 }
 
-bool IsScalarAddressLoad(Decoder::Opcode opcode) {
-	switch (opcode) {
-		case Decoder::Opcode::S_LOAD_DWORD:
-		case Decoder::Opcode::S_LOAD_DWORDX2:
-		case Decoder::Opcode::S_LOAD_DWORDX4:
-		case Decoder::Opcode::S_LOAD_DWORDX8:
-		case Decoder::Opcode::S_LOAD_DWORDX16: return true;
-		default: return false;
-	}
-}
 
 bool IsScalarBufferLoad(Decoder::Opcode opcode) {
 	switch (opcode) {
@@ -244,6 +235,7 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 				return index == 0u ? decoded.src1 : index == 1u ? decoded.src0 : decoded.src2;
 			case Decoder::Opcode::DS_WRITE_B8:
 			case Decoder::Opcode::DS_WRITE_B16:
+			case Decoder::Opcode::DS_WRITE_B8_D16_HI:
 			case Decoder::Opcode::DS_WRITE_B16_D16_HI:
 			case Decoder::Opcode::DS_WRITE_B32:
 			case Decoder::Opcode::DS_WRITE_B64:
@@ -289,15 +281,15 @@ IR::Value Translator::GetAddressResource(IR::Value low, IR::Value high) {
 
 Translator::AddressOperands Translator::ReadAddressOperands(const Decoder::Instruction& inst,
                                                             uint32_t first_source) {
-	const auto memory       = MemoryInfoFromDecoded(inst);
+	const auto kind         = MemoryKind(inst);
 	const auto low          = ReadU32(MemorySourceAt(inst, first_source));
 	const auto high_or_base = MemorySourceAt(inst, first_source + 1u);
-	if (memory.kind == IR::ResourceKind::Scratch) {
+	if (kind == IR::ResourceKind::Scratch) {
 		const auto offset =
 		    high_or_base.kind != Decoder::OperandKind::Vgpr ? ReadU32(high_or_base) : low;
 		return {ir.Emit(IR::ValueOpcode::GetScratchResource), offset, IR::Value(0u)};
 	}
-	if (memory.kind == IR::ResourceKind::Global &&
+	if (kind == IR::ResourceKind::Global &&
 	    high_or_base.kind != Decoder::OperandKind::Vgpr) {
 		const auto base_low  = ReadU32(high_or_base);
 		const auto base_high = ReadU32(OffsetOperand(high_or_base, 1u));
@@ -328,15 +320,17 @@ IR::Value Translator::GetSamplerResource(const IR::MemoryInfo& memory) {
 
 IR::Value Translator::MakeImageAddress(const Decoder::Instruction& inst,
                                        const Decoder::Operand&     base) {
-	const auto                memory = MemoryInfoFromDecoded(inst);
 	std::array<IR::Value, 13> components {};
-	components[0] = ReadRawU32(PlainOperand(base));
+	components.fill(IR::Value(0u));
+	const auto count =
+	    Decoder::ImageAddressDwordCount(inst.image_sample_flags, inst.image_address_components);
+	EXIT_IF(count > components.size());
 	const auto nsa_components =
-	    std::min(memory.image_nsa_dwords * 4u, Decoder::MaxImageNsaAddressComponents);
-	for (uint32_t index = 1; index < components.size(); index++) {
-		if (index - 1u < nsa_components) {
+	    std::min(inst.image_nsa_dwords * 4u, Decoder::MaxImageNsaAddressComponents);
+	for (uint32_t index = 0; index < count; index++) {
+		if (index != 0u && index - 1u < nsa_components) {
 			components[index] =
-			    ir.GetVectorReg(static_cast<IR::VectorReg>(memory.image_nsa_addr[index - 1u]));
+			    ir.GetVectorReg(static_cast<IR::VectorReg>(inst.image_nsa_addr[index - 1u]));
 		} else {
 			components[index] = ReadRawU32(OffsetOperand(PlainOperand(base), index));
 		}
@@ -380,11 +374,10 @@ void Translator::WriteImageComponents(const Decoder::Operand& dst, IR::Value val
 
 Translator::BufferAddress Translator::ReadBufferAddress(const Decoder::Instruction& inst,
                                                         uint32_t                    first_source) {
-	const auto memory  = MemoryInfoFromDecoded(inst);
 	uint32_t   cursor  = first_source;
 	const auto next    = [&]() { return ReadU32(MemorySourceAt(inst, cursor++)); };
-	const auto index   = memory.idxen ? next() : IR::U32(IR::Value(0u));
-	const auto offset  = memory.offen ? next() : IR::U32(IR::Value(0u));
+	const auto index   = inst.idxen ? next() : IR::U32(IR::Value(0u));
+	const auto offset  = inst.offen ? next() : IR::U32(IR::Value(0u));
 	const auto soffset = next();
 	return {index, offset, soffset};
 }
@@ -970,6 +963,14 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicISub32, false);
 		case Decoder::Opcode::DS_SUB_RTN_U32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicISub32, true);
+		case Decoder::Opcode::DS_INC_U32:
+			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicInc32, false);
+		case Decoder::Opcode::DS_INC_RTN_U32:
+			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicInc32, true);
+		case Decoder::Opcode::DS_DEC_U32:
+			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicDec32, false);
+		case Decoder::Opcode::DS_DEC_RTN_U32:
+			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicDec32, true);
 		case Decoder::Opcode::DS_MIN_I32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicSMin32, false);
 		case Decoder::Opcode::DS_MIN_RTN_I32:
@@ -1039,6 +1040,7 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::IMAGE_STORE:
 		case Decoder::Opcode::IMAGE_STORE_MIP: return IMAGE_STORE(inst);
 		case Decoder::Opcode::IMAGE_SAMPLE: return IMAGE_SAMPLE(inst);
+		case Decoder::Opcode::IMAGE_GATHER4_L:
 		case Decoder::Opcode::IMAGE_GATHER4_LZ:
 		case Decoder::Opcode::IMAGE_GATHER4_C:
 		case Decoder::Opcode::IMAGE_GATHER4_C_LZ:
@@ -1079,6 +1081,7 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::DS_WRITE2ST64_B64: return DS_WRITE2(inst);
 		case Decoder::Opcode::DS_WRITE_B8:
 		case Decoder::Opcode::DS_WRITE_B16:
+		case Decoder::Opcode::DS_WRITE_B8_D16_HI:
 		case Decoder::Opcode::DS_WRITE_B16_D16_HI:
 		case Decoder::Opcode::DS_WRITE_B32:
 		case Decoder::Opcode::DS_WRITE_B64:

@@ -9,10 +9,12 @@
 #include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
+#include "graphics/host_gpu/renderer/image/dccClearHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include <map>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -32,17 +34,9 @@ public:
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
 
 	struct ImageDesc {
-		ImageInfo           info;
-		ImageViewInfo       view_info;
-		BindingType         type = BindingType::Texture;
-		vk::ClearColorValue metadata_clear_value {};
-		bool                metadata_clear_supported = false;
-	};
-
-	struct RegionInfo {
-		bool image_pages     = false;
-		bool image_bytes     = false;
-		bool gpu_image_bytes = false;
+		ImageInfo     info;
+		ImageViewInfo view_info;
+		BindingType   type = BindingType::Texture;
 	};
 
 	TextureCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
@@ -54,6 +48,8 @@ public:
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
+	// Whether a registered image shares a page with the range.
+	[[nodiscard]] bool          HasImageInRange(uint64_t address, uint64_t size);
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);
@@ -68,31 +64,15 @@ public:
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
-	[[nodiscard]] RegionInfo QueryRegion(uint64_t address, uint64_t size);
+	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
 	// Bumps whenever an image is freed, unregistered or its guest memory invalidated. Renderer
 	// caches holding ImageIds compare it to know their ids are still current.
 	[[nodiscard]] uint64_t MutationEpoch() const noexcept { return m_mutation_epoch; }
 
-	// Records that a metadata fill targeted an address no surface has claimed yet, without the code:
-	// the caller lets the dispatch run, so the value only exists in the allocation afterwards.
-	// No-op when anything is already tracked there.
-	void ParkMetaFill(uint64_t address);
-	// True once per parked fill, after a surface has claimed the address. The caller then reads the
-	// code from the allocation - which must happen outside this cache's lock, because a guest read can
-	// fault into the very invalidation paths that hold it.
-	[[nodiscard]] bool TakeParkedMetaProbe(uint64_t address);
 	[[nodiscard]] bool IsMeta(uint64_t address);
-	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice,
-	                                 uint32_t* fill_value = nullptr);
-	[[nodiscard]] bool ClearMeta(uint64_t address,
-	                             uint8_t clear_code = DCC_CODE_UNCOMPRESSED);
-	// Returns true when registered DCC absorbed the fill and the caller may skip the dispatch.
-	// False may still record PendingDcc state, but the guest dispatch must execute.
-	[[nodiscard]] bool TryConsumeDccFill(uint64_t address, uint64_t size, uint32_t fill_value);
+	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
+	[[nodiscard]] bool ClearMeta(uint64_t address);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
-	[[nodiscard]] bool
-	ResolveDccMetaClear(uint64_t address, uint32_t base_layer, uint32_t layer_count,
-	                    vk::ClearColorValue& clear_value);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
@@ -102,30 +82,21 @@ public:
 	// re-enter the cache.
 	template <typename F>
 	void DebugForEachImage(F&& fn) {
-    	m_lock.lock();
-    	m_slot_images.ForEach(fn);
-    	m_lock.unlock();
+		m_lock.lock();
+		m_slot_images.ForEach(fn);
+		m_lock.unlock();
 	}
 
 private:
 	enum class TransferDirection { Upload, Download };
-	struct ColorTransferPlan;
-	struct DownloadPlan;
+	struct TextureTransfer;
+	struct ImageDownload;
 
 	struct MetaDataInfo {
-		// A guest metadata-fill dispatch may initialize DCC before its render target is bound.
-		// PendingDcc retains that exact fill until FindRenderTarget classifies the address,
-		// without exposing an unconfirmed buffer address to the normal metadata heuristics.
-		// Keep all surface metadata in one entry so CMask/FMask can be
-		// registered beside HTile and DCC without introducing parallel tracking paths.
-		enum class Type : uint8_t { PendingDcc, CMask, FMask, HTile, Dcc };
+		enum class Type : uint8_t { CMask, FMask, HTile };
 
-		Type     type       = Type::PendingDcc;
-		uint32_t clear_mask = 0;
-		uint32_t fill_value = 0xffffffffu;
-		uint64_t fill_size  = 0;
-		vk::ClearColorValue color_clear_value {};
-		bool                color_clear_supported = false;
+		Type     type;
+		uint32_t clear_mask = UINT32_MAX;
 	};
 
 	struct OverlapResult {
@@ -137,13 +108,25 @@ private:
 	using ImageIds       = InlinePageOwnerList<ImageId, 16>;
 	using ImagePageTable = MultiLevelPageTable<ImageIds, 20, 40, 10>;
 
+	// Callers have validated the nonempty 40-bit range with TryGetPageRange.
+	template <typename Func>
+	static void ForEachPage(uint64_t address, size_t size, Func&& func) {
+		using FuncReturn = typename std::invoke_result<Func, uint64_t>::type;
+		static constexpr bool RETURNS_BOOL = std::is_same_v<FuncReturn, bool>;
+		const uint64_t page_end = (address + size - 1) >> ImagePageTable::kPageBits;
+		for (uint64_t page = address >> ImagePageTable::kPageBits; page <= page_end; ++page) {
+			if constexpr (RETURNS_BOOL) {
+				if (func(page)) {
+					break;
+				}
+			} else {
+				func(page);
+			}
+		}
+	}
+
 	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info);
 	[[nodiscard]] ImageId     GetNullImage(const ImageDesc& desc);
-	[[nodiscard]] bool        ResolveDccMetaClearLocked(uint64_t address, uint32_t base_layer,
-	                                                    uint32_t layer_count,
-	                                                    vk::ClearColorValue& clear_value,
-	                                                    bool consume);
-	[[nodiscard]] bool MaterializeDccMetaClear(ImageId id, Image& image, const ImageDesc& desc);
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);
@@ -171,26 +154,34 @@ private:
 	                                                ImageId cached);
 	void                        PrepareStorageSampledOverlap(const ImageDesc& desc);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
-	void                        RefreshImage(ImageId id, const ImageDesc& desc);
-	void                        InitializeImage(ImageId id, const ImageDesc& desc);
-	[[nodiscard]] ColorTransferPlan BuildColorTransfer(const Image& image, BindingType binding,
-	                                                   TransferDirection direction) const;
-	[[nodiscard]] DownloadPlan      BuildDownload(const Image& image) const;
-	void UploadImage(Image& image, const ImageDesc& desc, Buffer& source, uint64_t source_offset);
-	void DownloadImageData(Image& image, Buffer& destination, uint64_t destination_offset,
-	                       uint64_t destination_size, DownloadPlan plan);
+	void                        RefreshImage(ImageId id);
+	void                        MaterializeDccClear(ImageId id, const ImageDesc& desc,
+	                                                uint32_t metadata_base_layer);
+	[[nodiscard]] bool          MaterializeDccClearOnGpu(ImageId id, const ImageDesc& desc,
+	                                                     uint32_t first, uint32_t image_first,
+	                                                     uint32_t count, uint64_t slice_size);
+	void                        InitializeImage(ImageId id);
+	[[nodiscard]] TextureTransfer
+	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
+	[[nodiscard]] ImageDownload BuildDownload(const Image& image) const;
+	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
+	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
+	                       uint64_t destination_size, ImageDownload transfer);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
 	void CommitGpuWrite(Image& image);
+	// Caller holds m_lock. Volume layer ranges select depth slices.
+	void ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
+	                const vk::ImageSubresourceRange& range, const vk::ClearValue& clear);
 	void PrepareImageCopy(Image& image);
 	void RefreshCopySource(ImageId id);
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
 	void               CopyImage(ImageId destination, ImageId source);
-	void               AssociateStencil(ImageId depth, GuestRange stencil);
+	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil);
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;
 
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
-	[[nodiscard]] bool TryDownloadImage(ImageId id);
+	[[nodiscard]] bool DownloadImageMemory(ImageId id);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -198,6 +189,7 @@ private:
 	PageManager&                                      m_page_manager;
 	BlitHelper                                        m_blit_helper;
 	TileManager                                       m_tiler;
+	DccClearHelper                                    m_dcc_clear_helper;
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
@@ -205,10 +197,18 @@ private:
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
-	// Metadata addresses whose fill was parked before its code could be observed. Held beside
-	// m_surface_metas rather than inside MetaDataInfo because it is transient repair bookkeeping, not
-	// durable metadata state, and it is erased wherever the metadata entry is.
-	std::unordered_set<uint64_t>                      m_parked_meta_probes;
+	// The last GPU check of each DCC metadata range: its inputs and the range's GPU write count.
+	struct DccCheck {
+		ImageId                             image;
+		uint32_t                            first      = 0;
+		uint32_t                            count      = 0;
+		uint32_t                            valid_mask = 0;
+		std::array<std::array<float, 4>, 5> colors {};
+		uint64_t                            writes = 0;
+
+		bool operator==(const DccCheck&) const = default;
+	};
+	std::unordered_map<uint64_t, DccCheck>            m_dcc_checks;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;

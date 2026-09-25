@@ -86,23 +86,19 @@ PipelineStaticParameters PreRasterParams(const PipelineStaticParameters& source)
 	result.cull_front          = source.cull_front;
 	result.cull_back           = source.cull_back;
 	result.face                = source.face;
+	result.provoking_vtx_last  = source.provoking_vtx_last;
+	result.polygon_mode        = source.polygon_mode;
 	return result;
 }
 
+// Depth and stencil tests are dynamic state; what remains static is sampling and depth bounds.
 PipelineStaticParameters FragmentShaderParams(const PipelineStaticParameters& source) {
 	PipelineStaticParameters result {};
 	result.samples                  = source.samples;
 	result.sample_shading_enable    = source.sample_shading_enable;
-	result.with_depth               = source.with_depth;
-	result.depth_test_enable        = source.depth_test_enable;
-	result.depth_write_enable       = source.depth_write_enable;
-	result.depth_compare_op         = source.depth_compare_op;
 	result.depth_bounds_test_enable = source.depth_bounds_test_enable;
 	result.depth_min_bounds         = source.depth_min_bounds;
 	result.depth_max_bounds         = source.depth_max_bounds;
-	result.stencil_test_enable      = source.stencil_test_enable;
-	result.stencil_front            = source.stencil_front;
-	result.stencil_back             = source.stencil_back;
 	return result;
 }
 
@@ -110,7 +106,6 @@ PipelineStaticParameters FragmentOutputParams(const PipelineStaticParameters& so
 	PipelineStaticParameters result {};
 	result.samples               = source.samples;
 	result.sample_shading_enable = source.sample_shading_enable;
-	result.color_count           = source.color_count;
 	for (uint32_t i = 0; i < RENDER_COLOR_ATTACHMENTS_MAX; i++) {
 		result.color_mask[i]           = source.color_mask[i];
 		result.color_srcblend[i]       = source.color_srcblend[i];
@@ -121,7 +116,6 @@ PipelineStaticParameters FragmentOutputParams(const PipelineStaticParameters& so
 		result.alpha_destblend[i]      = source.alpha_destblend[i];
 		result.separate_alpha_blend[i] = source.separate_alpha_blend[i];
 		result.blend_enable[i]         = source.blend_enable[i];
-		result.blend_bypass[i]         = source.blend_bypass[i];
 	}
 	return result;
 }
@@ -156,7 +150,7 @@ struct GraphicsPipelineLibraryCache::Impl {
 		                                                              nullptr, &pipeline);
 		if (result != vk::Result::eSuccess || pipeline == nullptr) {
 			LOGF("Graphics pipeline library creation failed: %s; using monolithic pipelines\n",
-			     VulkanToString(result).c_str());
+			     vk::to_string(result).c_str());
 			if (pipeline != nullptr) {
 				graphics.device.destroyPipeline(pipeline, nullptr);
 			}
@@ -207,9 +201,10 @@ GraphicsPipelineLibraryCache::~GraphicsPipelineLibraryCache() {
 }
 
 void GraphicsPipelineLibraryCache::PrepareLayout(
-    PipelineCache::GraphicsPipeline&                pipeline,
+    PipelineCache::Pipeline& pipeline, uint64_t vs_shader_id, uint64_t ps_shader_id,
+    vk::ShaderStageFlags push_constant_stages,
     std::span<const vk::DescriptorSetLayoutBinding> bindings) {
-	const LayoutKey key {pipeline.vs_shader_id, pipeline.ps_shader_id};
+	const LayoutKey key {vs_shader_id, ps_shader_id};
 	std::lock_guard layout_lock(m_impl->layouts_mutex);
 	auto            iter = m_impl->layouts.find(key);
 	if (iter == m_impl->layouts.end()) {
@@ -231,9 +226,7 @@ void GraphicsPipelineLibraryCache::PrepareLayout(
 		                                                          &layout.descriptor_set_layout) !=
 		        vk::Result::eSuccess);
 
-		constexpr auto GraphicsStages =
-		    vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
-		const vk::PushConstantRange  push_constants {GraphicsStages, 0,
+		const vk::PushConstantRange  push_constants {push_constant_stages, 0,
 		                                             ShaderRecompiler::IR::NativePushConstantSize};
 		vk::PipelineLayoutCreateInfo pipeline_layout_info {};
 		pipeline_layout_info.sType                  = vk::StructureType::ePipelineLayoutCreateInfo;
@@ -247,7 +240,7 @@ void GraphicsPipelineLibraryCache::PrepareLayout(
 			m_impl->graphics.device.destroyDescriptorSetLayout(layout.descriptor_set_layout,
 			                                                   nullptr);
 			EXIT("Could not create graphics pipeline-library layout: %s\n",
-			     VulkanToString(result).c_str());
+			     vk::to_string(result).c_str());
 		}
 		iter = m_impl->layouts.emplace(key, layout).first;
 	}
@@ -259,8 +252,8 @@ void GraphicsPipelineLibraryCache::PrepareLayout(
 }
 
 bool GraphicsPipelineLibraryCache::CreatePipeline(
-    PipelineCache::GraphicsPipeline& pipeline, const PipelineRenderingState& rendering,
-    const PipelineStaticParameters&       static_params,
+    PipelineCache::Pipeline& pipeline, uint64_t vs_shader_id, uint64_t ps_shader_id,
+    const PipelineRenderingState& rendering, const PipelineStaticParameters& static_params,
     const vk::GraphicsPipelineCreateInfo& pipeline_info, uint32_t pre_raster_stage_count,
     const vk::PipelineShaderStageCreateInfo* fragment_stage) {
 	if (m_impl->failed) {
@@ -276,7 +269,7 @@ bool GraphicsPipelineLibraryCache::CreatePipeline(
 	};
 
 	LibraryKey vertex_key {};
-	vertex_key.vs_shader_id  = pipeline.vs_shader_id;
+	vertex_key.vs_shader_id  = vs_shader_id;
 	vertex_key.static_params = VertexInputParams(static_params);
 	auto vertex_subset =
 	    make_library_info(vk::GraphicsPipelineLibraryFlagBitsEXT::eVertexInputInterface, nullptr);
@@ -300,8 +293,8 @@ bool GraphicsPipelineLibraryCache::CreatePipeline(
 	}
 
 	LibraryKey pre_raster_key {};
-	pre_raster_key.vs_shader_id  = pipeline.vs_shader_id;
-	pre_raster_key.ps_shader_id  = pipeline.ps_shader_id;
+	pre_raster_key.vs_shader_id  = vs_shader_id;
+	pre_raster_key.ps_shader_id  = ps_shader_id;
 	pre_raster_key.static_params = PreRasterParams(static_params);
 	auto pre_raster_subset       = make_library_info(
 	    vk::GraphicsPipelineLibraryFlagBitsEXT::ePreRasterizationShaders, pipeline_info.pNext);
@@ -315,9 +308,12 @@ bool GraphicsPipelineLibraryCache::CreatePipeline(
 	pre_raster_info.pDepthStencilState  = nullptr;
 	pre_raster_info.pColorBlendState    = nullptr;
 	LibraryKey fragment_key {};
-	fragment_key.vs_shader_id  = pipeline.vs_shader_id;
-	fragment_key.ps_shader_id  = pipeline.ps_shader_id;
+	fragment_key.vs_shader_id  = vs_shader_id;
+	fragment_key.ps_shader_id  = ps_shader_id;
 	fragment_key.static_params = FragmentShaderParams(static_params);
+	// Whether a depth-stencil state exists at all follows the depth and stencil formats.
+	fragment_key.rendering.depth_format   = rendering.depth_format;
+	fragment_key.rendering.stencil_format = rendering.stencil_format;
 	auto fragment_subset       = make_library_info(
 	    vk::GraphicsPipelineLibraryFlagBitsEXT::eFragmentShader, pipeline_info.pNext);
 	auto fragment_info                = pipeline_info;
@@ -376,7 +372,7 @@ bool GraphicsPipelineLibraryCache::CreatePipeline(
 	    m_impl->driver_cache, 1, &link_pipeline_info, nullptr, &pipeline.pipeline);
 	if (result != vk::Result::eSuccess || pipeline.pipeline == nullptr) {
 		LOGF("Graphics pipeline library link failed: %s; using monolithic pipelines\n",
-		     VulkanToString(result).c_str());
+		     vk::to_string(result).c_str());
 		if (pipeline.pipeline != nullptr) {
 			m_impl->graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
 			pipeline.pipeline = nullptr;

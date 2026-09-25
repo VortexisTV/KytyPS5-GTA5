@@ -20,7 +20,7 @@ constexpr std::array DescriptorPoolSizes = {
 
 DescriptorHeap::DescriptorHeap(GraphicContext& graphics, MasterSemaphore& master_semaphore)
     : m_graphics(graphics), m_master_semaphore(master_semaphore) {
-	CreatePool();
+	CreateDescriptorPool();
 }
 
 DescriptorHeap::~DescriptorHeap() {
@@ -49,7 +49,7 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 		m_pending_pools.pop_front();
 		EXIT_IF(m_graphics.device.resetDescriptorPool(m_current_pool, {}) != vk::Result::eSuccess);
 	} else {
-		CreatePool();
+		CreateDescriptorPool();
 	}
 
 	m_sets.clear();
@@ -63,7 +63,6 @@ bool DescriptorHeap::Allocate(vk::DescriptorSetLayout layout, Batch& batch) {
 	layouts.fill(layout);
 
 	vk::DescriptorSetAllocateInfo allocate {};
-	allocate.sType          = vk::StructureType::eDescriptorSetAllocateInfo;
 	allocate.descriptorPool = m_current_pool;
 	allocate.pSetLayouts    = layouts.data();
 
@@ -83,10 +82,8 @@ bool DescriptorHeap::Allocate(vk::DescriptorSetLayout layout, Batch& batch) {
 	}
 }
 
-void DescriptorHeap::CreatePool() {
+void DescriptorHeap::CreateDescriptorPool() {
 	vk::DescriptorPoolCreateInfo create {};
-	create.sType         = vk::StructureType::eDescriptorPoolCreateInfo;
-	create.flags         = {};
 	create.maxSets       = DescriptorHeapCount;
 	create.poolSizeCount = static_cast<uint32_t>(DescriptorPoolSizes.size());
 	create.pPoolSizes    = DescriptorPoolSizes.data();

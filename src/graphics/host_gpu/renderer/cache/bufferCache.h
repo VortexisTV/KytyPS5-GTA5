@@ -47,6 +47,16 @@ public:
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
 	                                                        BufferId id              = {});
+	// Counts GPU writes through the cache that overlap the range, so a caller can tell whether
+	// GPU-owned bytes changed without reading them back. The first call starts watching the range;
+	// only writes after it are counted.
+	[[nodiscard]] uint64_t GpuWriteCount(uint64_t vaddr, uint64_t size);
+	// Keeps CPU writes to the range faulting: a hot page stays writable, and the texture cache
+	// learns about CPU writes to an image only from faults.
+	void ClearHotPages(uint64_t vaddr, uint64_t size) {
+		m_memory_tracker.ClearHotPagesIfAny(vaddr, size);
+	}
+
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return m_staging_buffer;
@@ -61,6 +71,9 @@ public:
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
+	// Stores bytes the GPU has not written into a page it owns without taking the page back.
+	// Returns false when the store has to go through guest memory the usual way.
+	[[nodiscard]] bool TryWriteBesideGpu(uint64_t vaddr, std::span<const uint8_t> data);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
@@ -80,20 +93,33 @@ public:
 	// Records host-visible shadows of hot readback buffers written since the last call. Call
 	// before every submit so a CPU read never has to drain the GPU for data already produced.
 	void RecordHotShadows();
+	// Whether a draw or dispatch just wrote a buffer that should be shadowed and submitted now,
+	// rather than at the next flush.
+	[[nodiscard]] bool EagerShadowPending() const noexcept { return m_eager_shadow_pending; }
 
 private:
 	friend struct BufferCacheTestAccess;
 
-	struct DownloadCopy;
+	bool IsBufferInvalid(BufferId id) const {
+		const auto* buffer = m_slot_buffers.try_get(id);
+		return buffer == nullptr || buffer->is_deleted;
+	}
+
+	using BufferMap = std::map<uint64_t, BufferId>;
+	struct OverlapResult {
+		BufferMap::iterator first;
+		BufferMap::iterator last;
+		uint64_t            begin;
+		uint64_t            end;
+		bool                has_stream_leap;
+	};
+
 	using PageTable = MultiLevelPageTable<BufferId, CACHING_PAGEBITS, 40, 16>;
 	static_assert(CACHING_PAGESIZE == (uint64_t {1} << PageTable::kPageBits));
-	static constexpr uint64_t               DOWNLOAD_ALIGNMENT = 64;
-	[[nodiscard]] static constexpr uint64_t AlignDownload(uint64_t size) noexcept {
-		return (size + DOWNLOAD_ALIGNMENT - 1) & ~(DOWNLOAD_ALIGNMENT - 1);
-	}
-	[[nodiscard]] static std::pair<uint64_t, uint64_t> DownloadEnvelope(const DownloadCopy& copy);
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
 	void TouchBuffer(const Buffer& buffer);
+	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
+	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
 	[[nodiscard]] BufferId CreateBuffer(uint64_t vaddr, uint64_t size);
 	void                   Register(BufferId id);
 	void Unregister(BufferId id);
@@ -105,10 +131,41 @@ private:
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
-	void DownloadBufferMemory(std::span<const DownloadCopy> copies);
+	// Queues backing publication; callers wait before clearing dirty pages or reusing their data.
+	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// Records copies of `buffer` into the download ring; returns where the ring maps them.
+	[[nodiscard]] std::pair<uint8_t*, uint64_t> RecordDownload(Buffer&                     buffer,
+	                                                           std::vector<vk::BufferCopy>& copies,
+	                                                           uint64_t total_size);
 	void WriteBackShadow(BufferId id, uint64_t tick);
 	void WriteHostMemory(uint64_t vaddr, std::span<const uint8_t> data);
-	void ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write);
+	// A readback the GPU thread has submitted and a faulting guest thread waits for; zero id when
+	// the readback completed on the spot.
+	struct ReadbackTicket {
+		uint64_t id   = 0;
+		uint64_t tick = 0;
+	};
+	struct PendingReadback {
+		struct Part {
+			uint64_t address = 0;
+			uint64_t offset  = 0; // in m_download_buffer
+			uint64_t size    = 0;
+		};
+		uint64_t          id          = 0;
+		uint64_t          tick        = 0; // the submission that produces the bytes
+		uint64_t          after_tick  = 0; // CurrentTick() once it was submitted
+		uint64_t          fault_vaddr = 0; // for a synchronous retry
+		uint64_t          fault_size  = 0;
+		uint64_t          vaddr       = 0; // the range whose ownership passes to the CPU
+		uint64_t          size        = 0;
+		bool              is_write    = false;
+		bool              downloaded  = false; // copied now rather than served by a shadow
+		bool              valid       = true;  // no GPU write to the range since the copy
+		std::vector<Part> parts;
+	};
+	ReadbackTicket ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write,
+	                               bool allow_async = false);
+	void           FinishReadback(uint64_t id);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -117,10 +174,19 @@ private:
 	Buffer                                            m_bda_pagetable_buffer;
 	Common::SlotVector<Buffer>                        m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
-	std::map<uint64_t, BufferId>                      m_buffers;
+	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
 	std::vector<BufferId>                             m_hot_written;
+	bool                                              m_eager_shadow_pending = false;
+	std::vector<PendingReadback>                      m_pending_readbacks;
+	uint64_t                                          m_next_readback_id = 1;
+	struct WriteWatch {
+		uint64_t size   = 0;
+		uint64_t writes = 0;
+	};
+	std::map<uint64_t, WriteWatch>                    m_write_watches;
+	uint64_t                                          m_write_watch_span = 0; // largest watch
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;

@@ -21,10 +21,6 @@ namespace {
 	}
 }
 
-[[nodiscard]] bool IsCompatibleViewFormat(vk::Format image_format, vk::Format view_format) {
-	return ImageViewOps::FormatsCompatible(image_format, view_format);
-}
-
 [[nodiscard]] bool IsStencilViewFormat(vk::Format format) {
 	switch (format) {
 		case vk::Format::eS8Uint:
@@ -326,8 +322,14 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		normalized.aspect = vk::ImageAspectFlagBits::eStencil;
 	}
 	normalized.usage = is_storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlags {};
+	for (const auto& cached: views) {
+		if (cached.info == normalized) {
+			return cached.view;
+		}
+	}
+
 	const bool format_compatible = normalized.format != vk::Format::eUndefined &&
-	                               IsCompatibleViewFormat(image.format, normalized.format);
+	                               ImageViewOps::FormatsCompatible(image.format, normalized.format);
 	const bool slice_view =
 	    image.image_type == vk::ImageType::e3D && (normalized.type == vk::ImageViewType::e2D ||
 	                                               normalized.type == vk::ImageViewType::e2DArray);
@@ -355,20 +357,18 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		     image.layers);
 	}
 
-	for (const auto& cached: views) {
-		if (cached.info == normalized) {
-			return cached.view;
-		}
-	}
-
 	vk::ImageViewUsageCreateInfo usage {};
-	usage.sType = vk::StructureType::eImageViewUsageCreateInfo;
 	usage.usage = image.usage;
 	if (!is_storage) {
 		usage.usage &= ~vk::ImageUsageFlagBits::eStorage;
 	}
+	vk::ImageViewMinLodCreateInfoEXT min_lod {};
+	if (normalized.min_lod != 0) {
+		min_lod.minLod = static_cast<float>(normalized.base_level) +
+		                 static_cast<float>(normalized.min_lod) / 256.0f;
+		usage.pNext    = &min_lod;
+	}
 	vk::ImageViewCreateInfo create {};
-	create.sType                           = vk::StructureType::eImageViewCreateInfo;
 	create.pNext                           = &usage;
 	create.image                           = image.image;
 	create.viewType                        = normalized.type;
@@ -381,7 +381,7 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	create.subresourceRange.layerCount     = normalized.layer_count;
 
 	vk::ImageView view   = nullptr;
-	const auto    result = m_graphics->device.createImageView(&create, nullptr, &view);
+	const auto    result = m_graphics.device.createImageView(&create, nullptr, &view);
 	if (result != vk::Result::eSuccess || view == nullptr) {
 		EXIT("failed to create image view: result=%d image_format=%d view_format=%d type=%d "
 		     "aspect=0x%x mip=%u+%u layer=%u+%u usage=0x%x\n",

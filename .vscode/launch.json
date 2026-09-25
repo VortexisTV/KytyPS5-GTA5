@@ -26,8 +26,8 @@
             "program": "${workspaceFolder}\\_Build\\vscode-clang\\kyty_emulator.exe",
             "args": [
                 "--game", "D:/gamesps5/PPSA07429",
-                "--printf-direction", "Silent",
-                "--graphics-debug-dump", "False"
+                "--printf-direction", "File",
+                "--graphics-debug-dump", "True"
             ],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}\\_Build\\vscode-clang",
@@ -67,8 +67,5 @@
                 ]
             }
         }
-    ]
-}
-
     ]
 }

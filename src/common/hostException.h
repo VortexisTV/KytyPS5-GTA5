@@ -44,7 +44,11 @@ using Handler = bool (*)(const ExceptionInfo&);
 // Expected not to return.
 using FinalHandler = void (*)(const ExceptionInfo&);
 
-bool InstallHandler(Handler handler, FinalHandler final_handler);
+bool InstallHandler(Handler handler, FinalHandler final_handler = nullptr);
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+bool InitializeThreadSignalStack();
+#endif
 
 } // namespace Common::HostException
 
