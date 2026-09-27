@@ -67,6 +67,7 @@ struct SpirvRequirements {
 	bool function_scratch             = false;
 	bool pixel_valid_mask             = false;
 	bool buffer_int64_atomics         = false;
+	bool coherent_buffers             = false;
 };
 
 SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
@@ -97,6 +98,14 @@ struct EmitterState {
 	uint32_t                                         push_constant_variable  = 0;
 	uint32_t                                         shader_data_storage_variable = 0;
 	uint32_t                                         flattened_srt_variable  = 0;
+	uint32_t                                         loop_watchdog_variable  = 0;
+	// Per-invocation count of loop back edges evaluated, checked against the watchdog limit.
+	uint32_t                                         loop_watchdog_counter   = 0;
+	// Low device clock word at the invocation's first abort check, when the watchdog times loops.
+	uint32_t                                         loop_watchdog_start     = 0;
+	// Private table describing every buffer format, for formatted loads through descriptors the
+	// GPU selects at run time.
+	uint32_t                                         buffer_format_table     = 0;
 	uint32_t                                         lds_variable            = 0;
 	std::array<uint32_t, 2>                          scratch_variable {};
 	std::array<uint32_t, IR::ImageBindingCount>      image_variables {};
@@ -370,12 +379,13 @@ void EmitMemoryOffsets(EmitterState& state);
 uint32_t LdsDwordCount(const EmitterState& state);
 
 struct MemoryResourceAccess {
-	IR::ResourceKind kind             = IR::ResourceKind::None;
-	uint32_t         object_pointer   = 0;
-	uint32_t         length           = 0;
-	uint32_t         index_offset     = 0;
-	uint32_t         byte_offset      = 0;
-	bool             add_index_offset = false;
+	IR::ResourceKind      kind             = IR::ResourceKind::None;
+	uint32_t              object_pointer   = 0;
+	uint32_t              length           = 0;
+	uint32_t              index_offset     = 0;
+	uint32_t              byte_offset      = 0;
+	bool                  add_index_offset = false;
+	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
 };
 
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem);
@@ -475,6 +485,10 @@ uint32_t EmitF16BitsToF32(EmitterState& state, uint32_t bits);
 void EmitProgram(EmitterState& state);
 
 void DefineGetBdaPointer(EmitterState& state);
+
+// The host address of a 64-bit guest address through the BDA page table, or 0 when its page is not
+// mapped; the page is then registered for a later dispatch. The shader must use DMA.
+uint32_t EmitGuestToHostAddress(ValueEmitContext& ctx, uint32_t address);
 
 // These templates accept local lambdas from several emitter translation units.
 template <typename Fn>

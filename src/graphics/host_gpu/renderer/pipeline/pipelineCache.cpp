@@ -7,6 +7,7 @@
 #include "common/perfStats.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/gpuCrashDiagnostics.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -34,6 +35,8 @@
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
 #include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -102,11 +105,31 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 // Guest reads resource materialization made since the last shader lookup reported them to
 // PerfStats. Counting locally keeps atomics off the per-read path.
 thread_local uint64_t g_materialize_reads = 0;
+// The last guest read materialization could not make, for the warning when it fails.
+thread_local uint64_t g_failed_read_address = 0;
+thread_local uint64_t g_failed_read_size    = 0;
+// Reads materialization took back from the GPU since the last lookup reset it.
+thread_local uint64_t g_materialize_readbacks = 0;
 
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
 	g_materialize_reads++;
-	return !values.empty() &&
-	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(), values.size_bytes());
+	if (values.empty()) {
+		return false;
+	}
+	if (Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(),
+	                                                     values.size_bytes())) {
+		return true;
+	}
+	// Descriptor tables the GPU fills in itself, such as the counts and offsets of work lists it
+	// builds, are read back from it, which waits for the GPU work that writes them.
+	if (Libs::LibKernel::Memory::TryReadGpuBackingWithReadback(address, values.data(),
+	                                                           values.size_bytes())) {
+		g_materialize_readbacks++;
+		return true;
+	}
+	g_failed_read_address = address;
+	g_failed_read_size    = values.size_bytes();
+	return false;
 }
 
 bool ValidateShaderGuestMemoryRange(void*, uint64_t address, uint64_t size) {
@@ -226,6 +249,7 @@ struct PipelineCache::ProgramCache {
 		// A deque keeps every Permutation at a stable address: draw state and pipeline jobs hold
 		// pointers to permutation.program while new permutations are still being appended.
 		std::deque<Permutation> permutations;
+		bool                    skip_dispatch = false;
 	};
 
 	struct ProgramKeyHash {
@@ -299,10 +323,10 @@ struct PipelineCache::ProgramCache {
 
 	// The compile options for one stage. `input_info` must outlive the returned options.
 	template <typename InputInfo>
-	static ShaderRecompiler::CompileOptions MakeOptions(ShaderType stage, const InputInfo& input_info,
-	                                                    std::span<const uint32_t> user_data,
-	                                                    std::span<const uint32_t> back_code,
-	                                                    uint64_t                  hash) {
+	ShaderRecompiler::CompileOptions MakeOptions(ShaderType stage, const InputInfo& input_info,
+	                                             std::span<const uint32_t> user_data,
+	                                             std::span<const uint32_t> back_code,
+	                                             uint64_t                  hash) const {
 		ShaderStageInputInfo stage_input {};
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage_input.vertex = &input_info;
@@ -331,6 +355,7 @@ struct PipelineCache::ProgramCache {
 		options.early_dump  = options.dump_ir;
 		options.dump_label  = label;
 		options.input_info  = stage_input;
+		options.loop_watchdog_clock = device_clock;
 
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			options.user_data_base = 8;
@@ -398,7 +423,8 @@ struct PipelineCache::ProgramCache {
 
 	template <typename InputInfo>
 	void RunAsyncJob(AsyncJob<InputInfo>& job) {
-		PerfStats::Span    span(PerfStats::SpanId::ShaderCompileAsync);
+		PerfStats::Span             span(PerfStats::SpanId::ShaderCompileAsync);
+		const DiagnosticShaderScope diagnostic_scope(job.hash);
 		const auto         options = MakeOptions(job.stage, job.input_info, job.user_data,
 		                                         job.back_code, job.hash);
 		ShaderParams       params {};
@@ -470,6 +496,9 @@ struct PipelineCache::ProgramCache {
 			DrainCompleted();
 		}
 		const ShaderType stage = StageOf(input_info);
+		if (stage == ShaderType::Compute && SkipRunawayShader(params.hash)) {
+			return {};
+		}
 
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
 		lookup_key.stage           = stage;
@@ -478,6 +507,9 @@ struct PipelineCache::ProgramCache {
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		auto                                         entry = programs.find(lookup_key);
+		if (entry != programs.end() && entry->second.skip_dispatch) {
+			return {};
+		}
 		const ShaderRecompiler::IR::SrtRuntime       runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
@@ -490,9 +522,9 @@ struct PipelineCache::ProgramCache {
 				CountRepeatedInputs(entry->second, params);
 			}
 			PerfStats::Span materialize_span(PerfStats::SpanId::ShaderMaterialize);
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
+			if (!Materialize(entry->second, runtime, params.hash, stage)) {
+				return {};
+			}
 			materialize_span.Stop();
 			PerfStats::Add(PerfStats::CounterId::ShaderGuestReads,
 			               std::exchange(g_materialize_reads, 0));
@@ -512,6 +544,7 @@ struct PipelineCache::ProgramCache {
 				return permutation->handle;
 			}
 		}
+		RegisterDiagnosticShader(params.hash, params.code);
 
 		if (enqueue && allow_async) {
 			// Hand translation (and, once the plan exists, permutation compilation) to a worker.
@@ -546,15 +579,23 @@ struct PipelineCache::ProgramCache {
 			return {};
 		}
 
-		PerfStats::Span compile_span(PerfStats::SpanId::ShaderCompileSync);
+		PerfStats::Span             compile_span(PerfStats::SpanId::ShaderCompileSync);
+		const DiagnosticShaderScope diagnostic_scope(params.hash);
 		const auto options = MakeOptions(stage, input_info, user_data, params.back_code, params.hash);
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		if (translated.skip_dispatch) {
+			DumpDiagnosticShader(params.hash, "skipped");
+			entry = programs.try_emplace(lookup_key, ShaderRecompiler::IR::ResourcePlan {}).first;
+			entry->second.skip_dispatch = true;
+			return {};
+		}
 		if (entry == programs.end()) {
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
+			// The entry stays; the next draw materializes it before compiling a permutation.
+			if (!Materialize(entry->second, runtime, params.hash, stage)) {
+				return {};
+			}
 		}
 		entry->second.permutations.push_back(CompilePermutation(
 		    params, options, std::move(translated), entry->second.specialization, push_data_cursor));
@@ -566,6 +607,64 @@ struct PipelineCache::ProgramCache {
 		sync_builds++;
 		PrintCounts();
 		return permutation.handle;
+	}
+
+	// Reads the resources of one draw or dispatch from guest memory. When that fails, for instance
+	// because a descriptor table pointer leads to unmapped memory, the draw or dispatch is skipped
+	// and each shader is reported once.
+	bool Materialize(SourceEntry& source, const ShaderRecompiler::IR::SrtRuntime& runtime,
+	                 uint64_t hash, ShaderType stage) {
+		g_failed_read_size      = 0;
+		g_materialize_readbacks = 0;
+		if (ShaderRecompiler::IR::MaterializeResources(source.resource_plan, runtime,
+		                                               source.resources, source.specialization)) {
+			if (g_materialize_readbacks != 0 && gpu_written_tables.insert(hash).second) {
+				PipelineCacheLog("Shader 0x{:016x} reads descriptors from memory the GPU writes; "
+				                 "its {} wait for the GPU to finish writing them",
+				                 hash, stage == ShaderType::Compute ? "dispatches" : "draws");
+			}
+			return true;
+		}
+		if (!materialize_failures.insert(hash).second) {
+			return false;
+		}
+		const auto detail =
+		    g_failed_read_size != 0
+		        ? fmt::format("reading {} bytes of guest memory at 0x{:x} failed",
+		                      g_failed_read_size, g_failed_read_address)
+		        : std::string("no guest read failed, so a descriptor could not be worked out "
+		                      "before the dispatch");
+		std::string user_data;
+		for (const auto value: runtime.user_data) {
+			user_data += fmt::format(" {:08x}", value);
+		}
+		PipelineCacheLog("Warning: skipped {} of shader 0x{:016x}: its resources could not be "
+		                 "resolved: {}; user data:{}. Later failures of this shader are not logged",
+		                 stage == ShaderType::Compute ? "a dispatch" : "a draw", hash, detail,
+		                 user_data);
+		DumpDiagnosticShader(hash, "materialize");
+		return false;
+	}
+
+	// A compute shader the loop watchdog keeps cutting only produces results that are already
+	// wrong, and each dispatch spends its time budget, so its dispatches are skipped from then on.
+	bool SkipRunawayShader(uint64_t hash) {
+		if (const auto generation = RunawayShaderGeneration(); generation != runaway_generation) {
+			runaway_generation = generation;
+			for (const auto runaway: RunawayShaders()) {
+				runaway_shaders.try_emplace(runaway, false);
+			}
+		}
+		const auto found = runaway_shaders.find(hash);
+		if (found == runaway_shaders.end()) {
+			return false;
+		}
+		if (!std::exchange(found->second, true)) {
+			PipelineCacheLog("Warning: skipping compute dispatches of shader 0x{:016x}: the loop "
+			                 "watchdog had to cut its loops short in {} frames",
+			                 hash, RunawayShaderReports);
+		}
+		return true;
 	}
 
 	// Counts lookups whose program, shader base and user data match a recent lookup: the work a
@@ -586,7 +685,7 @@ struct PipelineCache::ProgramCache {
 		slot = inputs;
 	}
 
-	explicit ProgramCache(vk::Device device): device(device) {
+	ProgramCache(vk::Device device, bool device_clock): device(device), device_clock(device_clock) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
@@ -601,6 +700,15 @@ struct PipelineCache::ProgramCache {
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
+	// Whether shaders may read the device clock, which the loop watchdog uses to time loops.
+	bool                                                        device_clock = false;
+	// Compute shaders the loop watchdog keeps cutting, each with whether its skip was logged.
+	uint32_t                                                    runaway_generation = 0;
+	std::unordered_map<uint64_t, bool>                          runaway_shaders;
+	// Shaders whose resources failed to materialize, reported once each.
+	std::unordered_set<uint64_t>                                materialize_failures;
+	// Shaders whose resources had to be read back from the GPU, reported once each.
+	std::unordered_set<uint64_t>                                gpu_written_tables;
 	std::atomic<uint64_t>                                       next_shader_id = 0;
 	std::vector<uint64_t>                                       recent_inputs;
 
@@ -614,7 +722,8 @@ struct PipelineCache::ProgramCache {
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
-    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
+    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device,
+                                                      graphics.shader_device_clock_enabled)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 	if (graphics.graphics_pipeline_library_enabled &&
@@ -1065,7 +1174,10 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
 	Common::LockGuard lock(m_mutex);
-	uint32_t          push_data_cursor = 0;
+	// A dispatch sized in threads passes its thread counts in the first push-data dwords.
+	uint32_t push_data_cursor = input_info.dispatch_thread_dimensions
+	                                ? ShaderRecompiler::IR::PushData::DispatchThreadDwordCount
+	                                : 0u;
 	// Compute results feed later passes (indirect arguments, skinning); skipping a dispatch is
 	// riskier than a stall, so compute shaders stay synchronous.
 	return m_program_cache->Get(params, input_info, push_data_cursor, /*allow_async=*/false);

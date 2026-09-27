@@ -14,6 +14,7 @@
 #include "gpu_tiler_shaders/gpu_tiler_standard64_3d_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_standard64_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_swap_bgra16_spv.h"
+#include "graphics/host_gpu/gpuCrashDiagnostics.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -22,6 +23,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cinttypes>
 #include <cstring>
 #include <limits>
 
@@ -159,14 +161,22 @@ void TileManager::Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_ca
 		}
 		uint64_t linear_used = 0;
 		uint64_t bytes       = 0;
-		EXIT_NOT_IMPLEMENTED((info.depth > 1 && slice_bytes < minimum_slice) ||
-		                     !checked_multiply(info.depth - 1u, slice_bytes, bytes) ||
-		                     !checked_add(linear_used, bytes, linear_used) ||
-		                     !checked_multiply(info.height - 1u, pitch_bytes, bytes) ||
-		                     !checked_add(linear_used, bytes, linear_used) ||
-		                     !checked_multiply(info.width, info.bytes_per_element, bytes) ||
-		                     !checked_add(linear_used, bytes, linear_used) ||
-		                     linear_used > info.linear_size || slice_bytes > UINT32_MAX);
+		if ((info.depth > 1 && slice_bytes < minimum_slice) ||
+		    !checked_multiply(info.depth - 1u, slice_bytes, bytes) ||
+		    !checked_add(linear_used, bytes, linear_used) ||
+		    !checked_multiply(info.height - 1u, pitch_bytes, bytes) ||
+		    !checked_add(linear_used, bytes, linear_used) ||
+		    !checked_multiply(info.width, info.bytes_per_element, bytes) ||
+		    !checked_add(linear_used, bytes, linear_used) || linear_used > info.linear_size ||
+		    slice_bytes > UINT32_MAX) {
+			EXIT("TileManager: %s surface does not fit its linear range: family=%u "
+			     "bytes_per_element=%u extent=%ux%ux%u pitch=%u slice_bytes=0x%" PRIx64
+			     " linear_used=0x%" PRIx64 " linear_size=0x%" PRIx64 " tiled_size=0x%" PRIx64
+			     " surface_z=%u\n",
+			     tile ? "tiling" : "detiling", static_cast<uint32_t>(info.family),
+			     info.bytes_per_element, info.width, info.height, info.depth, info.pitch,
+			     slice_bytes, linear_used, info.linear_size, info.tiled_size, info.surface_z);
+		}
 
 		const uint64_t columns =
 		    (static_cast<uint64_t>(tiled_width) + block.block_width - 1u) / block.block_width;
@@ -349,6 +359,8 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
 		                             static_cast<uint32_t>(writes.size()), writes.data());
 		command.bindPipeline(vk::PipelineBindPoint::eCompute, GetPipeline(dispatch.pipeline_slot));
+		MarkGpuCheckpoint(m_graphics, command, GpuCheckpointKind::Tiler, 0, {},
+		                  dispatch.push.width, dispatch.push.height, dispatch.push.depth);
 		command.dispatch((dispatch.push.width + 7u) / 8u, (dispatch.push.height + 7u) / 8u,
 		                 dispatch.push.depth);
 	}
@@ -589,6 +601,8 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 			push.slice_bytes = static_cast<uint32_t>(layout.target_row_stride);
 			command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
 			                      sizeof(push), &push);
+			MarkGpuCheckpoint(m_graphics, command, GpuCheckpointKind::Tiler, 0, {}, layout.width,
+			                  rows, 1);
 			command.dispatch(static_cast<uint32_t>(groups_x), rows, 1);
 			row += rows;
 		}
@@ -658,6 +672,8 @@ void TileManager::SwapBgra16(Result input, Result output, uint32_t pixels) {
 	push.width    = pixels;
 	command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
 	                      &push);
+	MarkGpuCheckpoint(m_graphics, command, GpuCheckpointKind::Tiler, 0, {},
+	                  static_cast<uint32_t>(pixels));
 	command.dispatch((pixels + 63u) / 64u, 1, 1);
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eTransferRead;

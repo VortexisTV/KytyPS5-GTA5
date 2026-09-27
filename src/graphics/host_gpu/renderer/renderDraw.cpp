@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/gpuCrashDiagnostics.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -1185,6 +1186,18 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
+	std::array<uint64_t, 4> shader_hashes {};
+	uint32_t                shader_count = 0;
+	for (const auto& stage: vertex_stages) {
+		shader_hashes[shader_count++] = stage.stage.program->shader_hash;
+	}
+	if (state.ps_active && state.ps_input_info.stage.program != nullptr) {
+		shader_hashes[shader_count++] = state.ps_input_info.stage.program->shader_hash;
+	}
+	MarkGpuCheckpoint(m_context.GetGraphics(), vk_buffer,
+	                  mesh_active ? GpuCheckpointKind::DrawMesh : GpuCheckpointKind::Draw, submit_id,
+	                  std::span(shader_hashes).first(shader_count), draw.index_count,
+	                  draw.instance_count);
 	if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else {

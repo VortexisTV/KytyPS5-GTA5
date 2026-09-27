@@ -123,6 +123,11 @@ IR::MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded) {
 	memory.image_r128    = decoded.image_r128;
 	memory.idxen         = decoded.idxen;
 	memory.offen         = decoded.offen;
+	// Vector loads use GLC/DLC to bypass L0/GL1; atomics use GLC only to return data.
+	const bool buffer_atomic = decoded.opcode >= Decoder::Opcode::BUFFER_ATOMIC_SWAP &&
+	                           decoded.opcode <= Decoder::Opcode::BUFFER_ATOMIC_FMAX;
+	memory.coherent = memory.kind == ResourceKind::Buffer && !buffer_atomic &&
+	                  (decoded.glc || decoded.dlc);
 	memory.resource      = ResourceIndexFromOperand(decoded.src1);
 	memory.sampler       = ResourceIndexFromOperand(decoded.src2);
 	if (memory.kind == ResourceKind::ScalarBuffer) {
@@ -639,6 +644,41 @@ bool Translator::IMAGE_GET_LOD(const Decoder::Instruction& inst) {
 	return true;
 }
 
+// The BVH descriptor and the ray stay plain values: the node test reads the BVH through the BDA
+// page table rather than through a bound resource.
+bool Translator::IMAGE_BVH_INTERSECT_RAY(const Decoder::Instruction& inst) {
+	const bool bvh64 = inst.opcode == Decoder::Opcode::IMAGE_BVH64_INTERSECT_RAY;
+	const bool a16   = (inst.image_sample_flags & Decoder::ImageSampleFlagA16) != 0u;
+	std::array<IR::Value, 13> components {};
+	components.fill(IR::Value(0u));
+	const auto count = inst.image_address_components;
+	EXIT_IF(count > components.size());
+	const auto nsa_components =
+	    std::min(inst.image_nsa_dwords * 4u, Decoder::MaxImageNsaAddressComponents);
+	for (uint32_t index = 0; index < count; index++) {
+		if (index != 0u && index - 1u < nsa_components) {
+			components[index] =
+			    ir.GetVectorReg(static_cast<IR::VectorReg>(inst.image_nsa_addr[index - 1u]));
+		} else {
+			components[index] = ReadRawU32(OffsetOperand(PlainOperand(inst.src0), index));
+		}
+	}
+	const auto address = ir.Emit(
+	    IR::ValueOpcode::MakeImageAddress,
+	    {components[0], components[1], components[2], components[3], components[4], components[5],
+	     components[6], components[7], components[8], components[9], components[10],
+	     components[11], components[12]});
+	const auto descriptor = ConstructU32x4(inst.src1, 4u);
+	const auto result =
+	    ir.Emit(IR::ValueOpcode::BvhIntersectRay,
+	            {descriptor, address, IR::Value((bvh64 ? 1u : 0u) | (a16 ? 2u : 0u)), ir.GetExec()});
+	for (uint32_t component = 0; component < 4u; component++) {
+		WriteOperand(OffsetOperand(inst.dst, component),
+		             ir.Emit(IR::ValueOpcode::CompositeExtractU32x4, {result, IR::Value(component)}));
+	}
+	return true;
+}
+
 bool Translator::IMAGE_LOAD(const Decoder::Instruction& inst) {
 	const auto memory   = MemoryInfoFromDecoded(inst);
 	const auto resource = GetImageResource(memory);
@@ -1048,6 +1088,8 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::IMAGE_GATHER4_C_O:
 		case Decoder::Opcode::IMAGE_GATHER4_C_LZ_O:
 		case Decoder::Opcode::IMAGE_GATHER4H: return IMAGE_GATHER(inst);
+		case Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY:
+		case Decoder::Opcode::IMAGE_BVH64_INTERSECT_RAY: return IMAGE_BVH_INTERSECT_RAY(inst);
 
 		case Decoder::Opcode::DS_MIN_F32:
 			return DS_MINMAX_F32(inst, IR::ValueOpcode::SharedAtomicFMin32);

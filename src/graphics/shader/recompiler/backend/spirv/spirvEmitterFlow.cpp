@@ -592,6 +592,24 @@ uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return result;
 }
 
+uint32_t EmitDispatchThreadCount(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&       state   = ctx.state;
+	const auto  result  = state.builder.AllocateId();
+	const auto  index   = inst.Arg(0).U32();
+	const auto* compute = state.program.stage == ShaderType::Compute ? state.input_info.compute
+	                                                                 : nullptr;
+	if (compute == nullptr || !compute->dispatch_thread_dimensions ||
+	    index >= IR::PushData::DispatchThreadDwordCount) {
+		ctx.Fail(inst, "invalid dispatch thread count");
+	}
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer,
+	                          state.push_constant_variable, ConstantU32(state, 0),
+	                          ConstantU32(state, index));
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), result, pointer);
+	return result;
+}
+
 uint32_t EmitGetUserData(EmitterState& state, IR::ScalarReg reg) {
 
 	uint32_t dword = 0;

@@ -1176,8 +1176,23 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
 	if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
-		const auto* args = reinterpret_cast<const vk::DispatchIndirectCommand*>(args_addr);
-		DispatchDirect(args->x, args->y, args->z, mode);
+		// Thread counts size the dispatch here on the CPU. A shader that computed them and stored
+		// them through DMA left them only in the GPU's copy of the page, so an unchanged cached
+		// copy is read instead of guest memory.
+		vk::DispatchIndirectCommand args {};
+		std::memcpy(&args, reinterpret_cast<const void*>(args_addr), sizeof(args));
+		vk::DispatchIndirectCommand gpu_args {};
+		if (m_renderer.GetBufferCache().ReadGpuCopy(args_addr, &gpu_args, sizeof(gpu_args))) {
+			static uint32_t differed = 0;
+			if (std::memcmp(&args, &gpu_args, sizeof(args)) != 0 && differed++ < 16) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "Indirect dispatch sized in threads at 0x{:010x}: guest memory holds {}x{}x{}, "
+				    "the GPU stored {}x{}x{}; using the GPU's\n",
+				    args_addr, args.x, args.y, args.z, gpu_args.x, gpu_args.y, gpu_args.z));
+			}
+			args = gpu_args;
+		}
+		DispatchDirect(args.x, args.y, args.z, mode);
 		return;
 	}
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));

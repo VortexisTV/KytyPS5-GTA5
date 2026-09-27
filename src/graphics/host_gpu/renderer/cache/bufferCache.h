@@ -15,6 +15,7 @@
 #include <map>
 #include <span>
 #include <utility>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -69,11 +70,16 @@ public:
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
+	[[nodiscard]] Buffer* GetLoopWatchdogBuffer() noexcept { return &m_loop_watchdog_buffer; }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	// Stores bytes the GPU has not written into a page it owns without taking the page back.
 	// Returns false when the store has to go through guest memory the usual way.
 	[[nodiscard]] bool TryWriteBesideGpu(uint64_t vaddr, std::span<const uint8_t> data);
+	// Reads guest bytes from the cached buffer holding them, waiting for the GPU work recorded so
+	// far. Returns false when no buffer caches them or the CPU changed them since the upload, so
+	// guest memory holds the latest bytes. A shader's DMA stores reach only the cached copy.
+	[[nodiscard]] bool ReadGpuCopy(uint64_t vaddr, void* out, uint64_t size);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
@@ -83,6 +89,10 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	// For diagnostics: copies the bytes the buffer caching the range holds, whatever its tracking
+	// says, and waits for them (see DiagnosticMemoryReader).
+	void ReadDiagnosticMemory(uint64_t vaddr, uint64_t size, std::vector<uint8_t>& gpu,
+	                          std::vector<uint8_t>& cpu, std::string& note);
 	// Advances whenever SynchronizeBuffersInRange could upload something over ranges it has
 	// already synchronized: new work in the memory tracker, or a buffer registered or removed.
 	[[nodiscard]] uint64_t SynchronizationEpoch() const noexcept {
@@ -172,6 +182,8 @@ private:
 	FaultManager                                      m_fault_manager;
 	Buffer                                            m_gds_buffer;
 	Buffer                                            m_bda_pagetable_buffer;
+	// Where shaders report guest loops the recompiler's loop watchdog cut short.
+	Buffer                                            m_loop_watchdog_buffer;
 	Common::SlotVector<Buffer>                        m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                         m_buffers;

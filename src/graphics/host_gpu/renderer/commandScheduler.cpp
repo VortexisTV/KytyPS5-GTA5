@@ -4,6 +4,7 @@
 #include "common/logging/log.h"
 #include "common/perfStats.h"
 #include "common/timer.h"
+#include "graphics/host_gpu/gpuCrashDiagnostics.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
@@ -417,6 +418,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		                  m_command.m_debug_submit_id, m_command.m_debug_arg0,
 		                  m_command.m_debug_arg1, m_command.m_debug_arg2, m_command.m_debug_arg3,
 		                  m_command.m_debug_arg4);
+		ReportGpuFailure(graphics, "vkQueueSubmit", result);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 

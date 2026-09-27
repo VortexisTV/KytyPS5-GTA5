@@ -110,6 +110,9 @@ void                   SetFlexibleMemorySize(uint64_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
+// As TryReadGpuCleanBacking, but on the GPU thread bytes the GPU has written to a buffer are read
+// back first, which waits for the GPU work that writes them.
+bool                   TryReadGpuBackingWithReadback(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);

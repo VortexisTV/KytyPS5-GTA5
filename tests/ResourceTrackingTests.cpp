@@ -2508,9 +2508,52 @@ void TestDmaAddressRegisters() {
                  {based, Value(0u), Value(0u), Value(true)},
                  fixture.AddMemory(global, 4));
     fixture.PlanAndTrack();
-    Check(fixture.program.info.dma_address_registers ==
-              std::vector<uint32_t>{4u},
+    Check(fixture.program.info.dma_address_bases ==
+              std::vector<DmaAddressBase>{{4u, 5u}},
           "user-data DMA address base was not recorded");
+    Check(fixture.program.info.dma_write_address_bases.empty(),
+          "a DMA load recorded a write base");
+  }
+  {
+    // GTA V's BVH builder stores through a buffer descriptor built from a
+    // user-data pointer plus an offset it loaded itself, so the GPU selects it,
+    // and reads through another. Both bases are cached before the dispatch, the
+    // stored-through one as a write base.
+    Fixture fixture;
+    const auto table =
+        fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
+                        fixture.UserData(2), fixture.UserData(3)});
+    MemoryInfo raw;
+    raw.kind = ResourceKind::Buffer;
+    const auto offset = fixture.Emit(
+        ValueOpcode::LoadBufferU32,
+        {table, Value(0u), Value(0u), Value(0u), Value(true)},
+        fixture.AddMemory(raw, 4));
+    const auto low =
+        fixture.Emit(ValueOpcode::IAdd32, {fixture.UserData(4), offset});
+    const auto high = fixture.Emit(ValueOpcode::BitwiseOr32,
+                                   {fixture.UserData(5), Value(0x80000u)});
+    const auto written =
+        fixture.Buffer({low, high, Value(0x1000u), Value(0x16204u)}, 8);
+    fixture.Emit(ValueOpcode::StoreBufferU32,
+                 {written, Value(0u), Value(0u), Value(0u), Value(7u),
+                  Value(true)},
+                 fixture.AddMemory(raw, 8));
+    const auto read_low =
+        fixture.Emit(ValueOpcode::IAdd32, {fixture.UserData(8), offset});
+    const auto read = fixture.Buffer(
+        {read_low, fixture.UserData(9), Value(0x1000u), Value(0x16204u)}, 12);
+    fixture.Emit(ValueOpcode::LoadBufferU32,
+                 {read, Value(0u), Value(0u), Value(0u), Value(true)},
+                 fixture.AddMemory(raw, 12));
+    fixture.PlanAndTrack();
+    Check(fixture.program.info.uses_dma &&
+              fixture.program.info.dma_address_bases ==
+                  std::vector<DmaAddressBase>({{4u, 5u}, {8u, 9u}}) &&
+              fixture.program.info.dma_write_address_bases ==
+                  std::vector<DmaAddressBase>{{4u, 5u}} &&
+              fixture.program.info.dma_store_descriptor_tables.empty(),
+          "GPU-selected buffer bases were not recorded as DMA bases");
   }
   {
     // A full address the shader computes itself, the way GTA V's glyph blit
@@ -2533,8 +2576,8 @@ void TestDmaAddressRegisters() {
                  fixture.AddMemory(flat, 0xa4));
     fixture.PlanAndTrack();
     Check(fixture.program.info.uses_dma &&
-              fixture.program.info.dma_address_registers ==
-                  std::vector<uint32_t>{12u},
+              fixture.program.info.dma_address_bases ==
+                  std::vector<DmaAddressBase>{{12u, 13u}},
           "computed DMA address did not record only its user-data base");
   }
   {
@@ -2549,8 +2592,119 @@ void TestDmaAddressRegisters() {
                  fixture.AddMemory(flat, 8));
     fixture.PlanAndTrack();
     Check(fixture.program.info.uses_dma &&
-              fixture.program.info.dma_address_registers.empty(),
+              fixture.program.info.dma_address_bases.empty(),
           "DMA address without user-data roots recorded a register");
+  }
+  {
+    // GTA V's BVH builder stores its nodes through a descriptor whose base is
+    // user data 6 with user data 1 as the high dword, not 7, and whose record
+    // count it loads from the tree's header.
+    Fixture fixture;
+    const auto header =
+        fixture.Buffer({fixture.UserData(4), fixture.UserData(5),
+                        Value(0x1000u), Value(0x16204u)});
+    MemoryInfo raw;
+    raw.kind = ResourceKind::Buffer;
+    const auto count = fixture.Emit(
+        ValueOpcode::LoadBufferU32,
+        {header, Value(0u), Value(0u), Value(0u), Value(true)},
+        fixture.AddMemory(raw, 4));
+    const auto high = fixture.Emit(ValueOpcode::BitwiseOr32,
+                                   {fixture.UserData(1), Value(0x400000u)});
+    const auto nodes = fixture.Buffer(
+        {fixture.UserData(6), high, count, Value(0x10016204u)}, 8);
+    fixture.Emit(ValueOpcode::StoreBufferU32,
+                 {nodes, Value(0u), Value(0u), Value(0u), Value(7u),
+                  Value(true)},
+                 fixture.AddMemory(raw, 8));
+    fixture.PlanAndTrack();
+    Check(fixture.program.info.dma_write_address_bases ==
+              std::vector<DmaAddressBase>{{6u, 1u}},
+          "a DMA base split over user data 6 and 1 was not recorded");
+  }
+  {
+    // GTA V's BVH builder takes its base from (s3, s0) on one path and from
+    // (s6, s1) on the other. Only the halves arriving along the same edge pair
+    // up: (s6, s0) would name unrelated memory.
+    Fixture fixture;
+    auto *left = fixture.block;
+    auto *right = fixture.AddBlock();
+    auto *merge = fixture.AddBlock();
+    left->AddBranch(merge);
+    right->AddBranch(merge);
+    const auto user = [&](uint32_t reg, Block *block) {
+      return fixture.Emit(ValueOpcode::GetUserData,
+                          {Value(static_cast<ScalarReg>(reg))}, 0, block);
+    };
+    auto &low = merge->AppendNewInst(ValueOpcode::Phi, {},
+                                     static_cast<uint64_t>(Type::U32));
+    low.AddPhiOperand(left, user(3, left));
+    low.AddPhiOperand(right, user(6, right));
+    auto &high = merge->AppendNewInst(ValueOpcode::Phi, {},
+                                      static_cast<uint64_t>(Type::U32));
+    high.AddPhiOperand(left, user(0, left));
+    high.AddPhiOperand(right, user(1, right));
+    fixture.block = merge;
+    const auto header =
+        fixture.Buffer({fixture.UserData(4), fixture.UserData(5),
+                        Value(0x1000u), Value(0x16204u)});
+    MemoryInfo raw;
+    raw.kind = ResourceKind::Buffer;
+    const auto count = fixture.Emit(
+        ValueOpcode::LoadBufferU32,
+        {header, Value(0u), Value(0u), Value(0u), Value(true)},
+        fixture.AddMemory(raw, 4));
+    const auto counters = fixture.Buffer(
+        {Value(&low), Value(&high), count, Value(0x16204u)}, 8);
+    fixture.Emit(ValueOpcode::StoreBufferU32,
+                 {counters, Value(0u), Value(0u), Value(0u), Value(7u),
+                  Value(true)},
+                 fixture.AddMemory(raw, 8));
+    fixture.PlanAndTrack();
+    Check(fixture.program.info.dma_write_address_bases ==
+              std::vector<DmaAddressBase>({{3u, 0u}, {6u, 1u}}),
+          "a DMA base chosen per path paired halves from different paths");
+  }
+  {
+    // GTA V's vertex writers pick each destination descriptor per lane from a
+    // table in memory. The table is recorded so the renderer can cache the
+    // ranges its descriptors name.
+    Fixture fixture;
+    const auto table =
+        fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
+                        Value(0x1000u), Value(0x16204u)},
+                       0x860);
+    const auto invocation = fixture.Emit(
+        ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::GlobalInvocationId)),
+         Value(0u)});
+    const auto selector =
+        fixture.Emit(ValueOpcode::ReadFirstLane, {invocation, Value(true)});
+    const auto entry =
+        fixture.Emit(ValueOpcode::ShiftLeftLogical32, {selector, Value(4u)});
+    std::array<Value, 4> words;
+    for (uint32_t dword = 0; dword < words.size(); dword++) {
+      MemoryInfo scalar;
+      scalar.kind = ResourceKind::ScalarBuffer;
+      scalar.offset = dword * sizeof(uint32_t);
+      words[dword] = fixture.Emit(ValueOpcode::ReadConstBuffer, {table, entry},
+                                  fixture.AddMemory(scalar, 0x860));
+    }
+    const auto destination = fixture.Buffer(words, 0x86c);
+    MemoryInfo raw;
+    raw.kind = ResourceKind::Buffer;
+    fixture.Emit(ValueOpcode::StoreBufferU32,
+                 {destination, Value(0u), Value(0u), Value(0u), Value(7u),
+                  Value(true)},
+                 fixture.AddMemory(raw, 0x86c));
+    fixture.PlanAndTrack();
+    const auto &info = fixture.program.info;
+    Check(info.indirect_buffer_writes &&
+              info.dma_store_descriptor_tables.size() == 1u &&
+              info.dma_store_descriptor_tables[0] < info.buffers.size() &&
+              info.buffers[info.dma_store_descriptor_tables[0]].first_use_pc ==
+                  0x860u,
+          "a table of store descriptors was not recorded");
   }
 }
 
@@ -2833,7 +2987,8 @@ void TestImageBindingAbi() {
             static_cast<uint32_t>(DescriptorBindingKind::FaultBuffer) == 47u &&
             static_cast<uint32_t>(DescriptorBindingKind::FlattenedSrt) == 48u &&
             static_cast<uint32_t>(DescriptorBindingKind::ShaderData) == 49u &&
-            static_cast<uint32_t>(DescriptorBindingKind::Count) == 50u,
+            static_cast<uint32_t>(DescriptorBindingKind::LoopWatchdog) == 50u &&
+            static_cast<uint32_t>(DescriptorBindingKind::Count) == 51u,
         "native descriptor binding anchors changed");
 
   const std::array sampled_dimensions{
@@ -3052,9 +3207,14 @@ void TestMalformedMemoryKindsRejected() {
 
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
+  // An argument runs only the test of that name.
+  const char *only = argc > 1 ? argv[1] : nullptr;
   try {
-    const auto Run = [](const char *name, auto test) {
+    const auto Run = [&](const char *name, auto test) {
+      if (only != nullptr && std::string(name) != only) {
+        return;
+      }
       try {
         test();
       } catch (const std::exception &exception) {

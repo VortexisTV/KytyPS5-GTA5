@@ -2291,8 +2291,9 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 				break;
 			default: EXIT("unknown release_mem interrupt selector\n");
 		}
+		// A guest thread may be blocked on the interrupt, so it is submitted at once.
 		if (queued) {
-			cp.RequestBufferFlush();
+			cp.BufferFlush();
 		}
 	};
 
@@ -2331,7 +2332,12 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action,
 		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
 		                      interrupt_selector, interrupt_context_id);
-		cp.RequestBufferFlush();
+		// Selectors 1 and 2 raise an interrupt with the write; only a plain label can batch.
+		if (interrupt_selector == 0x01 || interrupt_selector == 0x02) {
+			cp.BufferFlush();
+		} else {
+			cp.RequestBufferFlush();
+		}
 
 		return 7;
 	}
@@ -2349,7 +2355,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
 		                      interrupt_selector, interrupt_context_id);
 		if (interrupt_selector == 0x01) {
-			cp.RequestBufferFlush();
+			cp.BufferFlush();
 		}
 
 		return 7;

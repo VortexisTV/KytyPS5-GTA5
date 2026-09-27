@@ -402,7 +402,7 @@ private:
 		}
 		m_visiting.pop_back();
 		m_visited.push_back(inst);
-		if (!IsRawRead(m_program, *inst)) {
+		if (!IsRawRead(m_program, *inst) || DependsOnGpuState(value)) {
 			return;
 		}
 		const auto offset = inst->Arg(1).Resolve();
@@ -422,6 +422,36 @@ private:
 		const auto slot = static_cast<uint32_t>(m_program.srt_reads.size());
 		m_program.srt_reads.push_back({value, slot});
 		m_patches.push_back({inst, slot, true});
+	}
+
+	// Whether the walker can never evaluate value before a dispatch because it takes one lane of a
+	// vector register, or a phi whose incoming values differ picks it by the path the GPU took. A
+	// read at such an address, like a ray-tracing traversal loading the instance its stack points
+	// at, stays a GPU load.
+	bool DependsOnGpuState(Value value) {
+		value            = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) {
+			return false;
+		}
+		if (const auto found = m_gpu_state.find(inst); found != m_gpu_state.end()) {
+			return found->second;
+		}
+		// A cycle is decided by the phi that closes it.
+		m_gpu_state.emplace(inst, false);
+		bool depends = false;
+		if (inst->GetOpcode() == ValueOpcode::ReadLane) {
+			depends = true;
+		} else if (inst->GetOpcode() == ValueOpcode::Phi) {
+			const auto invariant = ResolveInvariantPhi(m_program, value);
+			depends              = invariant.IsEmpty() || DependsOnGpuState(invariant);
+		} else {
+			for (size_t index = 0; index < inst->NumArgs() && !depends; index++) {
+				depends = DependsOnGpuState(inst->Arg(index));
+			}
+		}
+		m_gpu_state[inst] = depends;
+		return depends;
 	}
 
 	void PatchReads() {
@@ -456,10 +486,11 @@ private:
 		}
 	}
 
-	Program&           m_program;
-	std::vector<Inst*> m_visiting;
-	std::vector<Inst*> m_visited;
-	std::vector<Patch> m_patches;
+	Program&                              m_program;
+	std::vector<Inst*>                    m_visiting;
+	std::vector<Inst*>                    m_visited;
+	std::vector<Patch>                    m_patches;
+	std::unordered_map<const Inst*, bool> m_gpu_state;
 };
 
 } // namespace

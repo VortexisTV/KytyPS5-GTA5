@@ -20,9 +20,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <fmt/format.h>
 #include <map>
+#include <mutex>
+#include <set>
 #include <span>
 #include <utility>
 
@@ -523,6 +526,19 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(decoded.instructions.size()), phase_ms());
 
+	// Ray-tracing shaders were skipped before BVH intersection was implemented. One that still
+	// holds an instruction the recompiler lacks stays skipped rather than stopping the emulator.
+	if (options.stage == ShaderType::Compute && decoded.has_bvh) {
+		const auto unsupported = std::ranges::find(decoded.instructions, Decoder::Opcode::UNSUPPORTED,
+		                                           &Decoder::Instruction::opcode);
+		if (unsupported != decoded.instructions.end()) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Warning: skipping compute dispatches of ray-tracing shader 0x{:016x}: {}\n",
+			    options.shader_hash, Decoder::InstructionToString(*unsupported)));
+			return {.skip_dispatch = true};
+		}
+	}
+
 	std::string decoded_dump;
 	if (options.dump_ir) {
 		decoded_dump = Decoder::ProgramToString(decoded);
@@ -580,6 +596,8 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
+	ir.loop_watchdog       = options.loop_watchdog;
+	ir.loop_watchdog_clock = options.loop_watchdog_clock;
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
@@ -599,9 +617,31 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		IR::EliminateDeadCode(ir.blocks);
 	}
 	LowerTessellationMemory(ir, options);
+	IR::StandInRuntimeImages(ir);
+	IR::EliminateDeadCode(ir.blocks);
 	IR::BuildSrtPlan(ir);
 	IR::EliminateDeadCode(ir.blocks);
 	IR::TrackResources(ir);
+	if (!ir.image_stand_in.empty()) {
+		static std::mutex         reported_mutex;
+		static std::set<uint64_t> reported;
+		std::lock_guard           lock(reported_mutex);
+		if (reported.insert(options.shader_hash).second) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Warning: compute shader 0x{:016x} picks textures per lane, which is not "
+			    "supported yet; they read as mid-grey and opaque: {}.\n",
+			    options.shader_hash, ir.image_stand_in));
+		}
+	}
+	// Temporary workaround: of the accesses through descriptors selected at run time, only buffer
+	// loads, stores and atomics have a BDA path.
+	if (!ir.unsupported_indirect_access.empty()) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Warning: skipping compute dispatches of shader 0x{:016x}: it accesses memory through "
+		    "a descriptor selected at run time in a way not supported yet: {}.\n",
+		    options.shader_hash, ir.unsupported_indirect_access));
+		return {.skip_dispatch = true};
+	}
 	IR::EliminateDeadCode(ir.blocks);
 	TranslateResult result;
 	result.program = std::move(ir);
@@ -615,6 +655,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 CompileResult CompileProgram(TranslateResult translated, const CompileOptions& options,
                              const IR::ResourceSpecialization& specialization,
                              uint32_t push_data_start_dword) {
+	EXIT_IF(translated.skip_dispatch);
 	const auto emit_begin = std::chrono::steady_clock::now();
 	auto& ir = translated.program;
 	IR::ApplyResourceSpecialization(ir, specialization);

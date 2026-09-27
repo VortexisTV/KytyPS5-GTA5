@@ -166,7 +166,11 @@ uint32_t F32ArrayType(EmitterState& state, uint32_t count) {
 }
 
 void DefineDescriptors(EmitterState& state) {
-	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh) {
+	const bool dispatch_thread_counts = state.program.stage == ShaderType::Compute &&
+	                                    state.input_info.compute != nullptr &&
+	                                    state.input_info.compute->dispatch_thread_dimensions;
+	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh ||
+	    dispatch_thread_counts) {
 		const auto type              = PushConstantBlockType(state);
 		state.push_constant_variable = state.builder.DefineGlobalVariable(
 		    TypePointer(state, spv::StorageClassPushConstant, type), spv::StorageClassPushConstant);
@@ -201,6 +205,16 @@ void DefineDescriptors(EmitterState& state) {
 					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_u64_variable,
 					                            spv::DecorationAliased);
 				}
+				if (state.requirements.coherent_buffers) {
+					// RDNA2 stores publish to L2 even without GLC; every alias of the buffer
+					// must participate in visibility for cache-bypassing polling loads.
+					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_variable,
+					                            spv::DecorationCoherent);
+					if (state.storage_buffer_u64_variable != 0) {
+						state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_u64_variable,
+						                            spv::DecorationCoherent);
+					}
+				}
 				break;
 			case IR::DescriptorBindingKind::BdaPagetable:
 				state.bda_pagetable_variable = Define(StorageBufferU64Type(state), "bda_pagetable");
@@ -214,6 +228,13 @@ void DefineDescriptors(EmitterState& state) {
 				break;
 			case IR::DescriptorBindingKind::FlattenedSrt:
 				state.flattened_srt_variable = Define(StorageBufferType(state), "flattened_srt");
+				break;
+			case IR::DescriptorBindingKind::LoopWatchdog:
+				state.loop_watchdog_variable = Define(StorageBufferType(state), "loop_watchdog");
+				if (state.program.loop_watchdog_clock) {
+					state.builder.RequireExtension("SPV_KHR_shader_clock");
+					state.builder.RequireCapability(spv::CapabilityShaderClockKHR);
+				}
 				break;
 			case IR::DescriptorBindingKind::Samplers:
 				state.sampler_variable = Define(ArrayType(state.builder.Type(spv::OpTypeSampler)),

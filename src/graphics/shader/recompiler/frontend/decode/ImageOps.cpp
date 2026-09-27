@@ -223,6 +223,8 @@ Opcode DecodeMimgOpcode(uint32_t opcode, const MimgSampleInfo* sample, const Mim
 		case 0x09u: return Opcode::IMAGE_STORE_MIP;
 		case 0x0eu: return Opcode::IMAGE_GET_RESINFO;
 		case 0x60u: return Opcode::IMAGE_GET_LOD;
+		case 0xe6u: return Opcode::IMAGE_BVH_INTERSECT_RAY;
+		case 0xe7u: return Opcode::IMAGE_BVH64_INTERSECT_RAY;
 		default: return Opcode::UNSUPPORTED;
 	}
 }
@@ -344,10 +346,23 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	}
 	inst.image_address_components =
 	    DecodeMimgAddressComponents(opcode, dimension, sample, gather, atomic);
+	const bool bvh = inst.opcode == Opcode::IMAGE_BVH_INTERSECT_RAY ||
+	                 inst.opcode == Opcode::IMAGE_BVH64_INTERSECT_RAY;
+	if (bvh) {
+		// Node pointer (two DWORDs for BVH64), ray extent, origin, direction and inverse direction;
+		// A16 packs the two directions as halves into three DWORDs. The count is in DWORDs.
+		inst.image_address_components =
+		    (inst.opcode == Opcode::IMAGE_BVH64_INTERSECT_RAY ? 12u : 11u) - (a16 ? 3u : 0u);
+		inst.data_components = 4u;
+		inst.data_dwords     = 4u;
+	}
 	SetRawWords(inst, code, word_index, word_count);
 
 	if (inst.opcode == Opcode::UNSUPPORTED) {
 		SetUnsupported(inst, Family::MIMG, opcode, "MIMG opcode is not implemented");
+	}
+	if (bvh && inst.dmask != 0xfu) {
+		SetUnsupported(inst, Family::MIMG, opcode, "MIMG BVH intersection requires dmask 0xf");
 	}
 	if (gather != nullptr && !std::has_single_bit(inst.dmask)) {
 		SetUnsupported(inst, Family::MIMG, opcode,

@@ -15,6 +15,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/gpuCrashDiagnostics.h"
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -34,9 +35,14 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <fmt/format.h>
 #include <limits>
+#include <map>
+#include <set>
 #include <span>
+#include <string>
+#include <utility>
 #include <vector>
 
 #ifdef min
@@ -69,7 +75,8 @@ vk::DescriptorType NativeDescriptorType(BindingKind kind) {
 		case BindingKind::BdaPagetable:
 		case BindingKind::FaultBuffer:
 		case BindingKind::FlattenedSrt:
-		case BindingKind::ShaderData: return vk::DescriptorType::eStorageBuffer;
+		case BindingKind::ShaderData:
+		case BindingKind::LoopWatchdog: return vk::DescriptorType::eStorageBuffer;
 		case BindingKind::Count: EXIT("invalid native descriptor binding kind");
 	}
 	EXIT("invalid native descriptor binding kind");
@@ -870,6 +877,13 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 // a 64-bit pointer in user data; a glyph whose bitmap sits on an unseen page is blitted empty and the
 // game never redraws it. Cache the pages named by the user data that forms DMA address bases before
 // the shader runs.
+//
+// A DMA store to an uncached page is dropped, and its data never arrives: GTA V's ray-tracing BVH
+// builder writes each tree once, through buffer descriptors built from a user-data pointer, and a
+// tree missing its nodes sends every later traversal and refit around its lists forever. A base
+// that is written through caches WriteWindow bytes from its page. GTA V's vertex writers
+// instead pick each destination descriptor from a table at run time; every range the table's
+// descriptors name is cached.
 void RenderExecutor::PrepareDmaSources(const PreparedBindings& prepared) {
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program = *prepared.runtime->program;
@@ -879,15 +893,28 @@ void RenderExecutor::PrepareDmaSources(const PreparedBindings& prepared) {
 	PerfStats::Span span(PerfStats::SpanId::BindDmaSources);
 	// Covers a glyph bitmap or a small record run; reads beyond it still take the fault path.
 	constexpr uint64_t SourceWindow = 256ull * 1024ull;
+	// Covers the largest BVH seen (7.7 MB). Every cached page is write-protected, so a wider window
+	// would slow the CPU writing whatever else shares the memory.
+	constexpr uint64_t WriteWindow = 16ull * 1024ull * 1024ull;
 	auto&              cache        = m_context.GetBufferCache();
 	const auto&        user_data    = prepared.runtime->resources->user_data;
-	for (const auto reg: program.info.dma_address_registers) {
-		if (reg < program.user_data_base || reg - program.user_data_base + 1u >= user_data.size()) {
+	const auto&        writes       = program.info.dma_write_address_bases;
+	std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	for (const auto& source: prepared.buffer_sources) {
+		ranges.emplace_back(source.address, source.size);
+	}
+	std::string cached_writes;
+	const auto  in_user_data = [&](uint32_t reg) {
+		return reg >= program.user_data_base && reg - program.user_data_base < user_data.size();
+	};
+	for (const auto& base: program.info.dma_address_bases) {
+		if (!in_user_data(base.low) || !in_user_data(base.high)) {
 			continue;
 		}
-		const auto index = reg - program.user_data_base;
-		const auto low   = user_data[index];
-		const auto high  = user_data[index + 1u];
+		const bool write = std::ranges::find(writes, base) != writes.end();
+		const auto low   = user_data[base.low - program.user_data_base];
+		// A buffer descriptor's second dword keeps its stride and swizzle above the base.
+		const auto high = user_data[base.high - program.user_data_base] & (write ? 0xffffu : ~0u);
 		// Guest GPU memory lies below 2^40. A value this close to a 4 GiB boundary is more likely a
 		// pair of small integers than a base, and caching the wrong range write-protects live pages.
 		if (high == 0 || high > 0xffu || low < 0x10000u) {
@@ -895,12 +922,139 @@ void RenderExecutor::PrepareDmaSources(const PreparedBindings& prepared) {
 		}
 		const uint64_t address = (static_cast<uint64_t>(high) << 32u) | low;
 		const uint64_t page    = address & ~(BufferCache::CACHING_PAGESIZE - 1u);
-		const uint64_t extent  = m_context.MappedExtent(page, SourceWindow);
+		const uint64_t start   = page;
+		const uint64_t extent =
+		    m_context.MappedExtent(start, write ? WriteWindow : SourceWindow);
 		if (extent == 0) {
 			continue;
 		}
-		(void)cache.FindBuffer(page, extent);
+		(void)cache.FindBuffer(start, extent);
+		ranges.emplace_back(address, extent - (address - start));
+		if (write) {
+			cached_writes += fmt::format(" 0x{:010x}+0x{:x}", start, extent);
+		}
 	}
+	const auto table_ranges = CacheStoreDescriptorTables(prepared);
+	if (table_ranges != 0) {
+		cached_writes += fmt::format(" {} ranges its descriptor tables name", table_ranges);
+		for (const auto table: program.info.dma_store_descriptor_tables) {
+			if (table < prepared.buffer_sources.size()) {
+				cached_writes += fmt::format(" (table 0x{:010x}+0x{:x})",
+				                             prepared.buffer_sources[table].address,
+				                             prepared.buffer_sources[table].size);
+			}
+		}
+	}
+	// For a replay of a dump: the descriptor tables behind pointers in the user data and the SRT
+	// values the shader reads, which bound buffers do not cover.
+	constexpr uint64_t TableWindow = 64ull * 1024ull;
+	const auto         add_tables  = [&](std::span<const uint32_t> words) {
+		for (size_t index = 0; index + 1u < words.size() && ranges.size() < 96u; index++) {
+			const auto low  = words[index];
+			const auto high = words[index + 1u];
+			if (high == 0 || high > 0xffu || low < 0x10000u) {
+				continue;
+			}
+			const uint64_t pointer = (static_cast<uint64_t>(high) << 32u) | low;
+			const uint64_t start   = (pointer & ~uint64_t {0xfff}) - 0x1000u;
+			const uint64_t extent  = m_context.MappedExtent(start, TableWindow);
+			if (extent != 0) {
+				ranges.emplace_back(start, extent);
+			}
+		}
+	};
+	add_tables(user_data);
+	add_tables(prepared.runtime->resources->flattened_srt);
+	RecordDmaDispatch(program.shader_hash, user_data, std::move(ranges));
+	if (program.info.indirect_buffer_writes) {
+		NoteDmaWriter(program.shader_hash);
+	}
+	// Each shader that stores through DMA says once what was cached ahead of its stores.
+	static std::set<uint64_t> described;
+	if (program.info.indirect_buffer_writes && described.insert(program.shader_hash).second) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Shader 0x{:016x} stores through DMA; cached ahead of its stores:{}\n",
+		    program.shader_hash,
+		    cached_writes.empty() ? std::string(" nothing, no user-data base found")
+		                          : cached_writes));
+	}
+}
+
+// Caches every range the descriptors in the shader's store-descriptor tables name, and returns how
+// many there were. A table is read from guest memory at most every RescanInterval, and its ranges
+// are looked up again only when its contents changed.
+uint32_t RenderExecutor::CacheStoreDescriptorTables(const PreparedBindings& prepared) {
+	const auto& program = *prepared.runtime->program;
+	// Covers 262144 descriptors; a destination picked beyond that still takes the fault path.
+	constexpr uint64_t MaxTableBytes  = 4ull * 1024ull * 1024ull;
+	constexpr uint64_t MaxRangeBytes  = 256ull * 1024ull * 1024ull;
+	constexpr auto     RescanInterval = std::chrono::milliseconds(16);
+	struct Scan {
+		uint64_t                              hash  = 0;
+		uint32_t                              named = 0;
+		std::chrono::steady_clock::time_point time;
+	};
+	static std::map<std::pair<uint64_t, uint64_t>, Scan> scans;
+	auto&    cache = m_context.GetBufferCache();
+	uint32_t total = 0;
+	for (const auto table: program.info.dma_store_descriptor_tables) {
+		if (table >= prepared.buffer_sources.size()) {
+			continue;
+		}
+		const auto& source = prepared.buffer_sources[table];
+		const auto  size   = std::min<uint64_t>(source.size, MaxTableBytes) & ~uint64_t {15};
+		if (source.address == 0 || size == 0) {
+			continue;
+		}
+		const std::pair key {source.address, size};
+		const auto      now   = std::chrono::steady_clock::now();
+		auto            found = scans.find(key);
+		if (found != scans.end() && now - found->second.time < RescanInterval) {
+			total += found->second.named;
+			continue;
+		}
+		std::vector<uint32_t> words(size / sizeof(uint32_t));
+		if (!Libs::LibKernel::Memory::TryReadBacking(source.address, words.data(), size)) {
+			continue;
+		}
+		uint64_t hash = 0xcbf29ce484222325ull;
+		for (const auto word: words) {
+			hash = (hash ^ word) * 0x100000001b3ull;
+		}
+		auto& scan = scans[key];
+		scan.time  = now;
+		if (found != scans.end() && scan.hash == hash) {
+			total += scan.named;
+			continue;
+		}
+		scan.hash      = hash;
+		uint32_t count = 0;
+		for (size_t index = 0; index + 4u <= words.size(); index += 4u) {
+			const auto high   = words[index + 1u] & 0xffffu;
+			const auto stride = (words[index + 1u] >> 16u) & 0x3fffu;
+			const auto records = words[index + 2u];
+			const auto flags   = words[index + 3u];
+			// A buffer descriptor (type 0) with a base in guest GPU memory.
+			if (high == 0 || high > 0xffu || flags == 0 || (flags >> 30u) != 0u || records == 0) {
+				continue;
+			}
+			const uint64_t address = (static_cast<uint64_t>(high) << 32u) | words[index];
+			const uint64_t bytes =
+			    stride != 0 ? static_cast<uint64_t>(stride) * records : static_cast<uint64_t>(records);
+			if (bytes > MaxRangeBytes) {
+				continue;
+			}
+			const auto extent = m_context.MappedExtent(address, bytes);
+			if (extent == 0) {
+				continue;
+			}
+			(void)cache.FindBuffer(address, extent);
+			count++;
+		}
+		scan.named = count;
+		total += count;
+	}
+	return total;
 }
 
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
@@ -1148,11 +1302,14 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						}
 						break;
 					case BindingKind::BdaPagetable:
-					case BindingKind::FaultBuffer: {
+					case BindingKind::FaultBuffer:
+					case BindingKind::LoopWatchdog: {
 						auto&       cache      = m_context.GetBufferCache();
 						const auto* bda_buffer = binding.kind == BindingKind::BdaPagetable
 						                             ? cache.GetBdaPageTableBuffer()
-						                             : cache.GetFaultBuffer();
+						                         : binding.kind == BindingKind::FaultBuffer
+						                             ? cache.GetFaultBuffer()
+						                             : cache.GetLoopWatchdogBuffer();
 						m_descriptor_buffers.emplace_back(bda_buffer->Handle(), 0,
 						                                  bda_buffer->Size());
 						break;

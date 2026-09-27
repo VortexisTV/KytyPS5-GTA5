@@ -1180,6 +1180,31 @@ bool CanReachBefore(const Graph& graph, uint32_t start, uint32_t target, uint32_
 	return false;
 }
 
+// A straight run of blocks owned by `header`, outside the loop body, that ends in a branch to the
+// loop merge or in a return.
+bool IsBreakTail(const Graph& graph, const NaturalLoop& loop, uint32_t header, uint32_t start) {
+	std::vector<bool> visited(graph.blocks.size(), false);
+	for (auto block_id = start;;) {
+		const auto* block = graph.FindBlock(block_id);
+		if (block == nullptr || block_id >= visited.size() || visited[block_id] ||
+		    block_id == loop.continue_block || block_id == loop.header ||
+		    Contains(loop.body_blocks, block_id) || !graph.Dominates(header, block_id)) {
+			return false;
+		}
+		if (block->successors.empty()) {
+			return true;
+		}
+		if (block->successors.size() != 1u) {
+			return false;
+		}
+		if (block->successors.front() == loop.merge) {
+			return true;
+		}
+		visited[block_id] = true;
+		block_id          = block->successors.front();
+	}
+}
+
 uint32_t FindSelectionMerge(const Graph& graph, const BasicBlock& block) {
 	const auto  global_merge = graph.FindNearestCommonPostDominator(block.terminator.true_block,
 	                                                                block.terminator.false_block);
@@ -1233,6 +1258,19 @@ uint32_t FindSelectionMerge(const Graph& graph, const BasicBlock& block) {
 	    IsInsideLoopConstruct(graph, *loop, true_target)) {
 		return false_target;
 	}
+	// `if (c) { tail; break; }`: one arm stays in the loop body and the other runs a private tail
+	// before breaking to the loop merge (or returning). The arm that stays is the merge; the tail
+	// leaves the selection through the break.
+	const bool true_in_body  = Contains(loop->body_blocks, true_target);
+	const bool false_in_body = Contains(loop->body_blocks, false_target);
+	if (true_in_body != false_in_body) {
+		const auto inside  = true_in_body ? true_target : false_target;
+		const auto outside = true_in_body ? false_target : true_target;
+		if (inside != loop->continue_block && graph.Dominates(block.id, inside) &&
+		    IsBreakTail(graph, *loop, block.id, outside)) {
+			return inside;
+		}
+	}
 	return global_merge;
 }
 
@@ -1252,14 +1290,20 @@ bool IsInnermostLoopControlConditional(const Graph& graph, const BasicBlock& blo
 		};
 		return is_repeat_target(true_target) && is_repeat_target(false_target);
 	}
-	const bool true_in_body  = Contains(loop->body_blocks, true_target);
-	const bool false_in_body = Contains(loop->body_blocks, false_target);
-	if (true_in_body != false_in_body) {
-		return true;
-	}
 	const auto is_control_target = [&](uint32_t target) {
 		return target == loop->merge || target == loop->continue_block;
 	};
+	const bool true_in_body  = Contains(loop->body_blocks, true_target);
+	const bool false_in_body = Contains(loop->body_blocks, false_target);
+	// Only a branch straight to the loop's merge, continue block or header leaves the body without
+	// a selection. One into a longer exit path (blocks that lead on to the merge) is a selection
+	// like any other, and needs a merge of its own.
+	if (true_in_body != false_in_body) {
+		const auto outside = true_in_body ? false_target : true_target;
+		if (is_control_target(outside) || outside == loop->header) {
+			return true;
+		}
+	}
 	return (is_control_target(true_target) &&
 	        (is_control_target(false_target) ||
 	         IsInsideLoopConstruct(graph, *loop, false_target))) ||

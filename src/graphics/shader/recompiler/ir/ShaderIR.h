@@ -67,7 +67,39 @@ struct MemoryInfo {
 	bool                    image_r128                                            = false;
 	bool                    idxen                                                 = false;
 	bool                    offen                                                 = false;
+	bool                    coherent                                              = false;
 	bool                    planning_only                                         = false;
+
+	// Formatted loads decode the descriptor's format at run time.
+	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
+		return !typed && data_bits == 32u &&
+		       (opcode == ValueOpcode::LoadBufferU32 || opcode == ValueOpcode::LoadBufferU32x2 ||
+		        opcode == ValueOpcode::LoadBufferU32x3 || opcode == ValueOpcode::LoadBufferU32x4);
+	}
+
+	[[nodiscard]] bool SupportsIndirectBufferStore(ValueOpcode opcode) const {
+		return !formatted && !typed && data_bits == 32u &&
+		       (opcode == ValueOpcode::StoreBufferU32 || opcode == ValueOpcode::StoreBufferU32x2 ||
+		        opcode == ValueOpcode::StoreBufferU32x3 || opcode == ValueOpcode::StoreBufferU32x4);
+	}
+
+	// The 32-bit buffer atomics with a native SPIR-V equivalent.
+	[[nodiscard]] bool SupportsIndirectBufferAtomic(ValueOpcode opcode) const {
+		switch (opcode) {
+			case ValueOpcode::BufferAtomicSwap32:
+			case ValueOpcode::BufferAtomicCmpSwap32:
+			case ValueOpcode::BufferAtomicIAdd32:
+			case ValueOpcode::BufferAtomicISub32:
+			case ValueOpcode::BufferAtomicSMin32:
+			case ValueOpcode::BufferAtomicUMin32:
+			case ValueOpcode::BufferAtomicSMax32:
+			case ValueOpcode::BufferAtomicUMax32:
+			case ValueOpcode::BufferAtomicAnd32:
+			case ValueOpcode::BufferAtomicOr32:
+			case ValueOpcode::BufferAtomicXor32: return !formatted && !typed && data_bits == 32u;
+			default: return false;
+		}
+	}
 
 	bool operator==(const MemoryInfo& other) const = default;
 };
@@ -279,15 +311,58 @@ enum class DescriptorBindingKind : uint32_t {
 	FaultBuffer,
 	FlattenedSrt,
 	ShaderData,
+	LoopWatchdog,
 	Count,
 };
 
 static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 44u);
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 50u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 51u);
+
+// A structured guest loop is cut short once an invocation has evaluated IterationLimit loop back
+// edges, far more than any loop a game expects to finish. A dispatcher-fallback program counts the
+// runs of its blocks that can branch backwards instead, and a cut invocation there ends. Iterations that wait on memory or
+// contended atomics can take tens of microseconds, though, so on a device with a shader clock an
+// invocation is also cut once the watchdog buffer's TickBudget device clock ticks have passed
+// since its first abort check. Each cut counts in the watchdog buffer, and the first records its
+// shader and loop header. Each cut also counts in its shader's slot, which records that shader and
+// loop header too. Every AbortCheckInterval back edges an invocation reads its shader's slot count
+// and the clock, and leaves its loops once its shader has been cut, so a dispatch whose every
+// thread runs away still ends in time while other shaders' long loops run on. The host clears the
+// counts each frame.
+struct LoopWatchdog {
+	static constexpr uint32_t IterationLimit     = 1u << 20;
+	static constexpr uint32_t AbortCheckInterval = 1u << 8;
+	// 134 ms on NVIDIA's nanosecond device clock and 1.3 s on AMD's 100 MHz one, both inside the
+	// 2 s Windows GPU timeout.
+	static constexpr uint32_t DefaultTickBudget = 1u << 27;
+	static constexpr uint32_t TripCount      = 0;
+	static constexpr uint32_t Claimed        = 1;
+	static constexpr uint32_t HashLow        = 2;
+	static constexpr uint32_t HashHigh       = 3;
+	static constexpr uint32_t LoopPc         = 4;
+	static constexpr uint32_t TickBudget     = 5;
+	// Per-shader slots: shaders whose hashes share a slot also share its count.
+	static constexpr uint32_t SlotBase       = 8;
+	static constexpr uint32_t SlotCount      = 64;
+	static constexpr uint32_t SlotHashLow    = 0;
+	static constexpr uint32_t SlotHashHigh   = 1;
+	static constexpr uint32_t SlotLoopPc     = 2;
+	static constexpr uint32_t SlotTrips      = 3;
+	static constexpr uint32_t SlotDwords     = 4;
+	static constexpr uint32_t DwordCount     = SlotBase + SlotCount * SlotDwords;
+
+	[[nodiscard]] static constexpr uint32_t Slot(uint64_t hash) {
+		return SlotBase +
+		       static_cast<uint32_t>((hash ^ (hash >> 21u) ^ (hash >> 42u)) & (SlotCount - 1u)) *
+		           SlotDwords;
+	}
+};
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
 	static constexpr uint32_t MeshDrawDwordCount = 6;
+	// A compute dispatch sized in threads passes its thread counts per axis ahead of shader data.
+	static constexpr uint32_t DispatchThreadDwordCount = 3;
 	static constexpr uint32_t NoStart    = UINT32_MAX;
 	std::array<uint32_t, DwordCount> dwords {};
 
@@ -428,6 +503,14 @@ struct BindingLayout {
 	bool operator==(const BindingLayout& other) const = default;
 };
 
+// The user-data registers holding the low and high dwords of a DMA address base.
+struct DmaAddressBase {
+	uint32_t low  = 0;
+	uint32_t high = 0;
+
+	bool operator==(const DmaAddressBase& other) const = default;
+};
+
 struct ShaderInfo {
 	static constexpr uint32_t MaxBuffers      = 32;
 	static constexpr uint32_t MaxImages       = 64;
@@ -445,9 +528,20 @@ struct ShaderInfo {
 	int32_t                          instance_offset_sgpr = -1;
 	bool                             has_bitwise_xor    = false;
 	bool                             uses_dma           = false;
-	// Low user-data registers R whose dwords R and R + 1 form the base of a DMA address. The renderer
-	// caches those guest pages before the shader runs, so its first reads see guest memory.
-	std::vector<uint32_t> dma_address_registers;
+	// Stores and atomics through buffer descriptors the GPU selects at run time, and FLAT or GLOBAL
+	// stores. They reach guest memory through the BDA page table, outside the written buffers
+	// listed in `buffers`.
+	bool                             indirect_buffer_writes = false;
+	// User-data registers whose dwords form the low and high halves of a DMA address base, usually
+	// R and R + 1, though GTA V's BVH shaders pair s6 with s1. The renderer caches those guest pages
+	// before the shader runs, so its first reads see guest memory.
+	std::vector<DmaAddressBase> dma_address_bases;
+	// Those of them a DMA store or atomic writes through. A store to a page the buffer cache lacks
+	// is lost for good, not retried a frame later like a read, so far more is cached past them.
+	std::vector<DmaAddressBase> dma_write_address_bases;
+	// Buffers in `buffers` holding tables of buffer descriptors the shader picks at run time and
+	// stores through. The renderer caches the ranges those descriptors name before the shader runs.
+	std::vector<uint32_t> dma_store_descriptor_tables;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };
@@ -551,6 +645,14 @@ struct ResourcePlan {
 	std::vector<uint8_t>                clean_flat_slots;
 	bool                                requires_specialization_memory = false;
 	bool                                has_address_writes = false;
+	// The first access a compute shader makes through a descriptor selected at run time other than
+	// a buffer load, store or atomic, the kinds with a BDA path; empty when there is none. Its
+	// dispatches are skipped for now.
+	std::string                         unsupported_indirect_access;
+	// The first image a compute shader reads through a descriptor it picks per lane, such as a
+	// ray-tracing hit's material texture; empty when there is none. Such images read as a mid-grey,
+	// opaque stand-in until their tables are bound.
+	std::string                         image_stand_in;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;
@@ -585,7 +687,11 @@ struct Program: ResourcePlan {
 	uint32_t                      wave_size      = 64;
 	uint32_t                      scratch_dwords = 0;
 	bool                          dispatcher_fallback = false;
-	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
+	// Whether the guest loops get the loop watchdog (see LoopWatchdog).
+	bool                          loop_watchdog       = true;
+	// Whether the loop watchdog may read the device clock (VK_KHR_shader_clock).
+	bool                          loop_watchdog_clock = false;
+	CFG::FailureKind             cfg_failure_kind    = CFG::FailureKind::None;
 	std::string                   fallback_reason;
 	std::vector<BlockInfo>        block_info;
 	// Typed memory and export instructions reference shader-local metadata by dense index.

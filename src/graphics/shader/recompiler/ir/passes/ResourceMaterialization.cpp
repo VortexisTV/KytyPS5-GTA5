@@ -978,7 +978,7 @@ static bool Materialize(const ResourcePlan& program, const SrtRuntime& runtime,
 		       !source->indirect_image->selector_mask.IsEmpty();
 	});
 	if (masked_image &&
-	    (program.has_address_writes ||
+	    (program.has_address_writes || program.info.indirect_buffer_writes ||
 	     std::ranges::any_of(program.info.images, &ImageResource::written))) {
 		return false;
 	}

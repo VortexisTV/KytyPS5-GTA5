@@ -14,6 +14,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/gpuCrashDiagnostics.h"
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/pageManager.h"
@@ -76,8 +77,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <initializer_list>
+#include <iterator>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -1168,6 +1173,14 @@ struct BdaMapping {
   u32 backing_offset = 0;
 };
 
+// Guest memory a replayed dispatch reads, laid out in a test's `initial`: the region's bytes start
+// at backing_offset, which keeps the guest address's offset within its 16 KiB BDA page.
+struct GuestRegion {
+  uint64_t guest_base = 0;
+  u32 backing_offset = 0;
+  u32 size = 0;
+};
+
 struct TestCase {
   const char *name = "";
   std::vector<u32> code;
@@ -1216,6 +1229,18 @@ struct TestCase {
   std::vector<std::pair<std::string, size_t>> decoded_counts;
   std::vector<std::pair<std::string, size_t>> ir_counts;
   u32 expected_storage_mip_descriptors = 0;
+  // Guest PC of the loop header the loop watchdog must cut short; UINT32_MAX when no loop may
+  // reach the watchdog limit.
+  u32 expected_watchdog_loop_pc = UINT32_MAX;
+  // Device clock ticks a timed loop may run before the watchdog cuts it.
+  u32 watchdog_tick_budget = ShaderRecompiler::IR::LoopWatchdog::DefaultTickBudget;
+  // Cuts of another shader the watchdog buffer counts before the dispatch.
+  u32 watchdog_prior_trips = 0;
+  // DWORDs of the fault buffer (index, value) as the dispatch leaves them.
+  std::vector<std::pair<u32, u32>> expected_fault_words;
+  // When set, guest reads translate through these regions and each buffer binds at its
+  // descriptor's base, as a replay of a game dispatch needs.
+  std::vector<GuestRegion> guest_regions;
 };
 
 struct GraphicsCase {
@@ -1245,6 +1270,8 @@ struct CompiledShader {
   ShaderRecompiler::IR::Program program;
   ShaderRecompiler::IR::ResourceSnapshot resources;
   std::vector<u32> packed_user_data;
+  // Byte offsets of the buffers' bindings in the test backing; empty binds each at 0.
+  std::vector<vk::DeviceSize> buffer_binding_offsets;
 };
 
 std::array<u32, 64> MakeNativeUserData(const std::array<u32, 64> *source) {
@@ -1254,6 +1281,28 @@ std::array<u32, 64> MakeNativeUserData(const std::array<u32, 64> *source) {
     data = *source;
   }
   return data;
+}
+
+std::optional<uint64_t> GuestBacking(const TestCase &test, uint64_t address, uint64_t size) {
+  for (const auto &region : test.guest_regions) {
+    if (address >= region.guest_base && address - region.guest_base + size <= region.size) {
+      return region.backing_offset + (address - region.guest_base);
+    }
+  }
+  return std::nullopt;
+}
+
+bool ReadGuestRegions(void *userdata, uint64_t address, std::span<u32> values) {
+  const auto &test = *static_cast<const TestCase *>(userdata);
+  const auto backing = GuestBacking(test, address, values.size_bytes());
+  if (!backing || *backing % sizeof(u32) != 0) {
+    std::printf("replay: guest read 0x%llx+0x%zx is outside the dumped memory\n",
+                static_cast<unsigned long long>(address), values.size_bytes());
+    return false;
+  }
+  std::copy_n(test.initial.begin() + static_cast<ptrdiff_t>(*backing / sizeof(u32)),
+              values.size(), values.begin());
+  return true;
 }
 
 bool ReadTestMemory(void *userdata, uint64_t address, std::span<u32> values) {
@@ -1463,6 +1512,9 @@ void CheckSpirvText(const TestCase &test, const std::vector<u32> &spirv) {
   }
 }
 
+// Whether the harness device reads the shader device clock, so the loop watchdog times loops.
+bool g_device_clock = false;
+
 CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
@@ -1483,6 +1535,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Compute;
   options.dump_ir = true;
+  options.loop_watchdog_clock = g_device_clock;
   auto compute_info = test.compute_info;
   compute_info.host_subgroup_size = host_subgroup_size;
   options.input_info.compute = &compute_info;
@@ -1497,11 +1550,14 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
       ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
   ShaderRecompiler::IR::ResourceSnapshot resources;
   ShaderRecompiler::IR::ResourceSpecialization specialization;
+  const bool replay = !test.guest_regions.empty();
   const ShaderRecompiler::IR::SrtRuntime runtime{
       .user_data = options.user_data,
       .shader_base = reinterpret_cast<uint64_t>(test.code.data()),
-      .read_memory = ReadTestMemory,
-      .userdata = const_cast<std::vector<u32> *>(&test.initial),
+      .read_memory = replay ? ReadGuestRegions : ReadTestMemory,
+      .userdata = replay ? const_cast<TestCase *>(&test)
+                         : static_cast<void *>(const_cast<std::vector<u32> *>(&test.initial)),
+      .read_specialization_memory = replay ? ReadGuestRegions : nullptr,
   };
   Require(test.name, "resource materialization",
           ShaderRecompiler::IR::MaterializeResources(
@@ -1590,8 +1646,21 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
     packed_user_data[result.program.bindings.memory_offset_dword + i / 4u] |=
         offset << ((i % 4u) * 8u);
   }
-  return {std::move(result.spirv), std::move(result.program),
-          std::move(resources), std::move(packed_user_data)};
+  std::vector<vk::DeviceSize> binding_offsets;
+  if (replay) {
+    // Each buffer binds at its descriptor's base, 256-byte aligned, and the shader adds the rest.
+    for (u32 i = 0; i < buffer_count; i++) {
+      const auto &words = resources.buffers[i].dwords;
+      const uint64_t base = words[0] | (static_cast<uint64_t>(words[1] & 0xffffu) << 32u);
+      const auto backing = GuestBacking(test, base, 1).value_or(0);
+      const auto binding = backing & ~uint64_t{255};
+      binding_offsets.push_back(binding);
+      packed_user_data[result.program.bindings.memory_offset_dword + i / 4u] |=
+          static_cast<u32>(backing - binding) << ((i % 4u) * 8u);
+    }
+  }
+  return {std::move(result.spirv), std::move(result.program), std::move(resources),
+          std::move(packed_user_data), std::move(binding_offsets)};
 }
 
 std::array<u32, 64> MakeStructuredStorageBufferData(u32 stride_bytes,
@@ -1819,6 +1888,12 @@ public:
   };
 
   [[nodiscard]] vk::Device Device() const { return m_device; }
+  [[nodiscard]] const std::vector<u32> &LastFaultWords() const {
+    return m_last_fault_words;
+  }
+  [[nodiscard]] const std::vector<u32> &LastLoopWatchdog() const {
+    return m_last_loop_watchdog;
+  }
   [[nodiscard]] u32 SubgroupSize() const {
     vk::PhysicalDeviceSubgroupProperties subgroup{};
     vk::PhysicalDeviceProperties2 properties{};
@@ -2524,6 +2599,7 @@ public:
               "submission behavior");
 
       alignas(uint64_t) uint64_t release_label = 0;
+      alignas(uint64_t) uint64_t interrupt_label = 0;
       alignas(uint64_t) uint64_t gds_label = UINT64_MAX;
       bool release_mem_submission_counts = false;
       gpu.SendCommandSync([&] {
@@ -2534,8 +2610,19 @@ public:
         const auto immediate_tick = gpu_scheduler.CurrentTick();
         const auto immediate_result =
             processor->Process(immediate_execution, immediate);
-        const bool immediate_split_once =
-            gpu_scheduler.CurrentTick() == immediate_tick + 1;
+        // A plain label may ride along with the next submission instead.
+        const bool immediate_split_at_most_once =
+            gpu_scheduler.CurrentTick() <= immediate_tick + 1;
+
+        // Right behind it, a label that raises an interrupt still submits at once.
+        auto immediate_interrupt =
+            make_release_mem(1, 2, &interrupt_label, 0x55667788u);
+        Pm4Execution immediate_interrupt_execution;
+        const auto immediate_interrupt_tick = gpu_scheduler.CurrentTick();
+        const auto immediate_interrupt_result = processor->Process(
+            immediate_interrupt_execution, immediate_interrupt);
+        const bool immediate_interrupt_split_once =
+            gpu_scheduler.CurrentTick() == immediate_interrupt_tick + 1;
 
         auto gds = make_release_mem(5, 0, &gds_label, 1ull << 16u);
         Pm4Execution gds_execution;
@@ -2562,7 +2649,10 @@ public:
 
         release_mem_submission_counts =
             immediate_result == Pm4ProcessResult::Complete &&
-            immediate_split_once && gds_result == Pm4ProcessResult::Complete &&
+            immediate_split_at_most_once &&
+            immediate_interrupt_result == Pm4ProcessResult::Complete &&
+            immediate_interrupt_split_once &&
+            gds_result == Pm4ProcessResult::Complete &&
             gds_waited_once && interrupt_result == Pm4ProcessResult::Complete &&
             interrupt_split_once &&
             gds_interrupt_result == Pm4ProcessResult::Complete &&
@@ -2575,6 +2665,7 @@ public:
       Require("GpuCommandLane", "RELEASE_MEM submission counts",
               release_mem_submission_counts &&
                   static_cast<uint32_t>(release_label) == 0x11223344u &&
+                  static_cast<uint32_t>(interrupt_label) == 0x55667788u &&
                   static_cast<uint32_t>(gds_label) == 0,
               "RELEASE_MEM lost its required split/readback or retained a "
               "redundant GPU wait");
@@ -3549,6 +3640,54 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // Each report of the loop watchdog names the first shader it cut; once one shader has been
+  // named in RunawayShaderReports reports, it joins the runaway shaders whose dispatches the
+  // pipeline cache skips.
+  void CheckLoopWatchdogRunawayShaders() {
+    constexpr const char *name = "LoopWatchdogRunawayShaders";
+    constexpr uint64_t hash = 0x00c0ffee12345678ull;
+    using Watchdog = ShaderRecompiler::IR::LoopWatchdog;
+    std::vector<u32> code;
+    AppendEnd(&code);
+    RegisterDiagnosticShader(hash, code);
+
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto *buffer = context.GetBufferCache().GetLoopWatchdogBuffer();
+    const auto generation = RunawayShaderGeneration();
+    const auto listed = [&] {
+      const auto shaders = RunawayShaders();
+      return std::ranges::find(shaders, hash) != shaders.end();
+    };
+    for (u32 report = 1; report <= RunawayShaderReports; report++) {
+      auto *words = reinterpret_cast<u32 *>(buffer->Mapped().data());
+      words[Watchdog::TripCount] = 1;
+      words[Watchdog::Claimed] = 1;
+      words[Watchdog::HashLow] = static_cast<u32>(hash);
+      words[Watchdog::HashHigh] = static_cast<u32>(hash >> 32u);
+      words[Watchdog::LoopPc] = 0x40;
+      buffer->Flush(0, Watchdog::DwordCount * sizeof(u32));
+      ReportLoopWatchdog();
+      Require(name, "report", words[Watchdog::TripCount] == 0 && words[Watchdog::Claimed] == 0,
+              "the report did not clear the trip count");
+      Require(name, "report", words[Watchdog::TickBudget] == Watchdog::DefaultTickBudget,
+              "the report changed the tick budget");
+      const bool last = report == RunawayShaderReports;
+      Require(name, "runaway", listed() == last && (RunawayShaderGeneration() != generation) == last,
+              last ? "a shader cut in every report was not listed as a runaway"
+                   : "a shader was listed as a runaway too early");
+    }
+    std::error_code error;
+    const auto dump =
+        Config::GetShaderLogFolder() / "diagnostics" / "00c0ffee12345678_loop_watchdog";
+    for (const auto *extension : {".bin", ".rdna2"}) {
+      auto path = dump;
+      path += extension;
+      std::filesystem::remove(path, error);
+    }
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckBufferCacheDirtyGarbageCollection() {
     constexpr const char *name = "BufferCacheDirtyGarbageCollection";
     constexpr uintptr_t base = 0x0000000200700000ull;
@@ -4489,6 +4628,39 @@ public:
       cache.ReadMemory(base + reacquire_disjoint_offset,
                        sizeof(reacquire_value));
 
+      // A descriptor table the GPU fills in itself: the clean read used for resource
+      // materialization refuses it, and the readback variant waits for the GPU and returns the
+      // GPU's value, not the stale guest copy.
+      {
+        constexpr uint64_t table_offset = 0x4800100;
+        constexpr uint32_t table_stale = 0x5eed0001u;
+        constexpr uint32_t table_value = 0x0000abcdu;
+        Libs::LibKernel::Memory::WriteBacking(base + table_offset, &table_stale,
+                                              sizeof(table_stale));
+        MarkGpuWrite(base + table_offset, sizeof(table_value));
+        cache.FillBuffer(base + table_offset, sizeof(table_value), table_value, false);
+        uint32_t clean_word = 0;
+        uint32_t readback_word = 0;
+        bool clean_read = true;
+        bool readback_read = false;
+        bool off_gpu_thread = true;
+        Libs::LibKernel::Memory::InstallGpuResources(&context);
+        off_gpu_thread = !Libs::LibKernel::Memory::TryReadGpuBackingWithReadback(
+            base + table_offset, &readback_word, sizeof(readback_word));
+        context.GetGpu().SendCommandSync([&] {
+          clean_read = Libs::LibKernel::Memory::TryReadGpuCleanBacking(
+              base + table_offset, &clean_word, sizeof(clean_word));
+          readback_read = Libs::LibKernel::Memory::TryReadGpuBackingWithReadback(
+              base + table_offset, &readback_word, sizeof(readback_word));
+        });
+        Libs::LibKernel::Memory::InstallGpuResources(nullptr);
+        Require(name, "GPU-written table readback",
+                off_gpu_thread && !clean_read && readback_read &&
+                    readback_word == table_value &&
+                    !cache.HasGpuDirtyBytes(base + table_offset, sizeof(table_value)),
+                "a GPU-written descriptor table was not read back with the GPU's value");
+      }
+
       // The host reports one faulting byte. A store to the last bytes of a mapping whose
       // neighbour is unmapped must be resolved, and one byte past the end must not be.
       constexpr uint64_t mapped_end = base + allocation_size;
@@ -4510,6 +4682,138 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "dirty-GC direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // When the loop watchdog first cuts a shader, the ranges of its last DMA dispatch are dumped both
+  // as the GPU buffer caching them holds them, which DMA stores change without the tracker knowing,
+  // and as guest memory holds them.
+  void CheckDispatchMemoryDump() {
+    constexpr const char *name = "DispatchMemoryDump";
+    constexpr uint64_t hash = 0x00d15ea5e0000001ull;
+    constexpr uintptr_t base = 0x0000000207000000ull;
+    constexpr uint64_t allocation_size = 0x10000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t dump_size = 64;
+    constexpr uint32_t cpu_value = 0x11111111u;
+    constexpr uint32_t gpu_value = 0x22222222u;
+    using Watchdog = ShaderRecompiler::IR::LoopWatchdog;
+    std::vector<u32> code;
+    AppendEnd(&code);
+    RegisterDiagnosticShader(hash, code);
+
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "dump direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "dump fixed direct-memory mapping failed");
+    auto *memory = static_cast<uint32_t *>(mapped);
+    std::fill_n(memory, dump_size / sizeof(uint32_t), cpu_value);
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      const auto &buffer = cache.GetBuffer(cache.FindBuffer(base, dump_size));
+      // Uploaded, as the synchronization ahead of a DMA dispatch leaves it.
+      cache.SynchronizeBuffersInRange(base, dump_size);
+      // A DMA store: the cached buffer changes behind the tracker's back.
+      scheduler.Current().Handle().fillBuffer(buffer.Handle(), buffer.Offset(base), dump_size,
+                                              gpu_value);
+      vk::BufferMemoryBarrier barrier{};
+      barrier.sType = vk::StructureType::eBufferMemoryBarrier;
+      barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.buffer = buffer.Handle();
+      barrier.offset = buffer.Offset(base);
+      barrier.size = dump_size;
+      scheduler.Current().Handle().pipelineBarrier(
+          vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer, {}, 0,
+          nullptr, 1, &barrier, 0, nullptr);
+
+      const std::array<u32, 4> user_data{static_cast<u32>(base), static_cast<u32>(base >> 32u),
+                                         7u, 9u};
+      RecordDmaDispatch(hash, user_data, {{base, dump_size}});
+      auto *words = reinterpret_cast<u32 *>(
+          context.GetBufferCache().GetLoopWatchdogBuffer()->Mapped().data());
+      words[Watchdog::TripCount] = 1;
+      words[Watchdog::Claimed] = 1;
+      words[Watchdog::HashLow] = static_cast<u32>(hash);
+      words[Watchdog::HashHigh] = static_cast<u32>(hash >> 32u);
+      words[Watchdog::LoopPc] = 0x40;
+      ReportLoopWatchdog();
+
+      const auto folder = Config::GetShaderLogFolder() / "diagnostics";
+      const auto read_file = [](const std::filesystem::path &path) {
+        std::ifstream file(path, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(file), {});
+      };
+      const auto summary = read_file(folder / "00d15ea5e0000001_dispatch.txt");
+      const auto gpu = read_file(folder / "00d15ea5e0000001_mem_0207000000_gpu.bin");
+      const auto cpu = read_file(folder / "00d15ea5e0000001_mem_0207000000_cpu.bin");
+      const auto filled = [](const std::string &bytes, uint32_t value) {
+        if (bytes.size() != dump_size) {
+          return false;
+        }
+        for (size_t offset = 0; offset < bytes.size(); offset += sizeof(uint32_t)) {
+          uint32_t word = 0;
+          std::memcpy(&word, bytes.data() + offset, sizeof(word));
+          if (word != value) {
+            return false;
+          }
+        }
+        return true;
+      };
+      Require(name, "dump",
+              filled(gpu, gpu_value) && filled(cpu, cpu_value) &&
+                  summary.find("00000007") != std::string::npos &&
+                  summary.find("gpu differs from cpu") != std::string::npos,
+              "the dump did not hold the GPU buffer's and guest memory's bytes");
+      // An indirect dispatch sized in threads reads its counts from the GPU's copy, where a
+      // DMA store left them, not from guest memory.
+      std::array<uint32_t, 3> counts{};
+      Require(name, "GPU copy",
+              context.GetBufferCache().ReadGpuCopy(base + 16u, counts.data(),
+                                                   sizeof(counts)) &&
+                  counts == std::array<uint32_t, 3>{gpu_value, gpu_value, gpu_value},
+              "reading the cached copy did not return the bytes the GPU stored");
+      std::error_code error;
+      for (const auto *file : {"00d15ea5e0000001_dispatch.txt",
+                               "00d15ea5e0000001_writers.txt",
+                               "00d15ea5e0000001_mem_0207000000_gpu.bin",
+                               "00d15ea5e0000001_mem_0207000000_cpu.bin",
+                               "00d15ea5e0000001_loop_watchdog.bin",
+                               "00d15ea5e0000001_loop_watchdog.rdna2"}) {
+        std::filesystem::remove(folder / file, error);
+      }
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "dump direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "dump direct-memory allocation release failed");
     std::printf("[host]    %-32s ok\n", name);
   }
 
@@ -5659,6 +5963,35 @@ public:
               "its full guest range");
       (void)texture_cache.FindDepthTarget(layered_raw_d16_depth_image,
                                           layered_raw_d16_depth);
+
+      // A view reaching two faces of a six-face depth target sizes its stencil plane at two
+      // faces; the target keeps the plane of all six, as GTA V's cube shadow maps need.
+      auto six_face_depth = MakeLinearDesc(
+          base + 0x27e4000, sizeof(float) * 2 * 6, vk::Format::eD32SfloatS8Uint,
+          Prospero::BufferFormat::k32Float, Prospero::ImageType::kColor2D,
+          {2, 1, 1}, 6, sizeof(float), 1);
+      six_face_depth.type = BindingType::DepthTarget;
+      six_face_depth.info.stencil = {base + 0x27e5000, 2 * 6};
+      six_face_depth.view_info.aspect =
+          vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+      six_face_depth.view_info.layer_count = 6;
+      six_face_depth.view_info.usage =
+          vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      const auto six_face_image = texture_cache.FindImage(six_face_depth);
+      (void)texture_cache.FindDepthTarget(six_face_image, six_face_depth);
+      auto two_face_depth = six_face_depth;
+      two_face_depth.info.data.size = sizeof(float) * 2 * 2;
+      two_face_depth.info.stencil.size = 2 * 2;
+      two_face_depth.info.resources.layers = 2;
+      two_face_depth.info.mip_layout[0].size = two_face_depth.info.data.size;
+      two_face_depth.view_info.layer_count = 2;
+      const auto two_face_image = texture_cache.FindImage(two_face_depth);
+      (void)texture_cache.FindDepthTarget(two_face_image, two_face_depth);
+      Require(name, "layered stencil plane",
+              two_face_image == six_face_image &&
+                  texture_cache.GetImage(six_face_image).info.stencil ==
+                      six_face_depth.info.stencil,
+              "a two-face depth view shrank the six-face target's stencil plane");
 
       auto reacquired_layered_raw_d16_uint = layered_d16_color;
       reacquired_layered_raw_d16_uint.info.pixel_format = vk::Format::eR16Uint;
@@ -13026,7 +13359,8 @@ public:
 
   Buffer CreateStorageBuffer(const char *shader_name,
                              const std::vector<u32> &initial,
-                             size_t dword_count, bool device_address = false) {
+                             size_t dword_count, bool device_address = false,
+                             vk::BufferUsageFlags extra_usage = {}) {
     Buffer ret;
     ret.size = static_cast<vk::DeviceSize>(std::max<size_t>(dword_count, 1u) *
                                            sizeof(u32));
@@ -13034,7 +13368,7 @@ public:
     vk::BufferCreateInfo buffer_info{};
     buffer_info.sType = vk::StructureType::eBufferCreateInfo;
     buffer_info.size = ret.size;
-    buffer_info.usage = vk::BufferUsageFlagBits::eStorageBuffer;
+    buffer_info.usage = vk::BufferUsageFlagBits::eStorageBuffer | extra_usage;
     if (device_address) {
       buffer_info.usage |= vk::BufferUsageFlagBits::eShaderDeviceAddress;
     }
@@ -13414,7 +13748,7 @@ public:
     pipeline_layout_info.setLayoutCount = 1;
     pipeline_layout_info.pSetLayouts = &descriptor_layout;
     vk::PushConstantRange push_range{};
-    if (layout.UsesPushData()) {
+    if (layout.UsesPushData() || test.compute_info.dispatch_thread_dimensions) {
       push_range.stageFlags = vk::ShaderStageFlagBits::eCompute;
       push_range.offset = 0;
       push_range.size = ShaderRecompiler::IR::NativePushConstantSize;
@@ -13490,6 +13824,8 @@ public:
     std::vector<vk::DescriptorImageInfo> sampler_infos;
     Buffer flattened_buffer;
     Buffer user_data_buffer;
+    Buffer watchdog_buffer;
+    vk::DescriptorBufferInfo watchdog_info{};
     vk::DescriptorBufferInfo flattened_info{};
     vk::DescriptorBufferInfo user_data_info{};
     vk::DescriptorBufferInfo gds_info{};
@@ -13527,8 +13863,10 @@ public:
       for (u32 i = 0; i < buffer_infos.size(); i++) {
         auto &info = buffer_infos[i];
         info.buffer = buffer.buffer;
-        info.offset = 0;
-        info.range = buffer.size;
+        info.offset = i < compiled.buffer_binding_offsets.size()
+                          ? compiled.buffer_binding_offsets[i]
+                          : 0;
+        info.range = buffer.size - info.offset;
         if (test.storage_buffer_range_dwords != 0) {
           const auto offset = i < test.storage_buffer_offsets.size()
                                   ? test.storage_buffer_offsets[i]
@@ -13561,6 +13899,33 @@ public:
       write.descriptorCount = 1;
       write.descriptorType = vk::DescriptorType::eStorageBuffer;
       write.pBufferInfo = &flattened_info;
+      writes.push_back(write);
+    }
+    m_last_loop_watchdog.clear();
+    if (Binding(Kind::LoopWatchdog) != nullptr) {
+      using Watchdog = ShaderRecompiler::IR::LoopWatchdog;
+      std::vector<u32> watchdog_initial(Watchdog::DwordCount, 0u);
+      watchdog_initial[Watchdog::TickBudget] = test.watchdog_tick_budget;
+      if (test.watchdog_prior_trips != 0) {
+        // Another shader, in the slot after this one's, was cut first.
+        const auto own = Watchdog::Slot(compiled.program.shader_hash);
+        const auto other =
+            Watchdog::SlotBase + (own - Watchdog::SlotBase + Watchdog::SlotDwords) %
+                                     (Watchdog::SlotCount * Watchdog::SlotDwords);
+        watchdog_initial[Watchdog::TripCount] = test.watchdog_prior_trips;
+        watchdog_initial[Watchdog::Claimed] = 1;
+        watchdog_initial[other + Watchdog::SlotTrips] = test.watchdog_prior_trips;
+      }
+      watchdog_buffer =
+          CreateStorageBuffer(test.name, watchdog_initial, Watchdog::DwordCount);
+      watchdog_info = {watchdog_buffer.buffer, 0, watchdog_buffer.size};
+      vk::WriteDescriptorSet write{};
+      write.sType = vk::StructureType::eWriteDescriptorSet;
+      write.dstSet = descriptor_set;
+      write.dstBinding = Native(Kind::LoopWatchdog);
+      write.descriptorCount = 1;
+      write.descriptorType = vk::DescriptorType::eStorageBuffer;
+      write.pBufferInfo = &watchdog_info;
       writes.push_back(write);
     }
     if (const auto *user = Binding(Kind::ShaderData); user != nullptr) {
@@ -13744,7 +14109,47 @@ public:
       cmd.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
                         sizeof(push_data), push_data.dwords.data());
     }
+    if (test.compute_info.dispatch_thread_dimensions) {
+      // As the renderer does: thread counts follow the push data, ahead of the dispatch.
+      cmd.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+                        sizeof(test.compute_info.dispatch_threads_num),
+                        test.compute_info.dispatch_threads_num);
+    }
     cmd.dispatch(test.dispatch_x, test.dispatch_y, test.dispatch_z);
+
+    Buffer fault_readback;
+    if (uses_bda && !test.expected_fault_words.empty()) {
+      const auto count = test.expected_fault_words.size();
+      fault_readback =
+          CreateStorageBuffer(test.name, std::vector<u32>(count, 0u), count, false,
+                              vk::BufferUsageFlagBits::eTransferDst);
+      vk::BufferMemoryBarrier barrier{};
+      barrier.sType = vk::StructureType::eBufferMemoryBarrier;
+      barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.buffer = m_fault_buffer.buffer;
+      barrier.offset = 0;
+      barrier.size = m_fault_buffer.size;
+      cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+                          vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1,
+                          &barrier, 0, nullptr);
+      std::vector<vk::BufferCopy> copies;
+      for (size_t i = 0; i < count; i++) {
+        copies.emplace_back(test.expected_fault_words[i].first * sizeof(u32),
+                            i * sizeof(u32), sizeof(u32));
+      }
+      cmd.copyBuffer(m_fault_buffer.buffer, fault_readback.buffer,
+                     static_cast<u32>(copies.size()), copies.data());
+      barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      barrier.buffer = fault_readback.buffer;
+      barrier.size = fault_readback.size;
+      cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                          vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1,
+                          &barrier, 0, nullptr);
+    }
 
     if (buffers != nullptr) {
       vk::BufferMemoryBarrier barrier{};
@@ -13761,7 +14166,10 @@ public:
                           vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1,
                           &barrier, 0, nullptr);
     }
-    if (gds_buffer != nullptr) {
+    for (const Buffer *readback : {gds_buffer, &std::as_const(watchdog_buffer)}) {
+      if (readback == nullptr || readback->buffer == nullptr) {
+        continue;
+      }
       vk::BufferMemoryBarrier barrier{};
       barrier.sType = vk::StructureType::eBufferMemoryBarrier;
       barrier.srcAccessMask =
@@ -13769,14 +14177,26 @@ public:
       barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
       barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
       barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-      barrier.buffer = gds_buffer->buffer;
+      barrier.buffer = readback->buffer;
       barrier.offset = 0;
-      barrier.size = gds_buffer->size;
+      barrier.size = readback->size;
       cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
                           vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1,
                           &barrier, 0, nullptr);
     }
     EndSubmitAndFree(test.name, "dispatch", cmd);
+    m_last_fault_words.clear();
+    if (fault_readback.buffer != nullptr) {
+      m_last_fault_words = ReadBuffer(test.name, fault_readback,
+                                      test.expected_fault_words.size());
+      DestroyBuffer(&fault_readback);
+    }
+    if (watchdog_buffer.buffer != nullptr) {
+      m_last_loop_watchdog =
+          ReadBuffer(test.name, watchdog_buffer,
+                     ShaderRecompiler::IR::LoopWatchdog::DwordCount);
+      DestroyBuffer(&watchdog_buffer);
+    }
     if (flattened_buffer.buffer != nullptr) {
       DestroyBuffer(&flattened_buffer);
     }
@@ -16045,7 +16465,27 @@ private:
     vk::PhysicalDeviceFeatures2 available_features2{};
     available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
     available_features2.pNext = &available_min_lod;
+    u32 extension_count = 0;
+    RequireVk("VulkanHarness", "dispatch",
+              m_physical_device.enumerateDeviceExtensionProperties(
+                  nullptr, &extension_count, nullptr),
+              "vkEnumerateDeviceExtensionProperties");
+    std::vector<vk::ExtensionProperties> extensions(extension_count);
+    RequireVk("VulkanHarness", "dispatch",
+              m_physical_device.enumerateDeviceExtensionProperties(
+                  nullptr, &extension_count, extensions.data()),
+              "vkEnumerateDeviceExtensionProperties");
+    const bool clock_extension =
+        std::any_of(extensions.begin(), extensions.end(), [](const auto &extension) {
+          return std::strcmp(extension.extensionName, VK_KHR_SHADER_CLOCK_EXTENSION_NAME) == 0;
+        });
+    vk::PhysicalDeviceShaderClockFeaturesKHR available_clock{};
+    if (clock_extension) {
+      available_clock.pNext = available_features2.pNext;
+      available_features2.pNext = &available_clock;
+    }
     m_physical_device.getFeatures2(&available_features2);
+    g_device_clock = available_clock.shaderDeviceClock == VK_TRUE;
     Require("VulkanHarness", "dispatch",
             available_features.shaderStorageImageWriteWithoutFormat == true,
             "shaderStorageImageWriteWithoutFormat is not supported");
@@ -16135,15 +16575,22 @@ private:
     min_lod.pNext = &provoking_vertex;
     min_lod.minLod = true;
     device_info.pNext = &min_lod;
+    vk::PhysicalDeviceShaderClockFeaturesKHR shader_clock{};
+    if (g_device_clock) {
+      shader_clock.pNext = &min_lod;
+      shader_clock.shaderDeviceClock = true;
+      device_info.pNext = &shader_clock;
+    }
     vk::PhysicalDeviceFeatures device_features{};
     device_features.shaderStorageImageWriteWithoutFormat = true;
     device_features.shaderImageGatherExtended = true;
     device_features.sampleRateShading = true;
     device_features.shaderInt64 = true;
+    device_features.shaderFloat64 = available_features.shaderFloat64;
     device_features.fillModeNonSolid = true;
     device_features.tessellationShader = true;
     device_info.pEnabledFeatures = &device_features;
-    constexpr const char *device_extensions[] = {
+    std::vector<const char *> device_extensions = {
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
         VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME,
         VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
@@ -16154,8 +16601,11 @@ private:
         VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME,
         VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
         VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME};
-    device_info.enabledExtensionCount = std::size(device_extensions);
-    device_info.ppEnabledExtensionNames = device_extensions;
+    if (g_device_clock) {
+      device_extensions.push_back(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
+    }
+    device_info.enabledExtensionCount = static_cast<u32>(device_extensions.size());
+    device_info.ppEnabledExtensionNames = device_extensions.data();
     RequireVk("VulkanHarness", "dispatch",
               m_physical_device.createDevice(&device_info, nullptr, &m_device),
               "vkCreateDevice");
@@ -16401,7 +16851,8 @@ private:
     m_bda_pagetable_buffer =
         CreateDeviceBuffer(shader_name, BufferCache::BDA_PAGETABLE_SIZE, usage);
     m_fault_buffer = CreateDeviceBuffer(
-        shader_name, BufferCache::CACHING_NUMPAGES / 8, usage);
+        shader_name, BufferCache::CACHING_NUMPAGES / 8 * 2,
+        usage | vk::BufferUsageFlagBits::eTransferSrc);
   }
 
   Buffer CreateHostBuffer(const char *shader_name, vk::DeviceSize size,
@@ -16479,6 +16930,9 @@ private:
   vk::PhysicalDeviceMemoryProperties m_memory_properties{};
   Buffer m_bda_pagetable_buffer;
   Buffer m_fault_buffer;
+  // The loop watchdog buffer of the last dispatch; empty when its shader had no watched loop.
+  std::vector<u32> m_last_loop_watchdog;
+  std::vector<u32> m_last_fault_words;
   GraphicContext m_runtime_context{};
   std::unique_ptr<RenderContext> m_renderer;
 };
@@ -16613,6 +17067,46 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
                    needs_storage_image ? &storage_image_uint : nullptr,
                    sampler);
   auto actual = vulkan->ReadBuffer(test.name, buffer, test.expected.size());
+  {
+    using Watchdog = ShaderRecompiler::IR::LoopWatchdog;
+    const auto &watchdog = vulkan->LastLoopWatchdog();
+    const bool expect_trip = test.expected_watchdog_loop_pc != UINT32_MAX;
+    Require(test.name, "loop watchdog", !expect_trip || !watchdog.empty(),
+            "the shader has no watched loop");
+    if (!watchdog.empty()) {
+      const bool tripped = watchdog[Watchdog::TripCount] > test.watchdog_prior_trips;
+      Require(test.name, "loop watchdog", tripped == expect_trip,
+              expect_trip ? "the runaway loop was not cut short"
+                          : "a loop ran into the watchdog limit");
+      Require(test.name, "loop watchdog",
+              !expect_trip || test.watchdog_prior_trips != 0 ||
+                  (watchdog[Watchdog::Claimed] == 1u &&
+                               watchdog[Watchdog::LoopPc] ==
+                                   test.expected_watchdog_loop_pc),
+              "the watchdog did not record the runaway loop");
+      // The cut also counts in the shader's own slot, which ends only its loops.
+      const auto hash = compiled.program.shader_hash;
+      const auto slot = Watchdog::Slot(hash);
+      Require(test.name, "loop watchdog slot",
+              (watchdog[slot + Watchdog::SlotTrips] != 0) == expect_trip &&
+                  (!expect_trip ||
+                   (watchdog[slot + Watchdog::SlotHashLow] == static_cast<u32>(hash) &&
+                    watchdog[slot + Watchdog::SlotHashHigh] ==
+                        static_cast<u32>(hash >> 32u) &&
+                    watchdog[slot + Watchdog::SlotLoopPc] ==
+                        test.expected_watchdog_loop_pc)),
+              "the shader's watchdog slot did not record its cut");
+    }
+  }
+  if (!test.expected_fault_words.empty()) {
+    const auto &faults = vulkan->LastFaultWords();
+    for (size_t i = 0; i < test.expected_fault_words.size(); i++) {
+      const auto [index, value] = test.expected_fault_words[i];
+      Require(test.name, "fault buffer", i < faults.size() && faults[i] == value,
+              fmt::format("fault buffer DWORD {} is 0x{:08x}, expected 0x{:08x}", index,
+                          i < faults.size() ? faults[i] : 0u, value));
+    }
+  }
   if (!test.expected_gds.empty()) {
     const auto gds_actual =
         vulkan->ReadBuffer(test.name, gds_buffer, test.expected_gds.size());
@@ -16943,6 +17437,8 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::IMAGE_GATHER4_LZ_O:
   case Opcode::IMAGE_GATHER4_C_O:
   case Opcode::IMAGE_GATHER4_C_LZ_O:
+  case Opcode::IMAGE_BVH_INTERSECT_RAY:
+  case Opcode::IMAGE_BVH64_INTERSECT_RAY:
     return CoverageClass::NeedsImageCase;
 
   case Opcode::V_INTERP_P1_F32:
@@ -19158,6 +19654,29 @@ TestCase Vop1SdwaFfblCapturedHighWordSource() {
   return test;
 }
 
+// GTA V reverses the bits of a selected word: the other word must not reach the result.
+TestCase Vop1SdwaBfrevWord0Source() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendBufferLoadDword(&code, 2, 30);
+  code.push_back(0x7e2070f9u);
+  code.push_back(0x00040602u); // v_bfrev_b32 v16, v2.word0
+  AppendStoreVgpr(&code, 16, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Vop1SdwaBfrevWord0Source";
+  test.code = std::move(code);
+  test.initial = {0x12348001u};
+  test.expected = {0x80010000u};
+  test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_BFREV_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.decoded_counts = {{"V_BFREV_B32 v16, v2.sdwa(sel=4,sext=0)", 1}};
+  test.ir_counts = {{" = BitFieldUExtract ", 1}, {" = BitReverse32 ", 1}};
+  return test;
+}
+
 TestCase Vop1SdwaNotCapturedByte0Source() {
   using O = ShaderOpcode;
 
@@ -19879,6 +20398,259 @@ TestCase VectorMbcntUsesThreadMask() {
   test.has_compute_info = true;
   test.dispatch_x = 2;
   return test;
+}
+
+// A dispatch sized in threads ends in a partial workgroup whose lanes past the dispatch never run.
+// GTA V skinning relies on it: its unbounded vertex-range search never ends for those lanes.
+TestCase DispatchThreadDimensionsMaskPartialGroup() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code = {
+      EncodeVop1(0x01, 1, 4),                 // v_mov_b32 v1, s4 (workgroup id)
+      EncodeVop2(0x1a, 1, InlineU32(2), 1),   // v_lshlrev_b32 v1, 2, v1
+      EncodeVop2(0x25, 1, Vgpr(0), 1),        // v_add_nc_u32 v1, v0, v1 (global index)
+      EncodeVop2(0x25, 2, InlineU32(1), 1),   // v_add_nc_u32 v2, 1, v1
+      EncodeVop2(0x1a, 3, InlineU32(2), 1),   // v_lshlrev_b32 v3, 2, v1
+  };
+  AppendBufferStoreDword(&code, 2, 3);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DispatchThreadDimensionsMaskPartialGroup";
+  test.code = code;
+  test.expected = {1, 2, 3, 4, 5, 6, 0, 0};
+  test.opcodes = {O::V_MOV_B32, O::V_LSHLREV_B32, O::V_ADD_NC_U32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 4;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.group_id[0] = true;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.workgroup_register = 4;
+  test.compute_info.dispatch_thread_dimensions = true;
+  test.compute_info.dispatch_threads_num[0] = 6;
+  test.compute_info.dispatch_threads_num[1] = 1;
+  test.compute_info.dispatch_threads_num[2] = 1;
+  test.has_compute_info = true;
+  test.dispatch_x = 2;
+  return test;
+}
+
+// A loop that never ends for some lanes would hang the GPU until the device is lost. The watchdog
+// sends those lanes out through the loop's exit after the limit and records the loop.
+TestCase LoopWatchdogCutsRunawayLoop() {
+  using O = ShaderOpcode;
+  constexpr u32 Limit = ShaderRecompiler::IR::LoopWatchdog::IterationLimit;
+
+  std::vector<u32> code = {
+      EncodeVop1(0x01, 1, InlineU32(0)),      // v_mov_b32 v1, 0
+      EncodeSMovB32(10, 126),                 // s_mov_b32 s10, exec_lo
+      EncodeVop2(0x25, 1, InlineU32(1), 1),   // loop: v_add_nc_u32 v1, 1, v1
+      EncodeVopc(0xd5, InlineU32(0), 0),      // v_cmpx_ne_u32 exec, 0, v0 (lane 0 leaves)
+      EncodeSopp(0x09, 0xfffdu),              // s_cbranch_execnz loop
+      EncodeSMovB32(126, 10),                 // s_mov_b32 exec_lo, s10
+      EncodeVop2(0x1a, 3, InlineU32(2), 0),   // v_lshlrev_b32 v3, 2, v0
+  };
+  AppendBufferStoreDword(&code, 1, 3);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "LoopWatchdogCutsRunawayLoop";
+  test.code = code;
+  test.expected.assign(32, Limit);
+  test.expected[0] = 1;
+  test.opcodes = {O::V_MOV_B32,     O::S_MOV_B32,        O::V_ADD_NC_U32,
+                  O::V_CMPX_NE_U32, O::S_CBRANCH_EXECNZ, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.wave_size = 32;
+  test.compute_info.threads_num[0] = 32;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  test.expected_watchdog_loop_pc = 8;
+  return test;
+}
+
+// A loop that closes with an unconditional branch leaves only through the breaks in its body; the
+// watchdog takes the first one once the latch has counted the limit.
+TestCase LoopWatchdogCutsRunawayBranchLoop() {
+  using O = ShaderOpcode;
+  constexpr u32 Limit = ShaderRecompiler::IR::LoopWatchdog::IterationLimit;
+
+  std::vector<u32> code = {
+      EncodeVop1(0x01, 1, InlineU32(0)),      // v_mov_b32 v1, 0
+      EncodeSMovB32(10, 126),                 // s_mov_b32 s10, exec_lo
+      EncodeVopc(0xd5, InlineU32(0), 0),      // loop: v_cmpx_ne_u32 exec, 0, v0 (lane 0 leaves)
+      EncodeSopp(0x08, 2),                    // s_cbranch_execz done
+      EncodeVop2(0x25, 1, InlineU32(1), 1),   // v_add_nc_u32 v1, 1, v1
+      EncodeSopp(0x02, 0xfffcu),              // s_branch loop
+      EncodeSMovB32(126, 10),                 // done: s_mov_b32 exec_lo, s10
+      EncodeVop2(0x1a, 3, InlineU32(2), 0),   // v_lshlrev_b32 v3, 2, v0
+  };
+  AppendBufferStoreDword(&code, 1, 3);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "LoopWatchdogCutsRunawayBranchLoop";
+  test.code = code;
+  test.expected.assign(32, Limit);
+  test.expected[0] = 0;
+  test.opcodes = {O::V_MOV_B32,       O::S_MOV_B32, O::V_CMPX_NE_U32,
+                  O::S_CBRANCH_EXECZ, O::V_ADD_NC_U32, O::S_BRANCH,
+                  O::V_LSHLREV_B32,   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.wave_size = 32;
+  test.compute_info.threads_num[0] = 32;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  test.expected_watchdog_loop_pc = 8;
+  return test;
+}
+
+// A loop that runs long but ends is left alone, though the watchdog checks it many times.
+TestCase LoopWatchdogKeepsLongLoop() {
+  using O = ShaderOpcode;
+  constexpr u32 Iterations = 1u << 17;
+
+  std::vector<u32> code = {
+      EncodeVop1(0x01, 1, InlineU32(0)),      // v_mov_b32 v1, 0
+      EncodeSMovB32(10, 126),                 // s_mov_b32 s10, exec_lo
+  };
+  AppendSMovLiteral(&code, 11, Iterations);   // s_mov_b32 s11, Iterations
+  code.insert(code.end(), {
+      EncodeVop2(0x25, 1, InlineU32(1), 1),   // loop: v_add_nc_u32 v1, 1, v1
+      EncodeVopc(0xd5, 11, 1),                // v_cmpx_ne_u32 exec, s11, v1
+      EncodeSopp(0x09, 0xfffdu),              // s_cbranch_execnz loop
+      EncodeSMovB32(126, 10),                 // s_mov_b32 exec_lo, s10
+      EncodeVop2(0x1a, 3, InlineU32(2), 0),   // v_lshlrev_b32 v3, 2, v0
+  });
+  AppendBufferStoreDword(&code, 1, 3);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "LoopWatchdogKeepsLongLoop";
+  test.code = code;
+  test.expected.assign(32, Iterations);
+  test.opcodes = {O::V_MOV_B32,     O::S_MOV_B32,        O::V_ADD_NC_U32,
+                  O::V_CMPX_NE_U32, O::S_CBRANCH_EXECNZ, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.wave_size = 32;
+  test.compute_info.threads_num[0] = 32;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+// Another shader's runaway loop was cut before this dispatch. That cut ends only that shader's
+// loops: this one's long loop, which checks the watchdog every AbortCheckInterval iterations, still
+// runs to its end.
+TestCase LoopWatchdogIgnoresOtherShadersCuts() {
+  auto test = LoopWatchdogKeepsLongLoop();
+  test.name = "LoopWatchdogIgnoresOtherShadersCuts";
+  test.watchdog_prior_trips = 1;
+  return test;
+}
+
+// A runaway loop entered at two points has no structured form, so the shader runs through the
+// dispatcher. The watchdog counts the block that branches back and ends the invocations once they
+// reach the limit: the marker stored before the loop stays, and the loop is recorded.
+TestCase LoopWatchdogCutsDispatcherLoop() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code = {
+      EncodeVop1(0x01, 1, InlineU32(0)),      // v_mov_b32 v1, 0
+      EncodeVop2(0x1a, 3, InlineU32(2), 0),   // v_lshlrev_b32 v3, 2, v0
+      EncodeVop2(0x25, 2, InlineU32(1), 0),   // v_add_nc_u32 v2, 1, v0
+  };
+  AppendBufferStoreDword(&code, 2, 3);
+  code.push_back(EncodeSMovB32(10, 126));     // s_mov_b32 s10, exec_lo
+  code.push_back(EncodeSopp(0x05, 1));        // s_cbranch_scc1 B (SCC is zero: falls into A)
+  const auto loop_pc = static_cast<u32>(code.size() * 4u);
+  code.insert(code.end(), {
+      EncodeVop2(0x25, 1, InlineU32(1), 1),   // A: v_add_nc_u32 v1, 1, v1
+      EncodeVopc(0xd5, InlineU32(0), 0),      // B: v_cmpx_ne_u32 exec, 0, v0 (lane 0 leaves)
+      EncodeSopp(0x09, 0xfffdu),              // s_cbranch_execnz A
+      EncodeSMovB32(126, 10),                 // s_mov_b32 exec_lo, s10
+  });
+  AppendBufferStoreDword(&code, 1, 3);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "LoopWatchdogCutsDispatcherLoop";
+  test.code = code;
+  test.expected.resize(32);
+  for (u32 lane = 0; lane < 32; ++lane) {
+    test.expected[lane] = lane + 1u;
+  }
+  test.opcodes = {O::V_MOV_B32,      O::V_LSHLREV_B32, O::V_ADD_NC_U32,
+                  O::BUFFER_STORE_DWORD, O::S_MOV_B32, O::S_CBRANCH_SCC1,
+                  O::V_CMPX_NE_U32,  O::S_CBRANCH_EXECNZ, O::S_ENDPGM};
+  test.compute_info.wave_size = 32;
+  test.compute_info.threads_num[0] = 32;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  test.expected_watchdog_loop_pc = loop_pc;
+  return test;
+}
+
+// With a shader clock, a loop whose iterations are slow is cut once it outlasts its tick budget,
+// long before the iteration limit: with no budget at all, at the first abort check.
+TestCase LoopWatchdogCutsLoopOverTimeBudget() {
+  auto test = LoopWatchdogCutsRunawayLoop();
+  test.name = "LoopWatchdogCutsLoopOverTimeBudget";
+  test.expected.assign(32, ShaderRecompiler::IR::LoopWatchdog::AbortCheckInterval);
+  test.expected[0] = 1;
+  test.watchdog_tick_budget = 0;
+  return test;
+}
+
+TestCase LoopWatchdogCutsBranchLoopOverTimeBudget() {
+  auto test = LoopWatchdogCutsRunawayBranchLoop();
+  test.name = "LoopWatchdogCutsBranchLoopOverTimeBudget";
+  test.expected.assign(32, ShaderRecompiler::IR::LoopWatchdog::AbortCheckInterval);
+  test.expected[0] = 0;
+  test.watchdog_tick_budget = 0;
+  return test;
+}
+
+// The tick budget runs on the device clock from the first abort check, so a budget of one tick
+// lets a runaway loop through that check and cuts it at a later one.
+void CheckLoopWatchdogTimesLoops(VulkanHarness *vulkan) {
+  using Watchdog = ShaderRecompiler::IR::LoopWatchdog;
+  if (!g_device_clock) {
+    std::printf("[gpu]     %-32s skipped: no shader device clock\n", "LoopWatchdogTimesLoops");
+    return;
+  }
+  RunCase(vulkan, LoopWatchdogCutsLoopOverTimeBudget());
+  RunCase(vulkan, LoopWatchdogCutsBranchLoopOverTimeBudget());
+  auto test = LoopWatchdogCutsRunawayLoop();
+  test.name = "LoopWatchdogTimesLoops";
+  test.watchdog_tick_budget = 1;
+  const auto compiled = CompileCase(test, 32);
+  auto buffer = vulkan->CreateStorageBuffer(test.name, {}, test.expected.size());
+  vulkan->Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, nullptr);
+  const auto lanes = vulkan->ReadBuffer(test.name, buffer, test.expected.size());
+  vulkan->DestroyBuffer(&buffer);
+  bool cut_after_first_check = lanes[0] == 1;
+  for (size_t lane = 1; lane < lanes.size(); lane++) {
+    cut_after_first_check &= lanes[lane] > Watchdog::AbortCheckInterval &&
+                             lanes[lane] < Watchdog::IterationLimit &&
+                             lanes[lane] % Watchdog::AbortCheckInterval == 0;
+  }
+  Require(test.name, "loop watchdog", cut_after_first_check,
+          "the runaway loop was not cut at an abort check after the first");
+  const auto &watchdog = vulkan->LastLoopWatchdog();
+  Require(test.name, "loop watchdog",
+          !watchdog.empty() && watchdog[Watchdog::TripCount] != 0 &&
+              watchdog[Watchdog::Claimed] == 1u && watchdog[Watchdog::LoopPc] == 8u,
+          "the watchdog did not record the timed-out loop");
+  std::printf("[gpu]     %-32s ok (cut after %u iterations)\n", test.name, lanes[1]);
 }
 
 TestCase VectorAddcUsesPerLaneCarryIn() {
@@ -23415,6 +24187,40 @@ TestCase BufferLoadDwordx2SnapshotsOverlappingAddress() {
   return test;
 }
 
+// A polled GLC pair, such as the status and sum a decoupled look-back scan publishes with one
+// 64-bit atomic, is read with one 64-bit atomic load, so it cannot tear.
+TestCase CoherentBufferLoadDwordx2IsOneAccess() {
+  auto test = BufferLoadDwordx2SnapshotsOverlappingAddress();
+  test.name = "CoherentBufferLoadDwordx2IsOneAccess";
+  std::ranges::replace(test.code, EncodeMubuf0(0x0du, 0, true, true),
+                       EncodeMubuf0(0x0du, 0, true, true, true));
+  test.required_spirv = {"OpAtomicLoad"};
+  return test;
+}
+
+// A GLC pair at an address that is not 8-byte aligned is still read, as two dword loads.
+TestCase CoherentBufferLoadDwordx2Unaligned() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 21, 4);
+  code.push_back(EncodeMubuf0(0x0du, 0, false, true, true));
+  code.push_back(EncodeMubuf1(22, 0, 21));
+  AppendVMovU32(&code, 24, 12);
+  AppendBufferStoreDword(&code, 22, 24);
+  AppendVMovU32(&code, 24, 16);
+  AppendBufferStoreDword(&code, 23, 24);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "CoherentBufferLoadDwordx2Unaligned";
+  test.code = std::move(code);
+  test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0, 0};
+  test.expected = {0x11111111u, 0x22222222u, 0x33333333u, 0x22222222u, 0x33333333u};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORDX2, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase BufferLoadDwordx3SnapshotsOverlappingAddress() {
   using O = ShaderOpcode;
 
@@ -23463,7 +24269,9 @@ TestCase BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail() {
   return test;
 }
 
-TestCase BufferLoadsGpuSelectedDescriptors() {
+// Every variant reads the same six DWORDs: x4 + x2 (width 4), x3 + x3 (width 3), or six
+// single DWORD loads (width 1).
+TestCase BufferLoadsGpuSelectedDescriptors(u32 width) {
   using O = ShaderOpcode;
   constexpr uint64_t GuestBase = 0x0000000110000000ull;
   struct DescriptorCase {
@@ -23473,6 +24281,8 @@ TestCase BufferLoadsGpuSelectedDescriptors() {
   };
   const DescriptorCase cases[] = {
       {24, 2, 0, 0, false, true, {7, 8, 9, 10, 11, 12}},
+      // PPSA01417 selects XYZ vertices from a table of stride-16 descriptors.
+      {16, 2, 0, 0, false, true, {5, 6, 7, 8, 0, 0}},
       {12, 2, 0, 0, false, true, {4, 5, 6, 0, 0, 0}},
       {12, 2, 1, 0, false, true, {4, 5, 6, 7, 8, 9}},
       {12, 1, 2, 0, false, true, {4, 5, 6, 7, 8, 9}},
@@ -23486,7 +24296,16 @@ TestCase BufferLoadsGpuSelectedDescriptors() {
       {12, 4, 3, 4, true, true, {}},
   };
   TestCase test;
-  test.name = "BufferLoadsGpuSelectedDescriptors";
+  test.name = width == 1   ? "BufferLoadDwordGpuSelectedDescriptors"
+              : width == 3 ? "BufferLoadDwordx3GpuSelectedDescriptors"
+                           : "BufferLoadsGpuSelectedDescriptors";
+  struct Load {
+    u32 opcode, dwords;
+  };
+  const std::vector<Load> loads =
+      width == 1   ? std::vector<Load>(6, Load{0x0c, 1})
+      : width == 3 ? std::vector<Load>{{0x0f, 3}, {0x0f, 3}}
+                   : std::vector<Load>{{0x0e, 4}, {0x0d, 2}};
   test.initial.resize(2048);
   for (u32 i = 0; i < std::size(cases); ++i) {
     const auto &input = cases[i];
@@ -23512,10 +24331,12 @@ TestCase BufferLoadsGpuSelectedDescriptors() {
     test.code.push_back(EncodeSmem1(520, 20));
     AppendSMovLiteral(&test.code, 22, cases[selected].soffset);
     AppendVMovU32(&test.code, 21, 1);
-    test.code.push_back(EncodeMubuf0(0x0e, 0, true, false));
-    test.code.push_back(EncodeMubuf1(0, 2, 21, 22));
-    test.code.push_back(EncodeMubuf0(0x0d, 16, true, false));
-    test.code.push_back(EncodeMubuf1(4, 2, 21, 22));
+    u32 dword = 0;
+    for (const auto &load : loads) {
+      test.code.push_back(EncodeMubuf0(load.opcode, dword * 4, true, false));
+      test.code.push_back(EncodeMubuf1(dword, 2, 21, 22));
+      dword += load.dwords;
+    }
     for (u32 component = 0; component < 6; ++component) {
       AppendStoreVgpr(&test.code, component, i * 6 + component);
       const u32 expected = cases[selected].expected[component];
@@ -23526,9 +24347,997 @@ TestCase BufferLoadsGpuSelectedDescriptors() {
   test.bda_mappings = {{GuestBase, 0}};
   test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
                   O::V_READFIRSTLANE_B32, O::S_MUL_I32, O::S_BUFFER_LOAD_DWORDX4,
-                  O::BUFFER_LOAD_DWORDX4, O::BUFFER_LOAD_DWORDX2,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  if (width == 3) {
+    test.opcodes.push_back(O::BUFFER_LOAD_DWORDX3);
+  } else if (width == 4) {
+    test.opcodes.insert(test.opcodes.end(), {O::BUFFER_LOAD_DWORDX4, O::BUFFER_LOAD_DWORDX2});
+  }
   test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer"};
+  return test;
+}
+
+TestCase BufferLoadsGpuSelectedDescriptors() {
+  return BufferLoadsGpuSelectedDescriptors(4);
+}
+
+TestCase BufferLoadDwordx3GpuSelectedDescriptors() {
+  return BufferLoadsGpuSelectedDescriptors(3);
+}
+
+TestCase BufferLoadDwordGpuSelectedDescriptors() {
+  return BufferLoadsGpuSelectedDescriptors(1);
+}
+
+// A GPU failure report dumps the shaders it names; the dump must work from the registered copy.
+void CheckDiagnosticShaderDump() {
+  constexpr const char *Name = "DiagnosticShaderDump";
+  constexpr uint64_t Hash = 0x0123456789abcdefull;
+  std::vector<u32> code;
+  AppendVMovU32(&code, 0, 7);
+  AppendEnd(&code);
+  RegisterDiagnosticShader(Hash, code);
+  const auto code_bytes = code.size() * sizeof(u32);
+  code.clear(); // the registry keeps its own copy
+  DumpDiagnosticShader(Hash, "selftest");
+  const auto base =
+      Config::GetShaderLogFolder() / "diagnostics" / "0123456789abcdef_selftest";
+  auto bin = base;
+  bin += ".bin";
+  auto listing = base;
+  listing += ".rdna2";
+  std::error_code error;
+  Require(Name, "binary", std::filesystem::file_size(bin, error) == code_bytes,
+          "dumped binary is missing or has the wrong size");
+  Require(Name, "listing", std::filesystem::file_size(listing, error) > 0,
+          "decoded listing is missing or empty");
+  std::filesystem::remove(bin, error);
+  std::filesystem::remove(listing, error);
+  std::printf("[host]    %-32s ok\n", Name);
+}
+
+// Raw DWORD loads and stores through a GPU-selected descriptor translate to BDA accesses. An atomic,
+// a formatted load or an image read has no BDA path, so translation skips its compute dispatch
+// instead of exiting.
+void CheckGpuSelectedAccesses() {
+  constexpr const char *Name = "GpuSelectedAccesses";
+  struct Access {
+    const char *stage;
+    u32 opcode;
+    bool skip;
+    bool writes;
+    bool image;
+  };
+  const Access accesses[] = {{"load", 0x0c, false, false, false},
+                             {"store", 0x1c, false, true, false},
+                             {"atomic", 0x32, false, true, false},
+                             {"formatted load", 0x00, false, false, false},
+                             {"image load", 0x00, false, false, true}};
+  for (const auto &access : accesses) {
+    std::vector<u32> code;
+    AppendVMovU32(&code, 30, 64 * 4);
+    AppendBufferLoadDword(&code, 0, 30);
+    code.push_back(EncodeVop1(0x02, 20, Vgpr(0)));
+    code.push_back(EncodeSop2(0x26, 20, 20, 255)); // s_mul_i32 s20, s20, 120
+    code.push_back(120);
+    // s_buffer_load_dwordx4 s[8:11] (or _dwordx8 s[8:15] for an image), s[0:3], s20
+    code.push_back(EncodeSmem0(access.image ? 0x0b : 0x0a, 8, 0));
+    code.push_back(EncodeSmem1(520, 20));
+    AppendSMovLiteral(&code, 22, 0);
+    AppendVMovU32(&code, 21, 1);
+    // The access uses v1 through the selected descriptor at s8.
+    if (access.image) {
+      code.push_back(EncodeMimg0(access.opcode, 0x1));
+      code.push_back(EncodeMimg1(1, 21, 2));
+    } else {
+      code.push_back(EncodeMubuf0(access.opcode, 0, true, false));
+      code.push_back(EncodeMubuf1(1, 2, 21, 22));
+    }
+    if (!access.writes && access.opcode != 0x32) {
+      AppendStoreVgpr(&code, 1, 0);
+    }
+    AppendEnd(&code);
+
+    auto user_data = MakeNativeUserData(nullptr);
+    user_data[2] = 4096;
+    ShaderComputeInputInfo compute{};
+    compute.lds_size_dwords = 1024;
+    ShaderRecompiler::CompileOptions options;
+    options.stage = ShaderType::Compute;
+    options.input_info.compute = &compute;
+    options.user_data = user_data;
+    const auto translated = ShaderRecompiler::TranslateProgram(code, options);
+    Require(Name, access.stage, translated.skip_dispatch == access.skip,
+            access.skip ? "unsupported GPU-selected access did not skip its dispatch"
+                        : "GPU-selected raw access skipped its dispatch");
+    Require(Name, access.stage,
+            access.skip ||
+                translated.program.info.indirect_buffer_writes == access.writes,
+            "GPU-selected write flag does not match the access");
+  }
+  std::printf("[host]    %-32s ok\n", Name);
+}
+
+// Raw DWORD stores through GPU-selected descriptors reach guest memory through the BDA page table,
+// with the per-DWORD bounds checks raw loads use.
+TestCase BufferStoresGpuSelectedDescriptors() {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  constexpr u32 Sentinel = 0xaaaa0000u;
+  constexpr u32 RegionDwords = 16;
+  struct StoreCase {
+    u32 stride;
+    bool bound;
+    bool single; // BUFFER_STORE_DWORDs at offsets 0 and 8, not one BUFFER_STORE_DWORDX4
+    std::array<int, 4> written; // region DWORD each value lands in; -1 when dropped
+  };
+  const StoreCase cases[] = {
+      {16, true, false, {4, 5, 6, 7}},
+      // The fourth DWORD starts at the stride and fails the structured bounds check.
+      {12, true, false, {3, 4, 5, -1}},
+      {24, true, true, {6, 8, -1, -1}},
+      // A descriptor without a data format drops every store.
+      {16, false, false, {-1, -1, -1, -1}},
+  };
+  TestCase test;
+  test.name = "BufferStoresGpuSelectedDescriptors";
+  test.initial.resize(2048);
+  const u32 output_dwords = static_cast<u32>(std::size(cases)) * RegionDwords;
+  for (u32 dword = 0; dword < output_dwords; ++dword) {
+    test.initial[dword] = Sentinel | dword;
+  }
+  test.expected.assign(test.initial.begin(), test.initial.begin() + output_dwords);
+  for (u32 i = 0; i < std::size(cases); ++i) {
+    const auto &input = cases[i];
+    // Each descriptor addresses its own output region; index 1 skips one stride into it.
+    const std::array<u32, 4> descriptor{
+        static_cast<u32>(GuestBase + i * RegionDwords * 4u), (input.stride << 16u) | 1u, 2u,
+        input.bound ? 0x5204u : 0x204u};
+    std::copy(descriptor.begin(), descriptor.end(), test.initial.begin() + 130 + i * 30);
+    test.initial[64 + i] = i;
+    AppendVMovU32(&test.code, 30, (64 + i) * 4);
+    AppendBufferLoadDword(&test.code, 0, 30);
+    test.code.push_back(EncodeVop1(0x02, 20, Vgpr(0)));
+    test.code.push_back(EncodeSop2(0x26, 20, 20, 255)); // s_mul_i32 s20, s20, 120
+    test.code.push_back(120);
+    test.code.push_back(EncodeSmem0(0x0a, 8, 0));
+    test.code.push_back(EncodeSmem1(520, 20));
+    AppendSMovLiteral(&test.code, 22, 0);
+    AppendVMovU32(&test.code, 21, 1);
+    std::array<u32, 4> values{};
+    for (u32 component = 0; component < 4; ++component) {
+      values[component] = (i + 1) * 0x100u + component + 1;
+      AppendVMovLiteral(&test.code, 1 + component, values[component]);
+    }
+    if (input.single) {
+      test.code.push_back(EncodeMubuf0(0x1c, 0, true, false));
+      test.code.push_back(EncodeMubuf1(1, 2, 21, 22));
+      test.code.push_back(EncodeMubuf0(0x1c, 8, true, false));
+      test.code.push_back(EncodeMubuf1(2, 2, 21, 22));
+    } else {
+      test.code.push_back(EncodeMubuf0(0x1e, 0, true, false));
+      test.code.push_back(EncodeMubuf1(1, 2, 21, 22));
+    }
+    for (u32 component = 0; component < 4; ++component) {
+      if (input.written[component] >= 0) {
+        test.expected[i * RegionDwords + input.written[component]] = values[component];
+      }
+    }
+  }
+  AppendEnd(&test.code);
+  test.bda_mappings = {{GuestBase, 0}};
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
+                  O::V_READFIRSTLANE_B32, O::S_MUL_I32, O::S_BUFFER_LOAD_DWORDX4,
+                  O::BUFFER_STORE_DWORD, O::BUFFER_STORE_DWORDX4, O::S_ENDPGM};
+  test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer"};
+  return test;
+}
+
+// Buffer atomics through a GPU-selected descriptor reach guest memory through the BDA page table:
+// each lane adds to its own DWORD and gets the old value back, and every lane ORs its bit into one
+// shared DWORD.
+TestCase BufferAtomicsGpuSelectedDescriptors() {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  constexpr u32 Sentinel = 0xaaaa0000u;
+  constexpr u32 Lanes = 32;
+  constexpr u32 Shared = 32;
+  constexpr u32 Returned = 96;
+  TestCase test;
+  test.name = "BufferAtomicsGpuSelectedDescriptors";
+  test.initial.resize(2048);
+  for (u32 dword = 0; dword < Lanes; ++dword) {
+    test.initial[dword] = Sentinel | dword;
+  }
+  test.initial[Shared] = 0x100u;
+  const std::array<u32, 4> descriptor{static_cast<u32>(GuestBase),
+                                      static_cast<u32>(GuestBase >> 32u), 4096u, 0x30014204u};
+  std::copy(descriptor.begin(), descriptor.end(), test.initial.begin() + 130);
+  test.expected.assign(test.initial.begin(), test.initial.begin() + Returned + Lanes);
+  for (u32 lane = 0; lane < Lanes; ++lane) {
+    test.expected[lane] = (Sentinel | lane) + lane + 1u;
+    test.expected[Returned + lane] = Sentinel | lane;
+  }
+  test.expected[Shared] = 0xffffffffu;
+  test.code = {
+      EncodeVop2(0x1a, 3, InlineU32(2), 0),   // v_lshlrev_b32 v3, 2, v0
+      EncodeVop2(0x25, 5, InlineU32(1), 0),   // v_add_nc_u32 v5, 1, v0
+      EncodeVop1(0x01, 7, InlineU32(1)),      // v_mov_b32 v7, 1
+      EncodeVop2(0x1a, 6, Vgpr(0), 7),        // v_lshlrev_b32 v6, v0, v7
+  };
+  AppendVMovU32(&test.code, 8, Shared * 4u);
+  // The descriptor index is loaded, so the descriptor is only known on the GPU.
+  AppendVMovU32(&test.code, 30, 64 * 4);
+  AppendBufferLoadDword(&test.code, 10, 30);
+  test.code.push_back(EncodeVop1(0x02, 20, Vgpr(10)));  // v_readfirstlane_b32 s20, v10
+  test.code.push_back(EncodeSop2(0x26, 20, 20, 255));   // s_mul_i32 s20, s20, 120
+  test.code.push_back(120);
+  test.code.push_back(EncodeSmem0(0x0a, 8, 0));         // s_buffer_load_dwordx4 s[8:11]
+  test.code.push_back(EncodeSmem1(520, 20));
+  // buffer_atomic_add v5, v3, s[8:11] offen glc
+  test.code.push_back(EncodeMubuf0(0x32, 0, false, true, true));
+  test.code.push_back(EncodeMubuf1(5, 2, 3));
+  // buffer_atomic_or v6, v8, s[8:11] offen
+  test.code.push_back(EncodeMubuf0(0x3a, 0, false, true));
+  test.code.push_back(EncodeMubuf1(6, 2, 8));
+  AppendStoreVgprAtLaneDwordOffset(&test.code, 5, 0, Returned);
+  AppendEnd(&test.code);
+  test.bda_mappings = {{GuestBase, 0}};
+  test.opcodes = {O::V_LSHLREV_B32,      O::V_ADD_NC_U32,          O::V_MOV_B32,
+                  O::BUFFER_LOAD_DWORD,  O::V_READFIRSTLANE_B32,   O::S_MUL_I32,
+                  O::S_BUFFER_LOAD_DWORDX4, O::BUFFER_ATOMIC_ADD, O::BUFFER_ATOMIC_OR,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpConvertUToPtr", "OpAtomicIAdd", "OpAtomicOr"};
+  test.compute_info.wave_size = 32;
+  test.compute_info.threads_num[0] = Lanes;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+// Formatted loads through GPU-selected descriptors decode the descriptor's format at run time: an
+// R16 index buffer with an out-of-bounds lane, RGB32 floats with W from the "one" selector, RGBA8
+// UNORM read back swizzled with out-of-bounds lanes, and RG16 SNORM including the -1 clamp.
+TestCase BufferFormattedLoadsGpuSelectedDescriptors() {
+  using O = ShaderOpcode;
+  using Prospero::BufferFormat;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  constexpr u32 Lanes = 8;
+  constexpr u32 Outputs = 11;
+  const auto f = [](float value) { return std::bit_cast<u32>(value); };
+  const auto word3 = [](BufferFormat format, u32 x, u32 y, u32 z, u32 w) {
+    return x | (y << 3u) | (z << 6u) | (w << 9u) | (static_cast<u32>(format) << 12u);
+  };
+  struct Region {
+    u32 dword;
+    u32 stride;
+    u32 records;
+    u32 word3;
+  };
+  const std::array<Region, 4> regions{{
+      {256, 2, 7, word3(BufferFormat::k16UInt, 4, 0, 0, 1)},
+      {300, 12, 8, word3(BufferFormat::k32_32_32Float, 4, 5, 6, 1)},
+      {400, 4, 6, word3(BufferFormat::k8_8_8_8UNorm, 6, 5, 4, 7)},
+      {420, 4, 8, word3(BufferFormat::k16_16SNorm, 4, 5, 0, 0)},
+  }};
+
+  TestCase test;
+  test.name = "BufferFormattedLoadsGpuSelectedDescriptors";
+  test.initial.resize(2048);
+  const std::array<u32, Lanes> halves{0x0001, 0x8000, 0xffff, 0x1234, 0x00ff, 0x7fff, 0x4321, 0xabcd};
+  for (u32 lane = 0; lane < Lanes; ++lane) {
+    auto &packed = test.initial[256 + lane / 2];
+    packed |= halves[lane] << ((lane & 1u) * 16u);
+    test.initial[300 + lane * 3 + 0] = f(lane + 0.5f);
+    test.initial[300 + lane * 3 + 1] = f(-static_cast<float>(lane));
+    test.initial[300 + lane * 3 + 2] = f(lane * 2.0f);
+    // Exact UNORM values only: 0 and 255.
+    const u32 r = (lane & 1u) ? 255u : 0u;
+    const u32 g = (lane & 2u) ? 255u : 0u;
+    const u32 b = (lane & 4u) ? 255u : 0u;
+    test.initial[400 + lane] = r | (g << 8u) | (b << 16u) | (255u << 24u);
+    const std::array<std::pair<int16_t, int16_t>, 4> snorm{
+        {{32767, -32768}, {0, -32767}, {-32767, 32767}, {-32768, 0}}};
+    const auto [sx, sy] = snorm[lane % 4];
+    test.initial[420 + lane] = static_cast<uint16_t>(sx) | (static_cast<u32>(static_cast<uint16_t>(sy)) << 16u);
+  }
+  const auto snorm_value = [](int16_t v) {
+    return v == 0 ? 0.0f : (v > 0 ? 1.0f : -1.0f);
+  };
+  test.expected.assign(test.initial.begin(), test.initial.begin() + Lanes * Outputs);
+  for (u32 lane = 0; lane < Lanes; ++lane) {
+    std::array<u32, Outputs> out{};
+    out[0] = lane < 7 ? halves[lane] : 0u;
+    out[1] = f(lane + 0.5f);
+    out[2] = f(-static_cast<float>(lane));
+    out[3] = f(lane * 2.0f);
+    out[4] = f(1.0f);
+    const bool rgba_in = lane < 6;
+    out[5] = rgba_in && (lane & 4u) ? f(1.0f) : 0u;  // b
+    out[6] = rgba_in && (lane & 2u) ? f(1.0f) : 0u;  // g
+    out[7] = rgba_in && (lane & 1u) ? f(1.0f) : 0u;  // r
+    out[8] = rgba_in ? f(1.0f) : 0u;                  // a
+    const std::array<std::pair<int16_t, int16_t>, 4> snorm{
+        {{32767, -32768}, {0, -32767}, {-32767, 32767}, {-32768, 0}}};
+    out[9] = f(snorm_value(snorm[lane % 4].first));
+    out[10] = f(snorm_value(snorm[lane % 4].second));
+    for (u32 k = 0; k < Outputs; ++k) {
+      test.expected[k * Lanes + lane] = out[k];
+    }
+  }
+  for (u32 i = 0; i < regions.size(); ++i) {
+    const auto &region = regions[i];
+    const std::array<u32, 4> descriptor{
+        static_cast<u32>(GuestBase + region.dword * 4u),
+        static_cast<u32>(GuestBase >> 32u) | (region.stride << 16u), region.records,
+        region.word3};
+    std::copy(descriptor.begin(), descriptor.end(), test.initial.begin() + 130 + i * 4);
+  }
+  test.initial[64] = 0;
+  AppendVMovU32(&test.code, 30, 64 * 4);
+  AppendBufferLoadDword(&test.code, 29, 30);
+  test.code.push_back(EncodeVop1(0x02, 40, Vgpr(29)));  // v_readfirstlane_b32 s40, v29
+  for (u32 i = 0; i < 4; ++i) {
+    // s_buffer_load_dwordx4 s[20 + 4i : 23 + 4i], s[0:3], s40 offset:520 + 16i
+    test.code.push_back(EncodeSmem0(0x0a, 20 + i * 4, 0));
+    test.code.push_back(EncodeSmem1(520 + i * 16, 40));
+  }
+  // buffer_load_format_{x, xyzw, xyzw, xy} through the selected descriptors, indexed by lane.
+  const std::array<std::pair<u32, u32>, 4> loads{{{0x00, 10}, {0x03, 11}, {0x03, 15}, {0x01, 19}}};
+  for (u32 i = 0; i < 4; ++i) {
+    test.code.push_back(EncodeMubuf0(loads[i].first, 0, true, false));
+    test.code.push_back(EncodeMubuf1(loads[i].second, 5 + i, 0));
+  }
+  // Output k of a lane goes to DWORD k * Lanes + lane.
+  test.code.push_back(EncodeVop2(0x1a, 31, InlineU32(2), 0));  // v_lshlrev_b32 v31, 2, v0
+  for (u32 k = 0; k < Outputs; ++k) {
+    test.code.push_back(EncodeMubuf0(0x1c, k * Lanes * 4, false, true));
+    test.code.push_back(EncodeMubuf1(10 + k, 12, 31));
+  }
+  AppendEnd(&test.code);
+  test.bda_mappings = {{GuestBase, 0}};
+  test.opcodes = {O::V_MOV_B32,            O::BUFFER_LOAD_DWORD,   O::V_READFIRSTLANE_B32,
+                  O::S_BUFFER_LOAD_DWORDX4, O::BUFFER_LOAD_FORMAT_X, O::BUFFER_LOAD_FORMAT_XY,
+                  O::BUFFER_LOAD_FORMAT_XYZW, O::V_LSHLREV_B32,    O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer"};
+  test.compute_info.wave_size = 32;
+  test.compute_info.threads_num[0] = Lanes;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+// The double-precision hash GTA V's ray-tracing shaders use (fract(i * K + f) back to float, with
+// K in an SGPR pair and also a float inline constant), a 64-bit integer compare in VOP3 form and an
+// SDWA 16-bit signed compare-to-EXEC on the high words.
+TestCase Float64HashAndWideCompares() {
+  using O = ShaderOpcode;
+  constexpr u32 Lanes = 8;
+  constexpr double K = 0.1234567891234;
+  const auto K_bits = std::bit_cast<uint64_t>(K);
+  TestCase test;
+  test.name = "Float64HashAndWideCompares";
+  test.initial.resize(128);
+  std::array<int32_t, Lanes> ints{};
+  std::array<float, Lanes> floats{};
+  for (u32 lane = 0; lane < Lanes; ++lane) {
+    ints[lane] = static_cast<int32_t>(lane * 1000u) - 3493;
+    floats[lane] = static_cast<float>(lane) * 0.25f - 1.0f;
+    test.initial[64 + lane] = static_cast<u32>(ints[lane]);
+    test.initial[80 + lane] = std::bit_cast<u32>(floats[lane]);
+    test.initial[96 + lane] =
+        0x1234u | (static_cast<u32>(static_cast<uint16_t>(static_cast<int16_t>(lane) - 4)) << 16u);
+  }
+  test.expected.assign(test.initial.begin(), test.initial.begin() + 6 * Lanes);
+  for (u32 lane = 0; lane < Lanes; ++lane) {
+    const double x = std::fma(static_cast<double>(ints[lane]), K, static_cast<double>(floats[lane]));
+    const double fraction = x - std::floor(x);
+    const double y = std::fma(static_cast<double>(ints[lane]), 0.5, x);
+    const auto fraction_bits = std::bit_cast<uint64_t>(fraction);
+    test.expected[0 * Lanes + lane] = std::bit_cast<u32>(static_cast<float>(fraction));
+    test.expected[1 * Lanes + lane] = std::bit_cast<u32>(static_cast<float>(y));
+    test.expected[2 * Lanes + lane] = (lane & 1u) != 0u ? 1u : 0u;
+    test.expected[3 * Lanes + lane] = lane < 4u ? 1u : 0u;
+    test.expected[4 * Lanes + lane] = static_cast<u32>(fraction_bits);
+    test.expected[5 * Lanes + lane] = static_cast<u32>(fraction_bits >> 32u);
+  }
+  auto &code = test.code;
+  code.push_back(EncodeVop2(0x1a, 30, InlineU32(2), 0));  // v_lshlrev_b32 v30, 2, v0
+  const std::array<std::pair<u32, u32>, 3> inputs{{{1, 64}, {6, 80}, {17, 96}}};
+  for (const auto &[dst, dword] : inputs) {
+    AppendVMovU32(&code, 31, dword * 4u);
+    code.push_back(EncodeVop2(0x25, 32, Vgpr(30), 31));   // v_add_nc_u32 v32, v30, v31
+    AppendBufferLoadDword(&code, dst, 32);
+  }
+  AppendSMovLiteral(&code, 20, static_cast<u32>(K_bits));
+  AppendSMovLiteral(&code, 21, static_cast<u32>(K_bits >> 32u));
+  code.push_back(EncodeVop1(0x04, 2, Vgpr(1)));           // v_cvt_f64_i32 v[2:3], v1
+  code.push_back(EncodeVop1(0x10, 4, Vgpr(6)));           // v_cvt_f64_f32 v[4:5], v6
+  AppendVop3(&code, 0x14c, 4, Vgpr(2), 20, Vgpr(4));      // v_fma_f64 v[4:5], v[2:3], s[20:21], v[4:5]
+  code.push_back(EncodeVop1(0x3e, 8, Vgpr(4)));           // v_fract_f64 v[8:9], v[4:5]
+  code.push_back(EncodeVop1(0x0f, 7, Vgpr(8)));           // v_cvt_f32_f64 v7, v[8:9]
+  AppendVop3(&code, 0x14c, 10, Vgpr(2), 240, Vgpr(4));    // v_fma_f64 v[10:11], v[2:3], 0.5, v[4:5]
+  code.push_back(EncodeVop1(0x0f, 12, Vgpr(10)));         // v_cvt_f32_f64 v12, v[10:11]
+  code.push_back(EncodeVop2(0x1b, 13, InlineU32(1), 0));  // v_and_b32 v13, 1, v0
+  code.push_back(EncodeVop1(0x01, 14, InlineU32(0)));     // v_mov_b32 v14, 0
+  AppendVop3(&code, 0xa5, 106, Vgpr(13), InlineU32(0));   // v_cmp_ne_i64 vcc, v[13:14], 0
+  code.push_back(EncodeVop1(0x01, 15, InlineU32(1)));     // v_mov_b32 v15, 1
+  code.push_back(EncodeVop2(0x01, 16, InlineU32(0), 15)); // v_cndmask_b32 v16, 0, v15, vcc
+  code.push_back(EncodeVop1(0x01, 18, InlineU32(0)));     // v_mov_b32 v18, 0
+  code.push_back(EncodeVop1(0x01, 19, InlineU32(0)));     // v_mov_b32 v19, 0
+  code.push_back(EncodeSMovB32(24, 126));                 // s_mov_b32 s24, exec_lo
+  // v_cmpx_lt_i16 exec, v17.word1, v18.word1 (SDWA)
+  code.push_back(EncodeVopc(0x99, 249, 18));
+  code.push_back(EncodeVopcSdwa(17, 0, 0, 5, 5));
+  code.push_back(EncodeVop1(0x01, 19, InlineU32(1)));     // v_mov_b32 v19, 1
+  code.push_back(EncodeSMovB32(126, 24));                 // s_mov_b32 exec_lo, s24
+  const std::array<u32, 6> outputs{7, 12, 16, 19, 8, 9};
+  for (u32 k = 0; k < outputs.size(); ++k) {
+    AppendStoreVgprAtLaneDwordOffset(&code, outputs[k], 0, k * Lanes);
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_LSHLREV_B32,  O::V_MOV_B32,      O::V_ADD_NC_U32,   O::BUFFER_LOAD_DWORD,
+                  O::S_MOV_B32,      O::V_CVT_F64_I32,  O::V_CVT_F64_F32,  O::V_FMA_F64,
+                  O::V_FRACT_F64,    O::V_CVT_F32_F64,  O::V_AND_B32,      O::V_CMP_NE_I64,
+                  O::V_CNDMASK_B32,  O::V_CMPX_LT_I16,  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"Float64"};
+  test.compute_info.wave_size = 32;
+  test.compute_info.threads_num[0] = Lanes;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+// FLAT and GLOBAL stores reach guest memory through the BDA page table: a DWORD per lane, and bytes
+// and shorts that lanes merge into shared DWORDs without losing each other's.
+TestCase FlatStoresReachGuestMemory() {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  constexpr u32 Lanes = 8;
+  TestCase test;
+  test.name = "FlatStoresReachGuestMemory";
+  test.initial.assign(64, 0xaaaaaaaau);
+  test.expected = test.initial;
+  for (u32 lane = 0; lane < Lanes; ++lane) {
+    test.expected[lane] = 0x100u + lane;
+  }
+  // Bytes 0-7 of DWORDs 16-17 and shorts 0-7 of DWORDs 24-27.
+  for (u32 lane = 0; lane < Lanes; ++lane) {
+    auto &byte_word = test.expected[16 + lane / 4];
+    byte_word = (byte_word & ~(0xffu << ((lane % 4) * 8u))) | ((0x10u + lane) << ((lane % 4) * 8u));
+    auto &short_word = test.expected[24 + lane / 2];
+    short_word = (short_word & ~(0xffffu << ((lane % 2) * 16u))) |
+                 ((0x2000u + lane) << ((lane % 2) * 16u));
+  }
+  auto &code = test.code;
+  AppendVMovLiteral(&code, 21, static_cast<u32>(GuestBase >> 32u));
+  code.push_back(EncodeVop2(0x1a, 20, InlineU32(2), 0));   // v_lshlrev_b32 v20, 2, v0
+  AppendVMovU32(&code, 23, 0x100);
+  code.push_back(EncodeVop2(0x25, 1, Vgpr(0), 23));        // v_add_nc_u32 v1, v0, v23
+  AppendVMovLiteral(&code, 22, static_cast<u32>(GuestBase));
+  code.push_back(EncodeVop2(0x25, 20, Vgpr(20), 22));      // v_add_nc_u32 v20, v20, v22
+  // flat_store_dword v[20:21], v1 (segment 0: FLAT)
+  code.push_back(EncodeFlat0(0x1c, 0, 0));
+  code.push_back(EncodeFlat1(0, 0x7d, 1, 20));
+  // global_store_byte v[24:25], v2 at base + 64 + lane
+  AppendVMovU32(&code, 23, 0x10);
+  code.push_back(EncodeVop2(0x25, 2, Vgpr(0), 23));        // v_add_nc_u32 v2, v0, v23
+  AppendVMovLiteral(&code, 23, static_cast<u32>(GuestBase + 64u));
+  code.push_back(EncodeVop2(0x25, 24, Vgpr(0), 23));       // v_add_nc_u32 v24, v0, v23
+  AppendVMovLiteral(&code, 25, static_cast<u32>(GuestBase >> 32u));
+  code.push_back(EncodeFlat0(0x18, 2, 0));
+  code.push_back(EncodeFlat1(0, 0x7d, 2, 24));
+  // global_store_short v[26:27], v3 at base + 96 + 2 * lane
+  AppendVMovU32(&code, 23, 0x2000);
+  code.push_back(EncodeVop2(0x25, 3, Vgpr(0), 23));        // v_add_nc_u32 v3, v0, v23
+  code.push_back(EncodeVop2(0x1a, 26, InlineU32(1), 0));   // v_lshlrev_b32 v26, 1, v0
+  AppendVMovLiteral(&code, 23, static_cast<u32>(GuestBase + 96u));
+  code.push_back(EncodeVop2(0x25, 26, Vgpr(26), 23));      // v_add_nc_u32 v26, v26, v23
+  AppendVMovLiteral(&code, 27, static_cast<u32>(GuestBase >> 32u));
+  code.push_back(EncodeFlat0(0x1a, 2, 0));
+  code.push_back(EncodeFlat1(0, 0x7d, 3, 26));
+  AppendEnd(&code);
+  test.bda_mappings = {{GuestBase, 0}};
+  test.opcodes = {O::V_MOV_B32,       O::V_LSHLREV_B32,     O::V_ADD_NC_U32,
+                  O::FLAT_STORE_DWORD, O::FLAT_STORE_BYTE,  O::FLAT_STORE_SHORT,
+                  O::S_ENDPGM};
+  test.compute_info.wave_size = 32;
+  test.compute_info.threads_num[0] = Lanes;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+// A DMA store to a page the BDA page table lacks is dropped, and so is its data; the page is marked
+// in the fault buffer's access bitmap and in its dropped-store bitmap after it. A load from another
+// missing page marks only the access bitmap, and the mapped page marks neither.
+TestCase DroppedDmaStoresMarkTheirPage() {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  constexpr uint64_t StoredPage = 0x0000000120000000ull;
+  constexpr uint64_t LoadedPage = 0x0000000130000000ull;
+  constexpr uint32_t PageBits = BufferCache::CACHING_PAGEBITS;
+  constexpr auto StoreBitmapWords = static_cast<u32>(BufferCache::CACHING_NUMPAGES / 32u);
+  TestCase test;
+  test.name = "DroppedDmaStoresMarkTheirPage";
+  test.initial.assign(64, 0xaaaaaaaau);
+  test.expected = test.initial;
+  test.expected[0] = 0x1234u;
+  auto &code = test.code;
+  AppendVMovU32(&code, 1, 0x1234);
+  // global_store_dword to the mapped page, to the missing one, then a load from another.
+  for (const uint64_t address : {GuestBase, StoredPage}) {
+    AppendVMovLiteral(&code, 20, static_cast<u32>(address));
+    AppendVMovLiteral(&code, 21, static_cast<u32>(address >> 32u));
+    code.push_back(EncodeFlat0(0x1c, 2, 0));
+    code.push_back(EncodeFlat1(0, 0x7d, 1, 20));
+  }
+  AppendVMovLiteral(&code, 20, static_cast<u32>(LoadedPage));
+  AppendVMovLiteral(&code, 21, static_cast<u32>(LoadedPage >> 32u));
+  code.push_back(EncodeFlat0(0x0c, 2, 0));   // global_load_dword v2, v[20:21], off
+  code.push_back(EncodeFlat1(2, 0x7d, 0, 20));
+  // The missing page reads as zero, stored after the first DWORD.
+  AppendVMovLiteral(&code, 20, static_cast<u32>(GuestBase + 4u));
+  AppendVMovLiteral(&code, 21, static_cast<u32>(GuestBase >> 32u));
+  code.push_back(EncodeFlat0(0x1c, 2, 0));
+  code.push_back(EncodeFlat1(0, 0x7d, 2, 20));
+  AppendEnd(&code);
+  test.expected[1] = 0u;
+  test.bda_mappings = {{GuestBase, 0}};
+  const auto word_of = [](uint64_t address) {
+    const auto page = static_cast<u32>(address >> PageBits);
+    return std::pair{page / 32u, 1u << (page % 32u)};
+  };
+  const auto [stored_word, stored_bit] = word_of(StoredPage);
+  const auto [loaded_word, loaded_bit] = word_of(LoadedPage);
+  const auto [mapped_word, mapped_bit] = word_of(GuestBase);
+  (void)mapped_bit;
+  test.expected_fault_words = {
+      {stored_word, stored_bit},
+      {StoreBitmapWords + stored_word, stored_bit},
+      {loaded_word, loaded_bit},
+      {StoreBitmapWords + loaded_word, 0u},
+      {mapped_word, 0u},
+      {StoreBitmapWords + mapped_word, 0u},
+  };
+  test.opcodes = {O::V_MOV_B32, O::FLAT_STORE_DWORD, O::FLAT_LOAD_DWORD, O::S_ENDPGM};
+  test.compute_info.wave_size = 32;
+  test.compute_info.threads_num[0] = 1;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+// A ray-tracing traversal pops node pointers off a stack kept one entry per lane and scalar-loads
+// the instance record each one points at, then data through the pointer in that record. The
+// addresses come from the GPU, so both loads run there instead of being read before the dispatch.
+TestCase ScalarLoadsThroughLaneReadAddresses() {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  constexpr u32 Lanes = 32;
+  constexpr u32 Entries = 3;
+  constexpr u32 RecordDword = 128;
+  constexpr u32 OutputDword = 192;
+  TestCase test;
+  test.name = "ScalarLoadsThroughLaneReadAddresses";
+  test.initial.assign(256, 0u);
+  u32 sum = 0;
+  for (u32 lane = 0; lane < Lanes; ++lane) {
+    // Lane L's stack entry at dwords 2L..2L+1 points at record L, 16 bytes each from dword 128.
+    const uint64_t record = GuestBase + (RecordDword + lane * 4u) * 4u;
+    test.initial[lane * 2u] = static_cast<u32>(record);
+    test.initial[lane * 2u + 1u] = static_cast<u32>(record >> 32u);
+  }
+  for (u32 entry = 0; entry < Entries; ++entry) {
+    test.initial[RecordDword + entry * 4u + 1u] = 100u + entry * 7u;
+    sum += 100u + entry * 7u;
+  }
+  test.expected = test.initial;
+  for (u32 lane = 0; lane < Lanes; ++lane) {
+    test.expected[OutputDword + lane] = sum;
+  }
+  auto &code = test.code;
+  code.push_back(EncodeVop2(0x1a, 2, InlineU32(3), 0));    // v_lshlrev_b32 v2, 3, v0
+  AppendVMovLiteral(&code, 22, static_cast<u32>(GuestBase));
+  code.push_back(EncodeVop2(0x25, 2, Vgpr(2), 22));        // v_add_nc_u32 v2, v2, v22
+  AppendVMovLiteral(&code, 3, static_cast<u32>(GuestBase >> 32u));
+  code.push_back(EncodeSMovB32(40, InlineU32(0)));         // s_mov_b32 s40, 0
+  code.push_back(EncodeSMovB32(21, InlineU32(0)));         // s_mov_b32 s21, 0
+  const auto loop = code.size();
+  AppendVop3(&code, 0x360, 34, Vgpr(2), 40);               // v_readlane_b32 s34, v2, s40
+  AppendVop3(&code, 0x360, 35, Vgpr(3), 40);               // v_readlane_b32 s35, v3, s40
+  code.push_back(EncodeSmem0(0x01, 60, 34 / 2));           // s_load_dwordx2 s[60:61], s[34:35]
+  code.push_back(EncodeSmem1(0, 0x7d));
+  code.push_back(EncodeSmem0(0x00, 20, 60 / 2));           // s_load_dword s20, s[60:61], 4
+  code.push_back(EncodeSmem1(4, 0x7d));
+  code.push_back(EncodeSop2(0x00, 21, 21, 20));            // s_add_u32 s21, s21, s20
+  code.push_back(EncodeSop2(0x00, 40, 40, InlineU32(1)));  // s_add_u32 s40, s40, 1
+  code.push_back(EncodeSopc(0x0a, 40, InlineU32(Entries))); // s_cmp_lt_u32 s40, Entries
+  const auto back = static_cast<int32_t>(loop) - static_cast<int32_t>(code.size() + 1u);
+  code.push_back(EncodeSopp(0x05, static_cast<u32>(back) & 0xffffu)); // s_cbranch_scc1 loop
+  code.push_back(EncodeVop1(0x01, 5, 21));                 // v_mov_b32 v5, s21
+  AppendStoreVgprAtLaneDwordOffset(&code, 5, 0, OutputDword);
+  AppendEnd(&code);
+  test.bda_mappings = {{GuestBase, 0}};
+  test.opcodes = {O::V_LSHLREV_B32,  O::V_MOV_B32,      O::V_ADD_NC_U32,    O::S_MOV_B32,
+                  O::V_READLANE_B32, O::S_LOAD_DWORDX2, O::S_LOAD_DWORD,    O::S_ADD_U32,
+                  O::S_CMP_LT_U32,   O::S_CBRANCH_SCC1, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.wave_size = 32;
+  test.compute_info.threads_num[0] = Lanes;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+// GTA V's ray traversal pushes its node stack with FLAT stores whose high DWORD names the LDS
+// aperture (0x80000000) or the private one (0x70000000), and pops it with DS_READ and SCRATCH_LOAD.
+// FLAT loads read back through the same apertures, and a garbage address past the page table reads
+// zero and drops its store.
+TestCase FlatAperturesReachLdsAndScratch() {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  constexpr u32 Lanes = 32;
+  TestCase test;
+  test.name = "FlatAperturesReachLdsAndScratch";
+  test.expected.assign(5 * Lanes, 0u);
+  for (u32 lane = 0; lane < Lanes; ++lane) {
+    test.expected[lane] = 0x1000u + lane;
+    test.expected[Lanes + lane] = 0x2000u + lane;
+    test.expected[2 * Lanes + lane] = 0x1000u + lane;
+    test.expected[3 * Lanes + lane] = 0x2000u + lane;
+  }
+  test.initial.assign(test.expected.size(), 0xdeadbeefu);
+  auto &code = test.code;
+  code.push_back(EncodeVop2(0x1a, 1, InlineU32(2), 0));    // v_lshlrev_b32 v1, 2, v0
+  AppendVMovLiteral(&code, 2, 0x80000000u);                // LDS aperture
+  AppendVMovU32(&code, 23, 0x1000);
+  code.push_back(EncodeVop2(0x25, 3, Vgpr(0), 23));        // v_add_nc_u32 v3, v0, v23
+  code.push_back(EncodeFlat0(0x1c, 0, 0));                 // flat_store_dword v[1:2], v3
+  code.push_back(EncodeFlat1(0, 0x7d, 3, 1));
+  code.push_back(EncodeDs0(0x36));                         // ds_read_b32 v4, v1
+  code.push_back(EncodeDs1(4, 0, 1));
+  AppendVMovU32(&code, 6, 8);
+  AppendVMovLiteral(&code, 7, 0x70000000u);                // private aperture
+  AppendVMovU32(&code, 23, 0x2000);
+  code.push_back(EncodeVop2(0x25, 8, Vgpr(0), 23));        // v_add_nc_u32 v8, v0, v23
+  code.push_back(EncodeFlat0(0x1c, 0, 0));                 // flat_store_dword v[6:7], v8
+  code.push_back(EncodeFlat1(0, 0x7d, 8, 6));
+  code.push_back(EncodeSMovB32(20, InlineU32(0)));         // s_mov_b32 s20, 0
+  code.push_back(EncodeFlat0(0x0c, 1, 0));                 // scratch_load_dword v9, v6, off
+  code.push_back(EncodeFlat1(9, 0x7d, 0, 6));
+  code.push_back(EncodeFlat0(0x0c, 0, 0));                 // flat_load_dword v10, v[1:2]
+  code.push_back(EncodeFlat1(10, 0x7d, 0, 1));
+  code.push_back(EncodeFlat0(0x0c, 0, 0));                 // flat_load_dword v11, v[6:7]
+  code.push_back(EncodeFlat1(11, 0x7d, 0, 6));
+  AppendVMovU32(&code, 12, 0x100);
+  AppendVMovLiteral(&code, 13, 0x12345678u);               // far past the page table
+  code.push_back(EncodeFlat0(0x1c, 0, 0));                 // flat_store_dword v[12:13], v3
+  code.push_back(EncodeFlat1(0, 0x7d, 3, 12));
+  code.push_back(EncodeFlat0(0x0c, 0, 0));                 // flat_load_dword v14, v[12:13]
+  code.push_back(EncodeFlat1(14, 0x7d, 0, 12));
+  const std::array<u32, 5> outputs{4, 9, 10, 11, 14};
+  for (u32 k = 0; k < outputs.size(); ++k) {
+    AppendStoreVgprAtLaneDwordOffset(&code, outputs[k], 0, k * Lanes);
+  }
+  AppendEnd(&code);
+  test.bda_mappings = {{GuestBase, 0}};
+  test.opcodes = {O::V_LSHLREV_B32, O::V_MOV_B32,       O::V_ADD_NC_U32,
+                  O::FLAT_STORE_DWORD, O::DS_READ_B32,  O::S_MOV_B32,
+                  O::FLAT_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.wave_size = 32;
+  test.compute_info.threads_num[0] = Lanes;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.lds_size_dwords = 64;
+  test.compute_info.scratch_size_dwords = 4;
+  test.has_compute_info = true;
+  return test;
+}
+
+// A ray-tracing shader that reads an image through a descriptor it picks per lane still runs: the
+// image reads as mid-grey and opaque. Its BVH test of a node on an unmapped page misses.
+TestCase RayTracingImageStandIn() {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  TestCase test;
+  test.name = "RayTracingImageStandIn";
+  test.initial.resize(2048);
+  test.expected = {0x3f000000u, 0x3f000000u, 0x3f000000u, 0x3f800000u,
+                   0x7f800000u, 0x3f800000u, 0u,          0u};
+  AppendVMovU32(&test.code, 30, 64 * 4);
+  AppendBufferLoadDword(&test.code, 0, 30);
+  test.code.push_back(EncodeVop1(0x02, 20, Vgpr(0)));  // v_readfirstlane_b32 s20, v0
+  test.code.push_back(EncodeSop2(0x26, 20, 20, 255));  // s_mul_i32 s20, s20, 120
+  test.code.push_back(120);
+  test.code.push_back(EncodeSmem0(0x0b, 8, 0));        // s_buffer_load_dwordx8 s[8:15]
+  test.code.push_back(EncodeSmem1(520, 20));
+  AppendVMovU32(&test.code, 21, 1);
+  // image_load v[1:4], v21, s[8:15]
+  test.code.push_back(EncodeMimg0(0x00, 0xf));
+  test.code.push_back(EncodeMimg1(1, 21, 2));
+  // image_bvh_intersect_ray v[60:63], v[40:50], s[24:27] on node 0 of a BVH at address 0.
+  for (u32 k = 0; k < 4; ++k) {
+    AppendSMovLiteral(&test.code, 24 + k, 0);
+  }
+  for (u32 k = 0; k < 11; ++k) {
+    test.code.push_back(EncodeVop1(0x01, 40 + k, InlineU32(0)));
+  }
+  test.code.push_back(EncodeMimg0(0xe6, 0xf, 0, false, 0, true));
+  test.code.push_back(EncodeMimg1(60, 40, 6));
+  for (u32 k = 0; k < 4; ++k) {
+    AppendStoreVgpr(&test.code, 1 + k, k);
+    AppendStoreVgpr(&test.code, 60 + k, 4 + k);
+  }
+  AppendEnd(&test.code);
+  test.bda_mappings = {{GuestBase, 0}};
+  test.opcodes = {O::V_MOV_B32,           O::BUFFER_LOAD_DWORD,     O::V_READFIRSTLANE_B32,
+                  O::S_MUL_I32,           O::S_BUFFER_LOAD_DWORDX8, O::IMAGE_LOAD,
+                  O::S_MOV_B32,           O::IMAGE_BVH_INTERSECT_RAY, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  return test;
+}
+
+// IMAGE_BVH_INTERSECT_RAY and IMAGE_BVH64_INTERSECT_RAY against hand-built RDNA2 BVH nodes in guest
+// memory: a box32 and a box16 node (children nearest first when the descriptor sorts, in node order
+// when it does not), a triangle node hit from either side (t, det and barycentric numerators, or
+// the triangle id and hit status), a triangle miss and a node on an unmapped page.
+TestCase BvhIntersectRayNodes() {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  constexpr uint64_t BvhOffset = 0x1000;
+  constexpr uint64_t BvhBase = GuestBase + BvhOffset;
+  constexpr u32 BvhDword = BvhOffset / 4;
+  constexpr u32 InputDword = 512;
+  constexpr u32 Lanes = 8;
+  constexpr u32 Miss = 0xffffffffu;
+  const auto f = [](float value) { return std::bit_cast<u32>(value); };
+  const u32 inf = 0x7f800000u;
+  const u32 nan = 0x7fc00000u;
+
+  TestCase test;
+  test.name = "BvhIntersectRayNodes";
+  test.initial.resize(2048);
+  // box32 node at BVH offset 0 (pointer 5): children A, B, C and an unused slot.
+  const std::array<u32, 4> box32_children{0x1001u, 0x2002u, 0x3003u, Miss};
+  const std::array<std::array<float, 6>, 3> boxes{{{0, 0, 2, 1, 1, 3},   // A: hit at t = 3
+                                                    {0, 0, 0, 1, 1, 1},   // B: hit at t = 1
+                                                    {5, 5, 0, 6, 6, 1}}}; // C: missed
+  for (u32 i = 0; i < 4; ++i) {
+    test.initial[BvhDword + i] = box32_children[i];
+    for (u32 k = 0; k < 6; ++k) {
+      test.initial[BvhDword + 4 + i * 6 + k] = i < 3 ? f(boxes[i][k]) : nan;
+    }
+  }
+  // box16 node at BVH offset 128 (pointer 20): the same boxes as halves.
+  const auto half = [](float value) -> u32 {
+    switch (static_cast<int>(value)) {
+    case 0: return 0x0000u;
+    case 1: return 0x3c00u;
+    case 2: return 0x4000u;
+    case 3: return 0x4200u;
+    case 5: return 0x4500u;
+    default: return 0x4600u; // 6
+    }
+  };
+  const std::array<u32, 4> box16_children{0x4004u, 0x5005u, 0x6006u, Miss};
+  for (u32 i = 0; i < 4; ++i) {
+    test.initial[BvhDword + 32 + i] = box16_children[i];
+    for (u32 word = 0; word < 3; ++word) {
+      test.initial[BvhDword + 36 + i * 3 + word] =
+          i < 3 ? half(boxes[i][word * 2]) | (half(boxes[i][word * 2 + 1]) << 16u)
+                : 0x7e007e00u;
+    }
+  }
+  // Triangle node at BVH offset 192 (pointer 24).
+  const std::array<float, 9> triangle{0, 0, 5, 1, 0, 5, 0, 1, 5};
+  for (u32 k = 0; k < 9; ++k) {
+    test.initial[BvhDword + 48 + k] = f(triangle[k]);
+  }
+  test.initial[BvhDword + 48 + 12] = 0x777u;
+
+  struct Ray {
+    u32 node;
+    float extent;
+    std::array<float, 3> origin;
+    std::array<float, 3> dir;
+    std::array<u32, 3> inv;
+  };
+  const std::array<u32, 3> up_inv{inf, inf, f(1.0f)};
+  const std::array<u32, 3> down_inv{inf, inf, f(-1.0f)};
+  const std::array<Ray, Lanes> rays{{
+      {5, 100, {0.5f, 0.5f, -1}, {0, 0, 1}, up_inv},
+      {5, 2, {0.5f, 0.5f, -1}, {0, 0, 1}, up_inv},
+      {24, 100, {0.25f, 0.25f, 0}, {0, 0, 1}, up_inv},
+      {24, 100, {2, 2, 0}, {0, 0, 1}, up_inv},
+      {20, 100, {0.5f, 0.5f, -1}, {0, 0, 1}, up_inv},
+      {24, 100, {0.25f, 0.25f, 10}, {0, 0, -1}, down_inv},
+      {(0x100000u >> 3u) | 5u, 100, {0.5f, 0.5f, -1}, {0, 0, 1}, up_inv},
+      {5, 0.5f, {0.5f, 0.5f, -1}, {0, 0, 1}, up_inv},
+  }};
+  for (u32 lane = 0; lane < Lanes; ++lane) {
+    const auto &ray = rays[lane];
+    auto *input = &test.initial[InputDword + lane * 16];
+    input[0] = ray.node;
+    input[1] = f(ray.extent);
+    for (u32 k = 0; k < 3; ++k) {
+      input[2 + k] = f(ray.origin[k]);
+      input[5 + k] = f(ray.dir[k]);
+      input[8 + k] = ray.inv[k];
+    }
+  }
+  using Result = std::array<u32, 4>;
+  const Result tri_hit_up{f(-5), f(-1), f(-0.25f), f(-0.25f)};
+  const Result tri_hit_down{f(5), f(1), f(0.25f), f(0.25f)};
+  const Result tri_miss{inf, f(1), 0, 0};
+  const Result none{Miss, Miss, Miss, Miss};
+  // Sorted, IJ triangles.
+  const std::array<Result, Lanes> sorted{{
+      {0x2002u, 0x1001u, Miss, Miss},
+      {0x2002u, Miss, Miss, Miss},
+      tri_hit_up,
+      tri_miss,
+      {0x5005u, 0x4004u, Miss, Miss},
+      tri_hit_down,
+      none,
+      none,
+  }};
+  // Unsorted, triangle id and hit status.
+  const std::array<Result, Lanes> unsorted{{
+      {0x1001u, 0x2002u, Miss, Miss},
+      {Miss, 0x2002u, Miss, Miss},
+      {f(-5), f(-1), 0x777u, 1},
+      {inf, f(1), 0x777u, 0},
+      {0x4004u, 0x5005u, Miss, Miss},
+      {f(5), f(1), 0x777u, 1},
+      none,
+      none,
+  }};
+  test.expected.assign(test.initial.begin(), test.initial.begin() + 160);
+  for (u32 lane = 0; lane < Lanes; ++lane) {
+    for (u32 k = 0; k < 4; ++k) {
+      test.expected[lane * 4 + k] = sorted[lane][k];
+      test.expected[64 + lane * 4 + k] = unsorted[lane][k];
+      test.expected[128 + lane * 4 + k] = sorted[lane][k];
+    }
+  }
+
+  const auto descriptor = [&](bool sort, bool ij) {
+    return std::array<u32, 4>{static_cast<u32>(BvhBase >> 8u),
+                              static_cast<u32>((BvhBase >> 40u) & 0xffu) | (sort ? 1u << 31u : 0u),
+                              0xffffffffu, 0x3ffu | (ij ? 1u << 24u : 0u) | (1u << 31u)};
+  };
+  const auto sorted_desc = descriptor(true, true);
+  const auto unsorted_desc = descriptor(false, false);
+  for (u32 k = 0; k < 4; ++k) {
+    AppendSMovLiteral(&test.code, 20 + k, sorted_desc[k]);
+    AppendSMovLiteral(&test.code, 24 + k, unsorted_desc[k]);
+  }
+  test.code.push_back(EncodeVop2(0x1a, 2, InlineU32(6), 0)); // v_lshlrev_b32 v2, 6, v0
+  AppendVMovU32(&test.code, 3, InputDword * 4);
+  test.code.push_back(EncodeVop2(0x25, 2, Vgpr(3), 2));      // v_add_nc_u32 v2, v3, v2
+  for (u32 k = 0; k < 11; ++k) {
+    // buffer_load_dword v[10 + k], v2, s[0:3] offen offset:4k
+    test.code.push_back(EncodeMubuf0(0x0c, k * 4, false, true));
+    test.code.push_back(EncodeMubuf1(10 + k, 0, 2));
+  }
+  // The BVH64 address: node pointer low and high DWORDs, then the ray.
+  test.code.push_back(EncodeVop1(0x01, 30, Vgpr(10)));
+  test.code.push_back(EncodeVop1(0x01, 31, InlineU32(0)));
+  for (u32 k = 1; k < 11; ++k) {
+    test.code.push_back(EncodeVop1(0x01, 31 + k, Vgpr(10 + k)));
+  }
+  // image_bvh_intersect_ray v[44:47], v[10:20], s[20:23]
+  test.code.push_back(EncodeMimg0(0xe6, 0xf, 0, false, 0, true));
+  test.code.push_back(EncodeMimg1(44, 10, 5));
+  // image_bvh_intersect_ray v[50:53], v[10:20], s[24:27]
+  test.code.push_back(EncodeMimg0(0xe6, 0xf, 0, false, 0, true));
+  test.code.push_back(EncodeMimg1(50, 10, 6));
+  // image_bvh64_intersect_ray v[54:57], v[30:41], s[20:23]
+  test.code.push_back(EncodeMimg0(0xe7, 0xf, 0, false, 0, true));
+  test.code.push_back(EncodeMimg1(54, 30, 5));
+  test.code.push_back(EncodeVop2(0x1a, 4, InlineU32(4), 0)); // v_lshlrev_b32 v4, 4, v0
+  const std::array<std::pair<u32, u32>, 3> outputs{{{44, 0}, {50, 256}, {54, 512}}};
+  for (const auto &[first, byte_offset] : outputs) {
+    for (u32 k = 0; k < 4; ++k) {
+      // buffer_store_dword v[first + k], v4, s[48:51] offen offset:byte_offset + 4k
+      test.code.push_back(EncodeMubuf0(0x1c, byte_offset + k * 4, false, true));
+      test.code.push_back(EncodeMubuf1(first + k, 12, 4));
+    }
+  }
+  AppendEnd(&test.code);
+  test.bda_mappings = {{GuestBase, 0}};
+  test.opcodes = {O::S_MOV_B32,         O::V_LSHLREV_B32,           O::V_MOV_B32,
+                  O::V_ADD_NC_U32,      O::BUFFER_LOAD_DWORD,       O::IMAGE_BVH_INTERSECT_RAY,
+                  O::IMAGE_BVH64_INTERSECT_RAY, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer"};
+  test.compute_info.wave_size = 32;
+  test.compute_info.threads_num[0] = Lanes;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+// GTA V skinning stores through a descriptor each lane picks: a readfirstlane waterfall keeps EXEC
+// in vcc_hi, stores for the lanes sharing the first active key, restores EXEC and retires them.
+// On NVIDIA this loop never ended while its body sat in the SPIR-V continue construct.
+TestCase WaterfallGpuSelectedStores() {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  constexpr u32 Sentinel = 0xaaaa0000u;
+  constexpr u32 Keys = 4;
+  constexpr u32 RegionDwords = 32;
+  TestCase test;
+  test.name = "WaterfallGpuSelectedStores";
+  test.initial.resize(2048);
+  for (u32 dword = 0; dword < Keys * RegionDwords; ++dword) {
+    test.initial[dword] = Sentinel | dword;
+  }
+  test.expected.assign(test.initial.begin(), test.initial.begin() + Keys * RegionDwords);
+  for (u32 key = 0; key < Keys; ++key) {
+    const std::array<u32, 4> descriptor{static_cast<u32>(GuestBase) + key * RegionDwords * 4u,
+                                        static_cast<u32>(GuestBase >> 32u), 4096u,
+                                        0x30014204u};
+    std::copy(descriptor.begin(), descriptor.end(), test.initial.begin() + 130 + key * 4);
+  }
+  // Only lanes with bit 2 set take part, as a skinning lane without a vertex does not.
+  for (u32 lane = 0; lane < 32; ++lane) {
+    if ((lane & 4u) != 0) {
+      test.expected[(lane & 3u) * RegionDwords + lane] = lane + 64u;
+    }
+  }
+  test.code = {
+      EncodeVop2(0x1b, 24, InlineU32(3), 0),  // v_and_b32 v24, 3, v0 (the key)
+      EncodeVop2(0x1b, 26, InlineU32(4), 0),  // v_and_b32 v26, 4, v0
+      EncodeVop2(0x1a, 3, InlineU32(2), 0),   // v_lshlrev_b32 v3, 2, v0
+      EncodeVop2(0x25, 2, InlineU32(64), 0),  // v_add_nc_u32 v2, 64, v0
+      EncodeSMovB32(24, 126),                 // s_mov_b32 s24, exec_lo
+      EncodeVopc(0xd5, InlineU32(0), 26),     // v_cmpx_ne_u32 exec, 0, v26
+      EncodeSopp(0x08, 14),                   // s_cbranch_execz end
+      EncodeVop1(0x01, 1, InlineU32(1)),      // v_mov_b32 v1, 1
+      EncodeVop1(0x02, 106, Vgpr(24)),        // loop: v_readfirstlane_b32 vcc_lo, v24
+      EncodeSMovB32(107, 126),                // s_mov_b32 vcc_hi, exec_lo
+      EncodeVopc(0xd2, 106, 24),              // v_cmpx_eq_u32 exec, vcc_lo, v24
+      EncodeSop2(0x1e, 106, 106, InlineU32(4)), // s_lshl_b32 vcc_lo, vcc_lo, 4
+      EncodeVop1(0x01, 1, InlineU32(0)),      // v_mov_b32 v1, 0
+      EncodeSmem0(0x0a, 8, 0),                // s_buffer_load_dwordx4 s[8:11], s[0:3], vcc_lo
+      EncodeSmem1(520, 106),
+      EncodeSopp(0x0c, 0xc07f),               // s_waitcnt lgkmcnt(0)
+      EncodeMubuf0(0x1c, 0, false, true),     // buffer_store_dword v2, v3, s[8:11] offen
+      EncodeMubuf1(2, 2, 3),
+      EncodeSMovB32(126, 107),                // s_mov_b32 exec_lo, vcc_hi
+      EncodeVopc(0xd5, InlineU32(0), 1),      // v_cmpx_ne_u32 exec, 0, v1
+      EncodeSopp(0x09, 0xfff3u),              // s_cbranch_execnz loop
+      EncodeSMovB32(126, 24),                 // end: s_mov_b32 exec_lo, s24
+  };
+  AppendEnd(&test.code);
+  test.bda_mappings = {{GuestBase, 0}};
+  test.opcodes = {O::V_AND_B32,         O::V_LSHLREV_B32,       O::V_ADD_NC_U32,
+                  O::S_MOV_B32,         O::V_CMPX_NE_U32,       O::S_CBRANCH_EXECZ,
+                  O::V_MOV_B32,         O::V_READFIRSTLANE_B32, O::V_CMPX_EQ_U32,
+                  O::S_LSHL_B32,        O::S_BUFFER_LOAD_DWORDX4, O::S_WAITCNT,
+                  O::BUFFER_STORE_DWORD, O::S_CBRANCH_EXECNZ,   O::S_ENDPGM};
+  test.compute_info.wave_size = 32;
+  test.compute_info.threads_num[0] = 32;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
   return test;
 }
 
@@ -26197,6 +28006,76 @@ TestCase Wave64AppendConsumeHighHalf() {
   return test;
 }
 
+TestCase BufferWorkgroupPublication(u32 wave_size, bool dlc_only = false) {
+  using O = ShaderOpcode;
+  constexpr u32 groups = 31;
+  TestCase test;
+  test.name = dlc_only ? "BufferWorkgroupPublicationDlc"
+             : wave_size == 64 ? "BufferWorkgroupPublicationWave64"
+                               : "BufferWorkgroupPublicationWave32";
+  auto &code = test.code;
+  // Allocate work in execution order so every polled predecessor has started.
+  // Only one lane per workgroup owns a ticket and publishes its prefix total.
+  code.push_back(EncodeSop1(0x04, 126, InlineU32(1)));
+  AppendVMovU32(&code, 1, 1);
+  AppendVMovU32(&code, 20, 0);
+  AppendBufferStoreOpcode(&code, 0x32, 1, 20, true);
+  code.push_back(EncodeVop1(0x02, 20, Vgpr(1)));
+  code.push_back(EncodeVop2(0x1a, 20, InlineU32(2), 1));
+  AppendVMovU32(&code, 2, 0);
+  code.push_back(EncodeSMovB32(21, InlineU32(0)));
+  AppendSMovLiteral(&code, 22, 1000000);
+  code.push_back(EncodeSopc(0x06, 20, InlineU32(0)));
+  const auto first_ticket = code.size();
+  code.push_back(0);
+
+  const auto poll = code.size();
+  code.push_back(EncodeMubuf0(0x0c, 0, false, true, !dlc_only) | (1u << 15u));
+  code.push_back(EncodeMubuf1(2, 12, 20));
+  code.push_back(EncodeSopp(0x0c, 0)); // S_WAITCNT vmcnt(0).
+  code.push_back(EncodeVop1(0x02, 23, Vgpr(2)));
+  code.push_back(EncodeSopc(0x07, 23, InlineU32(0)));
+  const auto ready = code.size();
+  code.push_back(0);
+  code.push_back(EncodeSop2(0x00, 21, 21, InlineU32(1)));
+  code.push_back(EncodeSopc(0x0a, 21, 22));
+  code.push_back(EncodeSopp(0x05, static_cast<u32>(poll - code.size() - 1)));
+  // A broken poll reports an incorrect result instead of hanging the test GPU.
+  AppendVMovLiteral(&code, 2, 0x80000000u);
+  const auto publish = code.size();
+  code[first_ticket] = EncodeSopp(0x05, publish - first_ticket - 1);
+  code[ready] = EncodeSopp(0x05, publish - ready - 1);
+  code.push_back(EncodeVop2(0x25, 2, Vgpr(1), 2));
+  code.push_back(EncodeVop2(0x25, 2, InlineU32(1), 2));
+  code.push_back(EncodeVop2(0x25, 20, InlineU32(4), 20));
+  // RDNA2 stores publish to L2 even without GLC/DLC on the producer.
+  AppendBufferStoreDword(&code, 2, 20);
+  AppendEnd(&code);
+
+  test.initial.assign(groups + 1, 0);
+  test.expected = {groups};
+  for (u32 ticket = 0; ticket < groups; ++ticket) {
+    test.expected.push_back((ticket + 1) * (ticket + 2) / 2);
+  }
+  test.opcodes = {O::S_MOV_B64, O::S_MOV_B32, O::V_MOV_B32,
+                  O::BUFFER_ATOMIC_ADD, O::V_READFIRSTLANE_B32,
+                  O::V_LSHLREV_B32, O::S_CMP_EQ_U32, O::S_CMP_LG_U32,
+                  O::S_CMP_LT_U32, O::S_CBRANCH_SCC1, O::S_ADD_U32,
+                  O::S_WAITCNT, O::BUFFER_LOAD_DWORD, O::V_ADD_NC_U32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"Coherent", "Volatile", "OpAtomicIAdd", "OpLoopMerge"};
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  test.dispatch_x = groups;
+  // DLC alone does not bypass RDNA2's L0, so only check its translated policy.
+  test.compile_only = dlc_only;
+  return test;
+}
+
 TestCase BufferAtomicVariants() {
   using O = ShaderOpcode;
 
@@ -28557,6 +30436,9 @@ std::vector<TestCase> MakeCases() {
   auto AddCase = [&cases](TestCase (*factory)()) {
     cases.push_back(factory());
   };
+  cases.push_back(BufferWorkgroupPublication(32));
+  cases.push_back(BufferWorkgroupPublication(64));
+  cases.push_back(BufferWorkgroupPublication(32, true));
 
   AddCase(IntegerAddSubMul);
   AddCase(BitwiseOps);
@@ -28616,6 +30498,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorIntegerOps);
   AddCase(VectorFfbhI32NativeAndVop3OnGpu);
   AddCase(Vop1SdwaFfblCapturedHighWordSource);
+  AddCase(Vop1SdwaBfrevWord0Source);
   AddCase(Vop1SdwaNotCapturedByte0Source);
   AddCase(Vop1SdwaNotPreservesHighWordDestination);
   AddCase(Vop1SdwaMovByteDestinations);
@@ -28638,6 +30521,13 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorCarryAndBitCountOps);
   AddCase(VectorMbcntUsesThreadMask);
   AddCase(VectorAddcWritesPerLaneCarryOut);
+  AddCase(DispatchThreadDimensionsMaskPartialGroup);
+  AddCase(LoopWatchdogCutsRunawayLoop);
+  AddCase(LoopWatchdogCutsRunawayBranchLoop);
+  AddCase(LoopWatchdogKeepsLongLoop);
+  AddCase(LoopWatchdogIgnoresOtherShadersCuts);
+  AddCase(LoopWatchdogCutsDispatcherLoop);
+  AddCase(WaterfallGpuSelectedStores);
   AddCase(VectorAddcUsesPerLaneCarryIn);
   AddCase(VectorSubCoCiU32CompactAndVop3);
   AddCase(VectorSubrevCoCiU32ExactRawOnGpu);
@@ -28741,10 +30631,24 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferOffsetsUsePackedLaneAndStorageFallback);
   AddCase(BufferLoadVariants);
   AddCase(BufferLoadDwordx2SnapshotsOverlappingAddress);
+  AddCase(CoherentBufferLoadDwordx2IsOneAccess);
+  AddCase(CoherentBufferLoadDwordx2Unaligned);
   AddCase(BufferLoadDwordx3SnapshotsOverlappingAddress);
   AddCase(BufferLoadDwordx4SnapshotsOverlappingAddress);
   AddCase(BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail);
   AddCase(BufferLoadsGpuSelectedDescriptors);
+  AddCase(BufferLoadDwordx3GpuSelectedDescriptors);
+  AddCase(BufferLoadDwordGpuSelectedDescriptors);
+  AddCase(BufferStoresGpuSelectedDescriptors);
+  AddCase(BufferAtomicsGpuSelectedDescriptors);
+  AddCase(BvhIntersectRayNodes);
+  AddCase(BufferFormattedLoadsGpuSelectedDescriptors);
+  AddCase(RayTracingImageStandIn);
+  AddCase(Float64HashAndWideCompares);
+  AddCase(FlatStoresReachGuestMemory);
+  AddCase(DroppedDmaStoresMarkTheirPage);
+  AddCase(ScalarLoadsThroughLaneReadAddresses);
+  AddCase(FlatAperturesReachLdsAndScratch);
   AddCase(BufferStoreDwordx4DropsOnlyOutOfBoundsTail);
   AddCase(BufferLoadFormatXyzwRejectsPartialRecord);
   AddCase(BufferStoreFormatXyzwDropsPartialRecord);
@@ -31387,6 +33291,8 @@ void CheckNativeImageDescriptorTypes() {
               NativeDescriptorType(DescriptorBindingKind::FlattenedSrt) ==
                   vk::DescriptorType::eStorageBuffer &&
               NativeDescriptorType(DescriptorBindingKind::ShaderData) ==
+                  vk::DescriptorType::eStorageBuffer &&
+              NativeDescriptorType(DescriptorBindingKind::LoopWatchdog) ==
                   vk::DescriptorType::eStorageBuffer,
           "non-image binding has the wrong Vulkan descriptor type");
   std::printf("[host]    %-32s ok\n", "NativeImageDescriptorTypes");
@@ -33607,12 +35513,183 @@ void CheckPm4CeCompletion(RenderContext &renderer) {
 } // namespace
 } // namespace Libs::Graphics
 
+// Replays dispatches the emulator dumped when the loop watchdog first cut their shader (see
+// DumpDispatchMemory): its code, each dispatch's user data, input info and group counts, and the
+// guest memory they named, as the GPU held it after the frame. Reports whether the watchdog cuts
+// each replay too. `which` selects one dispatch by index, or every one when negative.
+int ReplayDispatch(const std::string &folder, const std::string &hash_text, int which) {
+  using namespace Libs::Graphics;
+  EnsureConfigInitialized();
+  std::setvbuf(stdout, nullptr, _IONBF, 0);
+  const auto read_file = [&](const std::string &name) {
+    std::ifstream file(folder + "/" + name, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(file), {});
+  };
+  TestCase base;
+  base.name = "ReplayDispatch";
+  const auto code = read_file(hash_text + "_loop_watchdog.bin");
+  base.code.resize(code.size() / sizeof(u32));
+  std::memcpy(base.code.data(), code.data(), base.code.size() * sizeof(u32));
+
+  struct Dispatch {
+    std::array<u32, 64> user_data{};
+    std::array<u32, 3> groups{1, 1, 1};
+  };
+  std::vector<Dispatch> dispatches;
+  {
+    std::istringstream summary(read_file(hash_text + "_dispatch.txt"));
+    std::string line;
+    u32 word_index = 0;
+    while (std::getline(summary, line)) {
+      if (line.rfind("ranges:", 0) == 0) {
+        break;
+      }
+      if (line.rfind("dispatch ", 0) == 0 || (dispatches.empty() && line.rfind("user data", 0) == 0)) {
+        if (line.rfind("user data", 0) != 0 || dispatches.empty()) {
+          dispatches.emplace_back();
+          word_index = 0;
+        }
+        continue;
+      }
+      if (line.rfind("groups:", 0) == 0 && !dispatches.empty()) {
+        std::istringstream words(line.substr(7));
+        auto &groups = dispatches.back().groups;
+        words >> groups[0] >> groups[1] >> groups[2];
+        continue;
+      }
+      if (line.rfind("  ", 0) == 0 && !dispatches.empty()) {
+        std::istringstream words(line);
+        std::string word;
+        auto &user_data = dispatches.back().user_data;
+        while (words >> word && word_index < user_data.size()) {
+          user_data[word_index++] = static_cast<u32>(std::strtoul(word.c_str(), nullptr, 16));
+        }
+      }
+    }
+  }
+  std::printf("replay: %zu dispatches recorded\n", dispatches.size());
+
+  std::map<uint64_t, std::filesystem::path> ranges;
+  const auto prefix = hash_text + "_mem_";
+  for (const auto &entry : std::filesystem::directory_iterator(folder)) {
+    const auto name = entry.path().filename().string();
+    if (name.rfind(prefix, 0) == 0 && name.size() >= prefix.size() + 18 &&
+        name.substr(name.size() - 8) == "_gpu.bin") {
+      ranges[std::strtoull(name.substr(prefix.size(), 10).c_str(), nullptr, 16)] = entry.path();
+    }
+  }
+  // Ranges that overlap or touch share one region, so every access to a guest byte reaches the
+  // same backing byte.
+  std::vector<std::pair<uint64_t, std::string>> merged;
+  for (const auto &[address, path] : ranges) {
+    std::ifstream file(path, std::ios::binary);
+    std::string bytes(std::istreambuf_iterator<char>(file), {});
+    if (!merged.empty() && address <= merged.back().first + merged.back().second.size()) {
+      auto &[start, data] = merged.back();
+      const auto offset = address - start;
+      if (data.size() < offset + bytes.size()) {
+        data.resize(offset + bytes.size());
+      }
+      data.replace(offset, bytes.size(), bytes);
+      continue;
+    }
+    merged.emplace_back(address, std::move(bytes));
+  }
+  constexpr uint64_t Page = BufferCache::CACHING_PAGESIZE;
+  uint64_t cursor = 0;
+  for (const auto &[address, bytes] : merged) {
+    const auto backing = (cursor + Page - 1) / Page * Page + (address & (Page - 1));
+    cursor = backing + bytes.size();
+    base.initial.resize((cursor + sizeof(u32) - 1) / sizeof(u32), 0u);
+    std::memcpy(reinterpret_cast<uint8_t *>(base.initial.data()) + backing, bytes.data(),
+                bytes.size());
+    base.guest_regions.push_back(
+        {address, static_cast<u32>(backing), static_cast<u32>(bytes.size())});
+    base.bda_mappings.push_back({address, static_cast<u32>(backing)});
+    std::printf("replay: 0x%010llx+0x%zx at backing 0x%llx\n",
+                static_cast<unsigned long long>(address), bytes.size(),
+                static_cast<unsigned long long>(backing));
+  }
+
+  VulkanHarness vulkan;
+  for (size_t index = 0; index < dispatches.size(); index++) {
+    if (which >= 0 && static_cast<size_t>(which) != index) {
+      continue;
+    }
+    TestCase test = base;
+    test.user_data = dispatches[index].user_data;
+    test.has_user_data = true;
+    test.dispatch_x = dispatches[index].groups[0];
+    test.dispatch_y = dispatches[index].groups[1];
+    test.dispatch_z = dispatches[index].groups[2];
+    auto input = read_file(hash_text + "_input_" + std::to_string(index) + ".bin");
+    if (input.empty()) {
+      input = read_file(hash_text + "_input.bin");
+    }
+    if (input.size() == sizeof(ShaderComputeInputInfo)) {
+      std::memcpy(static_cast<void *>(&test.compute_info), input.data(), input.size());
+      test.compute_info.stage = {};
+    } else {
+      // Dumps from before input info was recorded: a 64-lane wave64 group, group id after the
+      // user data.
+      test.compute_info.wave_size = 64;
+      test.compute_info.threads_num[0] = 64;
+      test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+      test.compute_info.group_id[0] = true;
+      test.compute_info.thread_ids_num = 1;
+      test.compute_info.lds_size_dwords = 16384;
+      test.compute_info.scratch_size_dwords = 1024;
+      u32 user_sgprs = 0;
+      for (u32 i = 0; i < 16; i++) {
+        user_sgprs = test.user_data[i] != 0 ? i + 1 : user_sgprs;
+      }
+      test.compute_info.workgroup_register = static_cast<int>(user_sgprs);
+    }
+    test.has_compute_info = true;
+    std::printf("replay %zu: user data %08x %08x %08x %08x %08x %08x, groups %u %u %u, wave %u, "
+                "threads %u %u %u\n",
+                index, test.user_data[0], test.user_data[1], test.user_data[2], test.user_data[3],
+                test.user_data[4], test.user_data[5], test.dispatch_x, test.dispatch_y,
+                test.dispatch_z, test.compute_info.wave_size, test.compute_info.threads_num[0],
+                test.compute_info.threads_num[1], test.compute_info.threads_num[2]);
+    const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+    for (size_t i = 0; i < compiled.program.info.buffers.size(); i++) {
+      const auto &words = compiled.resources.buffers[i].dwords;
+      const uint64_t address = words[0] | (static_cast<uint64_t>(words[1] & 0xffffu) << 32u);
+      if (!GuestBacking(test, address, 1)) {
+        std::printf("replay %zu: buffer %zu (first pc 0x%x) at 0x%010llx is not in the dump\n",
+                    index, i, compiled.program.info.buffers[i].first_use_pc,
+                    static_cast<unsigned long long>(address));
+      }
+    }
+    auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
+    vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, nullptr);
+    const auto after = vulkan.ReadBuffer(test.name, buffer, test.initial.size());
+    vulkan.DestroyBuffer(&buffer);
+    u32 changed = 0;
+    for (size_t word = 0; word < after.size(); word++) {
+      changed += after[word] != test.initial[word] ? 1u : 0u;
+    }
+    using Watchdog = ShaderRecompiler::IR::LoopWatchdog;
+    const auto &watchdog = vulkan.LastLoopWatchdog();
+    std::printf("replay %zu: watchdog trips %u, loop pc 0x%x, %u words changed\n", index,
+                watchdog.empty() ? 0u : watchdog[Watchdog::TripCount],
+                watchdog.empty() ? 0u : watchdog[Watchdog::LoopPc], changed);
+  }
+  return 0;
+}
+
 int main(int argc, char **argv) {
   using namespace Libs::Graphics;
+  if ((argc == 4 || argc == 5) && std::strcmp(argv[1], "--replay-dispatch") == 0) {
+    return ReplayDispatch(argv[2], argv[3], argc == 5 ? std::atoi(argv[4]) : -1);
+  }
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  CheckGpuSelectedAccesses();
+  CheckDiagnosticShaderDump();
   if (argc == 2 && std::strcmp(argv[1], "--packed-integer-neg-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop3pIntegerNegationCapturedAndSelectedHalves());
@@ -33714,9 +35791,64 @@ int main(int argc, char **argv) {
     return 0;
   }
 #endif
+  if (argc == 2 && std::strcmp(argv[1], "--sdwa-bfrev-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Vop1SdwaBfrevWord0Source());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--waterfall-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, WaterfallGpuSelectedStores());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--cases-only") == 0) {
+    // Only the compute and graphics case lists, without the host checks ahead of them.
+    VulkanHarness vulkan;
+    for (const auto &test : MakeCases()) {
+      RunCase(&vulkan, test);
+    }
+    for (const auto &test : MakeGraphicsCases()) {
+      RunGraphicsCase(&vulkan, test);
+    }
+    std::printf("ShaderRecompilerComputeTests: all compute and graphics cases passed\n");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--loop-watchdog-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, LoopWatchdogCutsRunawayLoop());
+    RunCase(&vulkan, LoopWatchdogCutsRunawayBranchLoop());
+    RunCase(&vulkan, LoopWatchdogKeepsLongLoop());
+    RunCase(&vulkan, LoopWatchdogIgnoresOtherShadersCuts());
+    RunCase(&vulkan, LoopWatchdogCutsDispatcherLoop());
+    CheckLoopWatchdogTimesLoops(&vulkan);
+    vulkan.CheckLoopWatchdogRunawayShaders();
+    vulkan.CheckDispatchMemoryDump();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--dispatch-threads-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, DispatchThreadDimensionsMaskPartialGroup());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bvh-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, BvhIntersectRayNodes());
+    RunCase(&vulkan, RayTracingImageStandIn());
+    RunCase(&vulkan, Float64HashAndWideCompares());
+    RunCase(&vulkan, FlatStoresReachGuestMemory());
+    RunCase(&vulkan, DroppedDmaStoresMarkTheirPage());
+    RunCase(&vulkan, ScalarLoadsThroughLaneReadAddresses());
+    RunCase(&vulkan, FlatAperturesReachLdsAndScratch());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--indirect-buffer-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, BufferLoadsGpuSelectedDescriptors());
+    RunCase(&vulkan, BufferLoadDwordx3GpuSelectedDescriptors());
+    RunCase(&vulkan, BufferLoadDwordGpuSelectedDescriptors());
+    RunCase(&vulkan, BufferStoresGpuSelectedDescriptors());
+    RunCase(&vulkan, BufferAtomicsGpuSelectedDescriptors());
+    RunCase(&vulkan, BufferFormattedLoadsGpuSelectedDescriptors());
     RunCase(&vulkan, BufferLoadDwordx4SnapshotsOverlappingAddress());
     RunCase(&vulkan, BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail());
     RunCase(&vulkan, BufferLoadDwordIdxenUsesDescriptorStride());
@@ -33827,6 +35959,14 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--shader-data-storage-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, BufferOffsetsUsePackedLaneAndStorageFallback());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-publication-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, BufferWorkgroupPublication(32));
+    RunCase(&vulkan, BufferWorkgroupPublication(64));
+    RunCase(&vulkan, BufferWorkgroupPublication(32, true));
+    RunCase(&vulkan, BufferAtomicVariants());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cmpswap-only") == 0) {
@@ -34220,6 +36360,8 @@ int main(int argc, char **argv) {
   vulkan.CheckRasterization(false, true);
   vulkan.CheckBufferCacheDirtyGarbageCollection();
 #endif
+  vulkan.CheckLoopWatchdogRunawayShaders();
+  vulkan.CheckDispatchMemoryDump();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
   vulkan.CheckCubeFaceStorageExpansion();
@@ -34232,6 +36374,7 @@ int main(int argc, char **argv) {
   for (const auto &test : graphics_tests) {
     RunGraphicsCase(&vulkan, test);
   }
+  CheckLoopWatchdogTimesLoops(&vulkan);
   vulkan.CheckGpuCommandLane();
   std::printf("ShaderRecompilerComputeTests: all cases passed\n");
   return 0;

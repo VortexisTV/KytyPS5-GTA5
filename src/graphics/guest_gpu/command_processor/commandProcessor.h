@@ -62,8 +62,9 @@ public:
 
 	void            BufferInit();
 	void            BufferFlush();
-	// Flush wanted for prompt fence completion, not for correctness. Rate-limited: the slice end
-	// always flushes, so deferring only delays a fence by at most one slice.
+	// Flush wanted for prompt completion of a plain fence, not for correctness. Rate-limited: the
+	// slice end always flushes, so deferring only delays a fence by at most one slice. Fences that
+	// raise an interrupt flush at once instead.
 	void            RequestBufferFlush();
 	void            BufferFlushAndWait();
 	void            FlushEagerShadows();

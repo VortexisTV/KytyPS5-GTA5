@@ -28,6 +28,7 @@
 #include <mutex>
 #include <span>
 #include <tuple>
+#include <unordered_set>
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Libs::Graphics {
@@ -231,6 +232,18 @@ void NameImageBinding(GraphicContext& graphics, Image& image, vk::ImageView view
 	    image.info.data.address, static_cast<uint32_t>(view_info.format),
 	    static_cast<vk::ImageAspectFlags::MaskType>(view_info.aspect), view_info.base_level,
 	    view_info.level_count, view_info.base_layer, view_info.layer_count);
+}
+
+// A depth target's stencil plane as the image holds it. A draw's desc sizes the plane for the layers
+// its view reaches, which can be fewer than the image has: in GTA V a view reaching two faces of a
+// six-face cube depth target sized its stencil plane at two faces.
+[[nodiscard]] GuestRange StencilRangeForLayers(const ImageInfo& view_info, uint32_t layers) {
+	const auto& stencil     = view_info.stencil;
+	const auto  view_layers = view_info.resources.layers;
+	if (stencil.Empty() || view_layers == 0 || stencil.size % view_layers != 0) {
+		return stencil;
+	}
+	return {stencil.address, stencil.size / view_layers * layers};
 }
 
 [[nodiscard]] std::vector<vk::BufferImageCopy> BuildDepthCopies(const ImageInfo& info,
@@ -1271,7 +1284,25 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	if (info.samples != 1 || destination.backing.samples != 1 ||
 	    info.resources.layers == 0 || info.data.size % info.resources.layers != 0 ||
 	    Prospero::NumBytesPerElement(info.guest_format) != info.bytes_per_block) {
-		EXIT("TextureCache: invalid depth upload\n");
+		// BuildDownload skips these planes too; the image keeps its contents instead.
+		static std::mutex                   warned_mutex;
+		static std::unordered_set<uint64_t> warned;
+		std::lock_guard                     lock(warned_mutex);
+		if (warned.insert(info.data.address).second) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Warning: TextureCache skipped an unsupported {} upload: addr=0x{:010x} "
+			    "size=0x{:x} guest_format={} element_bytes={} bytes_per_block={} pixel_format={} "
+			    "tile={} extent={}x{}x{} pitch={} levels={} layers={} samples={} "
+			    "backing_samples={}\n",
+			    image.depth_id ? "stencil" : "depth", info.data.address, info.data.size,
+			    static_cast<uint32_t>(info.guest_format),
+			    Prospero::NumBytesPerElement(info.guest_format), info.bytes_per_block,
+			    vk::to_string(info.pixel_format), static_cast<uint32_t>(info.tile_mode),
+			    info.extent.width, info.extent.height, info.extent.depth, info.pitch,
+			    info.resources.levels, info.resources.layers, info.samples,
+			    static_cast<uint32_t>(destination.backing.samples)));
+		}
+		return;
 	}
 	const auto          layers          = info.resources.layers;
 	const auto          full_slice_size = info.data.size / layers;
@@ -1840,7 +1871,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	TouchImage(image);
 	image.MarkGpuModified();
 	image.usage.depth_target = true;
-	image.info.stencil = desc.info.stencil;
+	image.info.stencil = StencilRangeForLayers(desc.info, image.info.resources.layers);
 	image.info.metadata = desc.info.metadata;
 	if (desc.info.HasMetadata()) {
 		m_surface_metas.emplace(desc.info.metadata.range.address,
@@ -1849,8 +1880,8 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	}
 	RefreshImage(id);
 	CommitGpuWrite(image);
-	if (desc.info.HasStencil()) {
-		RefreshImage(AssociateStencil(id, desc.info.stencil));
+	if (image.info.HasStencil()) {
+		RefreshImage(AssociateStencil(id, image.info.stencil));
 	}
 	const auto view = image.FindView(desc.view_info);
 	NameImageBinding(m_graphics, image, view, desc.type, desc.view_info);

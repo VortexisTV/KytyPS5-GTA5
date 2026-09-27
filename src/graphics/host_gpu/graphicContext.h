@@ -34,6 +34,10 @@ struct GraphicContext {
 	bool                               supports_block_texel_view              = false;
 	bool                               graphics_pipeline_library_enabled      = false;
 	bool                               graphics_pipeline_library_fast_linking = false;
+	bool                               device_fault_enabled                   = false;
+	bool                               device_checkpoints_enabled             = false;
+	// VK_KHR_shader_clock shaderDeviceClock, which the loop watchdog uses to time guest loops.
+	bool                               shader_device_clock_enabled            = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;

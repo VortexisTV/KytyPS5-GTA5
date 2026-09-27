@@ -6,12 +6,14 @@
 #include "common/perfStats.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/gpuCrashDiagnostics.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -246,6 +248,8 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
       m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
                              BDA_PAGETABLE_SIZE),
+      m_loop_watchdog_buffer(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
+                             ShaderRecompiler::IR::LoopWatchdog::DwordCount * sizeof(uint32_t)),
       m_memory_tracker(page_manager),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
@@ -256,6 +260,19 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
 	                     "BDA Page Table Buffer");
+	std::memset(m_loop_watchdog_buffer.Mapped().data(), 0, m_loop_watchdog_buffer.Size());
+	{
+		using Watchdog = ShaderRecompiler::IR::LoopWatchdog;
+		reinterpret_cast<uint32_t*>(m_loop_watchdog_buffer.Mapped().data())[Watchdog::TickBudget] =
+		    Watchdog::DefaultTickBudget;
+	}
+	m_loop_watchdog_buffer.Flush(0, m_loop_watchdog_buffer.Size());
+	SetVulkanObjectNameF(m_graphics.device, m_loop_watchdog_buffer.Handle(), "Loop Watchdog");
+	RegisterLoopWatchdog(&m_loop_watchdog_buffer);
+	RegisterDiagnosticMemoryReader([this](uint64_t vaddr, uint64_t size, std::vector<uint8_t>& gpu,
+	                                      std::vector<uint8_t>& cpu, std::string& note) {
+		ReadDiagnosticMemory(vaddr, size, gpu, cpu, note);
+	});
 	const auto null_id =
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);
@@ -275,6 +292,8 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 BufferCache::~BufferCache() {
+	RegisterLoopWatchdog(nullptr);
+	RegisterDiagnosticMemoryReader({});
 	if (!m_gpu_modified_ranges.Empty()) {
 		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");
 	}
@@ -552,6 +571,67 @@ void BufferCache::FinishReadback(uint64_t id) {
 	if (pending.is_write) {
 		m_memory_tracker.MarkRegionAsCpuModified(pending.fault_vaddr, pending.fault_size);
 	}
+}
+
+void BufferCache::ReadDiagnosticMemory(uint64_t vaddr, uint64_t size, std::vector<uint8_t>& gpu,
+                                       std::vector<uint8_t>& cpu, std::string& note) {
+	gpu.clear();
+	cpu.resize(size);
+	if (!Libs::LibKernel::Memory::TryReadBacking(vaddr, cpu.data(), size)) {
+		cpu.clear();
+	}
+	note = fmt::format("cache uses {} MiB, evicts from {} MiB", m_total_used_memory >> 20u,
+	                   m_trigger_gc_memory >> 20u);
+	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	if (owner == nullptr || !*owner) {
+		note += "; not cached";
+		return;
+	}
+	auto&      buffer = m_slot_buffers[*owner];
+	const auto begin  = buffer.CpuAddress();
+	const auto end    = begin + buffer.Size();
+	if (vaddr < begin || vaddr >= end) {
+		note += "; not cached";
+		return;
+	}
+	const auto bytes = std::min(size, end - vaddr);
+	// In pieces the download ring holds with room to spare.
+	constexpr uint64_t Chunk = 4ull * 1024ull * 1024ull;
+	gpu.reserve(bytes);
+	for (uint64_t done = 0; done < bytes; done += Chunk) {
+		const auto                  piece = std::min(Chunk, bytes - done);
+		std::vector<vk::BufferCopy> copies {vk::BufferCopy {vaddr - begin + done, 0, piece}};
+		const auto [mapped, offset] = RecordDownload(buffer, copies, Common::AlignUp(piece, 64));
+		const auto tick             = m_scheduler.CurrentTick();
+		m_scheduler.Wait(tick);
+		m_scheduler.WaitPriorityOperations(tick);
+		m_download_buffer.Invalidate(offset, piece);
+		gpu.insert(gpu.end(), mapped, mapped + piece);
+	}
+	note += fmt::format("; cached in 0x{:010x}+0x{:x}, gpu-modified {}, cpu-modified {}", begin,
+	                    buffer.Size(), m_memory_tracker.IsRegionGpuModified(vaddr, bytes),
+	                    m_memory_tracker.IsRegionCpuModified(vaddr, bytes));
+}
+
+bool BufferCache::ReadGpuCopy(uint64_t vaddr, void* out, uint64_t size) {
+	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	if (size == 0 || owner == nullptr || !*owner) {
+		return false;
+	}
+	auto&      buffer = m_slot_buffers[*owner];
+	const auto begin  = buffer.CpuAddress();
+	if (vaddr < begin || vaddr + size > begin + buffer.Size() ||
+	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+		return false;
+	}
+	std::vector<vk::BufferCopy> copies {vk::BufferCopy {vaddr - begin, 0, size}};
+	const auto [mapped, offset] = RecordDownload(buffer, copies, Common::AlignUp(size, 64));
+	const auto tick             = m_scheduler.CurrentTick();
+	m_scheduler.Wait(tick);
+	m_scheduler.WaitPriorityOperations(tick);
+	m_download_buffer.Invalidate(offset, size);
+	std::memcpy(out, mapped, size);
+	return true;
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
@@ -1039,6 +1119,7 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::RunGarbageCollector() {
+	ReportLoopWatchdog();
 	RecordHotShadows();
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {

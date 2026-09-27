@@ -560,9 +560,29 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		supported_pipeline_library.pNext = supported_features2.pNext;
 		supported_features2.pNext        = &supported_pipeline_library;
 	}
+	const bool fault_extension = HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+	vk::PhysicalDeviceFaultFeaturesEXT supported_fault {};
+	if (fault_extension) {
+		supported_fault.pNext     = supported_features2.pNext;
+		supported_features2.pNext = &supported_fault;
+	}
+	const bool clock_extension = HasExtension(device_extensions, VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
+	vk::PhysicalDeviceShaderClockFeaturesKHR supported_clock {};
+	if (clock_extension) {
+		supported_clock.pNext     = supported_features2.pNext;
+		supported_features2.pNext = &supported_clock;
+	}
 	physical_device.getFeatures2(&supported_features2);
+	graphics.shader_device_clock_enabled = clock_extension && supported_clock.shaderDeviceClock;
 	graphics.graphics_pipeline_library_enabled =
 	    pipeline_library_extensions && supported_pipeline_library.graphicsPipelineLibrary;
+	graphics.device_fault_enabled = fault_extension && supported_fault.deviceFault;
+	graphics.device_checkpoints_enabled =
+	    HasExtension(device_extensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+	LOGF("Vulkan GPU crash diagnostics: deviceFault=%s checkpoints=%s shaderDeviceClock=%s\n",
+	     graphics.device_fault_enabled ? "true" : "false",
+	     graphics.device_checkpoints_enabled ? "true" : "false",
+	     graphics.shader_device_clock_enabled ? "true" : "false");
 	graphics.mesh_shader_enabled = mesh_extension && supported_mesh.meshShader;
 
 	vk::PhysicalDeviceSubgroupSizeControlProperties subgroup_size_control {};
@@ -644,6 +664,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
 	graphics.sample_rate_shading_enabled                 = true;
 	device_features.shaderInt64 = VK_TRUE;
+	// A few ray-tracing shaders compute in double precision.
+	device_features.shaderFloat64 = supported_features2.features.shaderFloat64;
 
 	vk::PhysicalDeviceRobustness2FeaturesEXT robustness2 {};
 #if defined(__APPLE__)
@@ -695,6 +717,18 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		pipeline_library.pNext                   = const_cast<void*>(create_info.pNext);
 		pipeline_library.graphicsPipelineLibrary = VK_TRUE;
 		create_info.pNext                        = &pipeline_library;
+	}
+	vk::PhysicalDeviceFaultFeaturesEXT fault {};
+	if (graphics.device_fault_enabled) {
+		fault.pNext       = const_cast<void*>(create_info.pNext);
+		fault.deviceFault = VK_TRUE;
+		create_info.pNext = &fault;
+	}
+	vk::PhysicalDeviceShaderClockFeaturesKHR shader_clock {};
+	if (graphics.shader_device_clock_enabled) {
+		shader_clock.pNext             = const_cast<void*>(create_info.pNext);
+		shader_clock.shaderDeviceClock = VK_TRUE;
+		create_info.pNext              = &shader_clock;
 	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
@@ -1057,10 +1091,16 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
 		}
+		// VK_EXT_device_fault and VK_NV_device_diagnostic_checkpoints report what a lost device
+		// was running; see gpuCrashDiagnostics.h. VK_KHR_shader_clock lets the loop watchdog time
+		// guest loops.
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
-		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME}) {
+		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME,
+		                             VK_EXT_DEVICE_FAULT_EXTENSION_NAME,
+		                             VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME,
+		                             VK_KHR_SHADER_CLOCK_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}

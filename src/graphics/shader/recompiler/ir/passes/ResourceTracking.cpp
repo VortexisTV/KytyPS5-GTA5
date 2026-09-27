@@ -88,9 +88,12 @@ public:
 		m_info.images.clear();
 		m_info.samplers.clear();
 		m_info.sampled_pairs.clear();
-		m_info.uses_dma = false;
-		m_shader_writes = HasShaderMemoryWrites(program);
-		m_info.dma_address_registers.clear();
+		m_info.uses_dma               = false;
+		m_info.indirect_buffer_writes = false;
+		m_shader_writes               = HasShaderMemoryWrites(program);
+		m_info.dma_address_bases.clear();
+		m_info.dma_write_address_bases.clear();
+		m_info.dma_store_descriptor_tables.clear();
 	}
 
 	void Run() {
@@ -110,6 +113,13 @@ public:
 		LinkImageAliases();
 		for (const auto& patch: m_handle_patches) {
 			patch.handle->SetFlags<uint32_t>(patch.resource);
+			// A table the shader reads the descriptors it stores through from.
+			if (std::ranges::find(m_store_descriptor_tables, patch.handle) !=
+			        m_store_descriptor_tables.end() &&
+			    std::ranges::find(m_info.dma_store_descriptor_tables, patch.resource) ==
+			        m_info.dma_store_descriptor_tables.end()) {
+				m_info.dma_store_descriptor_tables.push_back(patch.resource);
+			}
 		}
 		for (const auto& patch: m_memory_patches) {
 			auto& memory    = m_program.memory_info[patch.index];
@@ -1136,6 +1146,12 @@ private:
 		}
 	}
 
+	void NoteUnsupportedIndirectAccess(std::string access) {
+		if (m_program.unsupported_indirect_access.empty()) {
+			m_program.unsupported_indirect_access = std::move(access);
+		}
+	}
+
 	bool GetHandle(Value value, ValueOpcode expected, uint32_t width, uint32_t pc, Inst*& handle,
 	               uint32_t& source, bool sampler = false, bool sample_adjust = false) {
 		handle = value.Resolve().TryInstruction();
@@ -1166,8 +1182,14 @@ private:
 				source = InternSource(descriptor);
 				return true;
 			}
-			Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
-			                     ValueOpcodeName(expected), bad_dword));
+			const auto reason = fmt::format("{} dword {} is not a valid runtime value",
+			                                ValueOpcodeName(expected), bad_dword);
+			// A compute shader's dispatches are skipped instead; see unsupported_indirect_access.
+			if (m_program.stage == ShaderType::Compute) {
+				NoteUnsupportedIndirectAccess(fmt::format("{} at pc=0x{:08x}", reason, pc));
+				return false;
+			}
+			Fail(pc, reason);
 		}
 		source = InternSource(descriptor);
 		return true;
@@ -1176,8 +1198,22 @@ private:
 	// Collects the user-data registers a data value is computed from. Boolean operands only steer
 	// selects and carries, and memory loads name pointers stored elsewhere, so neither contributes an
 	// address register.
+	// Memory reads end a search for the user data a value derives from.
+	static bool StopsRootSearch(const Inst& inst) {
+		const auto op = inst.GetOpcode();
+		return op == ValueOpcode::ReadConst || op == ValueOpcode::ReadConstBuffer ||
+		       BufferAccessOf(op) != BufferAccess::None ||
+		       SharedAccessOf(op) != SharedAccess::None ||
+		       AddressOpcodeInfoOf(op).access != AddressAccess::None ||
+		       ImageOpcodeInfoOf(op).access != ImageAccess::None;
+	}
+
+	// The user-data registers a value derives from. With a merge block, its phis follow only the
+	// value arriving from `predecessor`.
 	static void CollectUserDataRoots(Value value, std::vector<uint32_t>& registers,
-	                                 std::vector<const Inst*>& visited) {
+	                                 std::vector<const Inst*>& visited,
+	                                 const Block* merge = nullptr,
+	                                 const Block* predecessor = nullptr) {
 		constexpr size_t MaxVisited = 256;
 		value            = value.Resolve();
 		const auto* inst = value.TryInstruction();
@@ -1197,41 +1233,141 @@ private:
 			}
 			return;
 		}
-		if (op == ValueOpcode::ReadConst || op == ValueOpcode::ReadConstBuffer ||
-		    BufferAccessOf(op) != BufferAccess::None || SharedAccessOf(op) != SharedAccess::None ||
-		    AddressOpcodeInfoOf(op).access != AddressAccess::None ||
-		    ImageOpcodeInfoOf(op).access != ImageAccess::None) {
+		if (StopsRootSearch(*inst)) {
 			return;
 		}
+		const bool one_edge = merge != nullptr && op == ValueOpcode::Phi && inst->Parent() == merge &&
+		                      inst->NumPhiBlocks() == inst->NumArgs();
 		for (uint32_t index = 0; index < inst->NumArgs(); index++) {
 			const auto arg = inst->Arg(index);
-			if (arg.GetType() != Type::U1) {
-				CollectUserDataRoots(arg, registers, visited);
+			if (arg.GetType() != Type::U1 && (!one_edge || inst->PhiBlock(index) == predecessor)) {
+				CollectUserDataRoots(arg, registers, visited, merge, predecessor);
 			}
 		}
 	}
 
 	// A DMA address is a 64-bit value split over a low and a high dword. When the low dword derives
-	// from user data R and the high dword from R + 1, the pair names the guest memory the shader reads.
-	void RecordDmaAddressRegisters(const Inst& inst, const MemoryInfo& memory) {
+	// from one user-data register and the high dword from another, the pair names the guest memory
+	// the shader reads.
+	void RecordDmaAddressRegisters(const Inst& inst, const MemoryInfo& memory, bool write) {
 		const auto* handle = inst.Arg(0).Resolve().TryInstruction();
 		if (handle == nullptr || handle->NumArgs() != 2 ||
 		    (memory.address_is_full && inst.NumArgs() < 3)) {
 			return;
 		}
-		const auto               low  = memory.address_is_full ? inst.Arg(1) : handle->Arg(0);
-		const auto               high = memory.address_is_full ? inst.Arg(2) : handle->Arg(1);
-		std::vector<uint32_t>    low_roots;
-		std::vector<uint32_t>    high_roots;
+		RecordDmaBase(memory.address_is_full ? inst.Arg(1) : handle->Arg(0),
+		              memory.address_is_full ? inst.Arg(2) : handle->Arg(1), write);
+	}
+
+	// A buffer descriptor the GPU builds at run time keeps its base in dword 0 and the low 16 bits
+	// of dword 1. One the shader stores through may instead be read whole from a table it indexes at
+	// run time, as GTA V's vertex writers pick their destination per lane.
+	void RecordIndirectBufferBase(const Inst& inst, bool write) {
+		const auto* handle = inst.Arg(0).Resolve().TryInstruction();
+		if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetBufferResource ||
+		    handle->NumArgs() != 4) {
+			return;
+		}
+		RecordDmaBase(handle->Arg(0), handle->Arg(1), write);
+		const auto* base = handle->Arg(0).Resolve().TryInstruction();
+		if (!write || base == nullptr || base->GetOpcode() != ValueOpcode::ReadConstBuffer ||
+		    base->NumArgs() == 0) {
+			return;
+		}
+		auto* table = base->Arg(0).Resolve().TryInstruction();
+		if (table != nullptr && table->GetOpcode() == ValueOpcode::GetBufferResource &&
+		    std::ranges::find(m_store_descriptor_tables, table) == m_store_descriptor_tables.end()) {
+			m_store_descriptor_tables.push_back(table);
+		}
+	}
+
+	void RecordDmaBase(Value low, Value high, bool write) {
+		std::vector<DmaAddressBase> pairs;
+		CollectBasePairs(low, high, pairs);
+		const auto add = [](std::vector<DmaAddressBase>& bases, DmaAddressBase base) {
+			if (std::ranges::find(bases, base) == bases.end()) {
+				bases.push_back(base);
+			}
+		};
+		for (const auto pair: pairs) {
+			add(m_info.dma_address_bases, pair);
+			if (write) {
+				add(m_info.dma_write_address_bases, pair);
+			}
+		}
+	}
+
+	// The user-data registers a DMA base's low and high dwords come from, paired path by path.
+	// Where both dwords pass through phis of one merge block, only the values arriving along the
+	// same edge pair up: GTA V's BVH builder picks its base as (s3, s0) on one path and (s6, s1) on
+	// the other, and a base built from s6 and s0 would name unrelated memory. Along each path
+	// adjacent registers are the usual pair; only a base with none is taken from the other
+	// pairings, so an unrelated register feeding the other half does not pair up.
+	static void CollectBasePairs(Value low, Value high, std::vector<DmaAddressBase>& pairs) {
+		std::vector<const Inst*> low_phis;
+		std::vector<const Inst*> high_phis;
 		std::vector<const Inst*> visited;
-		CollectUserDataRoots(low, low_roots, visited);
+		CollectPhis(low, low_phis, visited);
 		visited.clear();
-		CollectUserDataRoots(high, high_roots, visited);
-		auto& registers = m_info.dma_address_registers;
-		for (const auto reg: low_roots) {
-			if (std::ranges::find(high_roots, reg + 1u) != high_roots.end() &&
-			    std::ranges::find(registers, reg) == registers.end()) {
-				registers.push_back(reg);
+		CollectPhis(high, high_phis, visited);
+		const Block* merge = nullptr;
+		for (const auto* phi: low_phis) {
+			if (std::ranges::any_of(high_phis, [&](const Inst* other) {
+				    return other->Parent() == phi->Parent();
+			    })) {
+				merge = phi->Parent();
+				break;
+			}
+		}
+		const auto add_pairs = [&](const Block* predecessor) {
+			std::vector<uint32_t> low_roots;
+			std::vector<uint32_t> high_roots;
+			visited.clear();
+			CollectUserDataRoots(low, low_roots, visited, merge, predecessor);
+			visited.clear();
+			CollectUserDataRoots(high, high_roots, visited, merge, predecessor);
+			const bool adjacent = std::ranges::any_of(low_roots, [&](uint32_t reg) {
+				return std::ranges::find(high_roots, reg + 1u) != high_roots.end();
+			});
+			for (const auto low_reg: low_roots) {
+				for (const auto high_reg: high_roots) {
+					const DmaAddressBase pair {low_reg, high_reg};
+					if (low_reg == high_reg || (adjacent && high_reg != low_reg + 1u) ||
+					    std::ranges::find(pairs, pair) != pairs.end()) {
+						continue;
+					}
+					pairs.push_back(pair);
+				}
+			}
+		};
+		if (merge == nullptr) {
+			add_pairs(nullptr);
+			return;
+		}
+		const auto* phi = *std::ranges::find_if(
+		    low_phis, [&](const Inst* candidate) { return candidate->Parent() == merge; });
+		for (size_t index = 0; index < phi->NumPhiBlocks(); index++) {
+			add_pairs(phi->PhiBlock(index));
+		}
+	}
+
+	// The phis a value derives from, through the operations CollectUserDataRoots follows.
+	static void CollectPhis(Value value, std::vector<const Inst*>& phis,
+	                        std::vector<const Inst*>& visited) {
+		constexpr size_t MaxVisited = 256;
+		const auto*      inst       = value.Resolve().TryInstruction();
+		if (inst == nullptr || visited.size() >= MaxVisited ||
+		    std::ranges::find(visited, inst) != visited.end() || StopsRootSearch(*inst)) {
+			return;
+		}
+		visited.push_back(inst);
+		if (inst->GetOpcode() == ValueOpcode::Phi) {
+			phis.push_back(inst);
+		}
+		for (uint32_t index = 0; index < inst->NumArgs(); index++) {
+			const auto arg = inst->Arg(index);
+			if (arg.GetType() != Type::U1) {
+				CollectPhis(arg, phis, visited);
 			}
 		}
 	}
@@ -1381,6 +1517,10 @@ private:
 
 	void Collect(Inst& inst) {
 		const auto op           = inst.GetOpcode();
+		if (op == ValueOpcode::BvhIntersectRay) {
+			m_info.uses_dma = true;
+			return;
+		}
 		const auto buffer       = BufferAccessOf(op);
 		const auto address_info = AddressOpcodeInfoOf(op);
 		const auto image_info   = ImageOpcodeInfoOf(op);
@@ -1406,15 +1546,26 @@ private:
 		if (buffer != BufferAccess::None) {
 			if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc, handle,
 			               source)) {
-				if (memory.kind != ResourceKind::Buffer || memory.formatted || memory.typed ||
-				    (op != ValueOpcode::LoadBufferU32x2 && op != ValueOpcode::LoadBufferU32x4)) {
-					Fail(flags.pc,
-					     "buffer descriptor is not a valid runtime value; GPU-selected access "
-					     "requires a raw DWORD x2/x4 load");
+				const bool raw_store = memory.SupportsIndirectBufferStore(op) ||
+				                       memory.SupportsIndirectBufferAtomic(op);
+				if (memory.kind == ResourceKind::Buffer &&
+				    (raw_store || memory.SupportsIndirectBufferLoad(op))) {
+					m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
+					m_info.uses_dma                         = true;
+					m_info.indirect_buffer_writes           = m_info.indirect_buffer_writes || raw_store;
+					RecordIndirectBufferBase(inst, raw_store);
+					return;
 				}
-				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
-				m_info.uses_dma                         = true;
-				return;
+				const auto access = fmt::format("{} at pc=0x{:08x} (bits={} formatted={} typed={})",
+				                                ValueOpcodeName(op), flags.pc, memory.data_bits,
+				                                memory.formatted, memory.typed);
+				if (memory.kind == ResourceKind::Buffer && m_program.stage == ShaderType::Compute) {
+					NoteUnsupportedIndirectAccess(access);
+					return;
+				}
+				Fail(flags.pc, "buffer descriptor is not a valid runtime value; GPU-selected "
+				               "access requires a raw DWORD load or store, got " +
+				                   access);
 			}
 			resource = AddBuffer(source, memory, op, flags.pc);
 			if (resource == UINT32_MAX) {
@@ -1442,8 +1593,9 @@ private:
 			ValidateAddressHandle(inst.Arg(0), flags.pc);
 			if (address_info.access == AddressAccess::Write) {
 				m_program.has_address_writes = true;
+				m_info.indirect_buffer_writes = true;
 			}
-			RecordDmaAddressRegisters(inst, memory);
+			RecordDmaAddressRegisters(inst, memory, address_info.access == AddressAccess::Write);
 			m_info.uses_dma = true;
 			return;
 		}
@@ -1457,7 +1609,10 @@ private:
 		if (indirect != nullptr) {
 			source = indirect->source;
 		} else {
-			GetHandle(inst.Arg(0), ValueOpcode::GetImageResource, 8, flags.pc, handle, source);
+			if (!GetHandle(inst.Arg(0), ValueOpcode::GetImageResource, 8, flags.pc, handle,
+			               source)) {
+				return;
+			}
 		}
 		resource = AddImage(source, memory, op, flags.pc);
 		if (resource == UINT32_MAX) {
@@ -1473,8 +1628,10 @@ private:
 			uint32_t   sampler_source = 0;
 			const bool sample_adjust =
 			    (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) != 0;
-			GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc, sampler_handle,
-			          sampler_source, true, sample_adjust);
+			if (!GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc,
+			               sampler_handle, sampler_source, true, sample_adjust)) {
+				return;
+			}
 			sampler = AddSampler(sampler_source, flags.pc);
 			if (sampler == UINT32_MAX) {
 				Fail(flags.pc, "sampler resource limit exceeded");
@@ -1518,6 +1675,8 @@ private:
 	ShaderInfo                                 m_info;
 	std::vector<DescriptorSource>              m_sources;
 	std::vector<HandlePatch>                   m_handle_patches;
+	// Handles of the tables store descriptors are read from (see RecordIndirectBufferBase).
+	std::vector<const Inst*>                   m_store_descriptor_tables;
 	std::vector<MemoryPatch>                   m_memory_patches;
 	std::vector<IndirectImagePlan>             m_indirect_images;
 	std::vector<std::pair<const Inst*, Value>> m_descriptor_selections;
@@ -1528,6 +1687,92 @@ private:
 
 void TrackResources(Program& program) {
 	Tracker(program).Run();
+}
+
+namespace {
+
+// Whether `value` is computed from a lane read, that is from data that differs between lanes.
+bool DependsOnLaneRead(Value value, std::vector<const Inst*>& visited) {
+	constexpr size_t MaxVisited = 512;
+	const auto*      inst       = value.Resolve().TryInstruction();
+	if (inst == nullptr || visited.size() >= MaxVisited ||
+	    std::ranges::find(visited, inst) != visited.end()) {
+		return false;
+	}
+	visited.push_back(inst);
+	if (inst->GetOpcode() == ValueOpcode::ReadFirstLane ||
+	    inst->GetOpcode() == ValueOpcode::ReadLane) {
+		return true;
+	}
+	for (size_t index = 0; index < inst->NumArgs(); index++) {
+		if (DependsOnLaneRead(inst->Arg(index), visited)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Reads as mid-grey and opaque, and a compare as lit; a write is dropped and an atomic returns 0.
+// The access's metadata stays behind, marked as touching no resource.
+void StandInImage(Inst& inst, MemoryInfo& memory) {
+	memory.planning_only = true;
+	if (ImageOpcodeInfoOf(inst.GetOpcode()).access == ImageAccess::Write) {
+		inst.Invalidate();
+		return;
+	}
+	if (inst.GetType() != Type::U32x4) {
+		inst.ReplaceUsesWith(Value(0u));
+		return;
+	}
+	std::array<uint32_t, 4> values {0x3f000000u, 0x3f000000u, 0x3f000000u, 0x3f800000u};
+	if ((memory.image_sample_flags & Decoder::ImageSampleFlagCompare) != 0u) {
+		values[0] = 0x3f800000u;
+	}
+	if (memory.data_bits == 16u) {
+		values = {0x38003800u, 0x3c003800u, 0u, 0u};
+	}
+	inst.Invalidate();
+	inst.SetFlags<uint64_t>(0);
+	inst.ReplaceOpcode(ValueOpcode::CompositeConstructU32x4);
+	for (uint32_t component = 0; component < values.size(); component++) {
+		inst.SetArg(component, Value(values[component]));
+	}
+}
+
+} // namespace
+
+void StandInRuntimeImages(Program& program) {
+	if (program.stage != ShaderType::Compute) {
+		return;
+	}
+	for (auto* block: program.blocks) {
+		for (auto& inst: *block) {
+			if (ImageOpcodeInfoOf(inst.GetOpcode()).access == ImageAccess::None ||
+			    inst.NumArgs() == 0u) {
+				continue;
+			}
+			const auto* handle = inst.Arg(0).Resolve().TryInstruction();
+			const auto  flags  = inst.Flags<MemoryFlags>();
+			if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetImageResource ||
+			    flags.index >= program.memory_info.size() ||
+			    program.memory_info[flags.index].planning_only) {
+				continue;
+			}
+			std::vector<const Inst*> visited;
+			bool                     picked = false;
+			for (size_t index = 0; index < handle->NumArgs() && !picked; index++) {
+				picked = DependsOnLaneRead(handle->Arg(index), visited);
+			}
+			if (!picked) {
+				continue;
+			}
+			if (program.image_stand_in.empty()) {
+				program.image_stand_in =
+				    fmt::format("{} at pc=0x{:08x}", ValueOpcodeName(inst.GetOpcode()), flags.pc);
+			}
+			StandInImage(inst, program.memory_info[flags.index]);
+		}
+	}
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

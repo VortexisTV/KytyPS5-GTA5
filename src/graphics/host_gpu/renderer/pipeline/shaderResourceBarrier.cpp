@@ -92,7 +92,8 @@ bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 	const auto& program   = *runtime.program;
 	const auto& resources = *runtime.resources;
 	EXIT_IF(resources.buffers.size() != program.info.buffers.size());
-	bool has_writes = false;
+	// Stores through GPU-selected descriptors name no buffer here but still write guest memory.
+	bool has_writes = program.info.indirect_buffer_writes;
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		if (!program.info.buffers[i].written) {
 			continue;

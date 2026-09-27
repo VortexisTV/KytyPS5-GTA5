@@ -1025,6 +1025,19 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				                                  IR::U32(IR::Value(total_threads)));
 			}
 		}
+		if (options.stage == ShaderType::Compute &&
+		    options.input_info.compute->dispatch_thread_dimensions) {
+			// A dispatch sized in threads ends in partial workgroups. The hardware launches their
+			// lanes past the dispatch with EXEC clear (NUM_THREAD_PARTIAL), so they never run.
+			for (uint32_t axis = 0; axis < 3u; axis++) {
+				const auto threads = IR::U32(
+				    entry_ir.Emit(IR::ValueOpcode::DispatchThreadCount, {IR::Value(axis)}));
+				initial_exec = entry_ir.LogicalAnd(
+				    initial_exec,
+				    entry_ir.ULessThan(builtin(IR::StageInputKind::GlobalInvocationId, axis),
+				                       threads));
+			}
+		}
 		entry_ir.SetExec(initial_exec);
 		const auto initial_mask = entry_ir.Emit(IR::ValueOpcode::Ballot, {initial_exec});
 		entry_ir.SetExecLo(entry_ir.CompositeExtract(initial_mask, 0));

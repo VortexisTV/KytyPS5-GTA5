@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/gpuCrashDiagnostics.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/frameDump.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
@@ -39,6 +40,24 @@
 #include <vector>
 
 namespace Libs::Graphics {
+// For crash diagnostics: the guest ranges the dispatch writes through its bound buffers.
+static void RecordWrittenBuffers(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                                 const PreparedBindings&                        bindings,
+                                 std::array<uint32_t, 3>                        groups) {
+	std::array<std::pair<uint64_t, uint64_t>, 4> written {};
+	size_t                                       count = 0;
+	for (size_t index = 0; index < program.info.buffers.size() &&
+	                       index < bindings.buffer_sources.size() && count < written.size();
+	     index++) {
+		const auto& source = bindings.buffer_sources[index];
+		if (program.info.buffers[index].written && source.address != 0 && source.size != 0) {
+			written[count++] = {source.address, source.size};
+		}
+	}
+	RecordDispatchWrites(program.shader_hash, std::span(written.data(), count),
+	                     program.info.indirect_buffer_writes, groups);
+}
+
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
                                  GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
 	for (uint32_t i = 0; i < sources.size(); ++i) {
@@ -197,6 +216,38 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 	return true;
 }
 
+// Marks a dispatch for the GPU crash report with its user data and the constant buffers it reads.
+static void MarkDispatchCheckpoint(const GraphicContext& graphics, vk::CommandBuffer vk_buffer,
+                                   GpuCheckpointKind kind, uint64_t submit_id,
+                                   const ShaderComputeInputInfo& input_info,
+                                   const PreparedBindings& bindings, uint32_t arg0, uint32_t arg1,
+                                   uint32_t arg2) {
+	if (!graphics.device_checkpoints_enabled) {
+		return;
+	}
+	const auto&                        program = *bindings.runtime->program;
+	std::array<GpuCheckpointBuffer, 3> buffers {};
+	size_t                             buffer_count = 0;
+	for (size_t i = 0; i < program.info.buffers.size() && i < bindings.buffer_sources.size() &&
+	                   buffer_count < buffers.size();
+	     i++) {
+		const auto& source = bindings.buffer_sources[i];
+		if (program.info.buffers[i].scalar && source.address != 0) {
+			buffers[buffer_count++] = {source.address, source.size};
+		}
+	}
+	GpuCheckpointDispatch dispatch {
+	    .user_data     = bindings.runtime->resources->user_data,
+	    .flattened_srt = bindings.runtime->resources->flattened_srt,
+	    .buffers       = std::span(buffers).first(buffer_count),
+	};
+	if (input_info.dispatch_thread_dimensions) {
+		std::copy_n(input_info.dispatch_threads_num, 3, dispatch.dispatch_threads.begin());
+	}
+	MarkGpuCheckpoint(graphics, vk_buffer, kind, submit_id, {&program.shader_hash, 1}, arg0, arg1,
+	                  arg2, &dispatch);
+}
+
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode) {
@@ -259,6 +310,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
 	const auto compute_program =
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	if (!compute_program) {
+		// Temporary until RT is implemented.
+		return;
+	}
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
 		input_info.dispatch_threads_num[1]    = thread_group_y;
@@ -368,9 +423,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	FindBuffers(bindings);
+	RecordWrittenBuffers(program, bindings, {thread_group_x, thread_group_y, thread_group_z});
 	if (program.info.uses_dma) {
 		PrepareDmaSources(bindings);
 		m_context.PrepareBda();
+		RecordDmaDispatchShape(
+		    program.shader_hash,
+		    std::span(reinterpret_cast<const uint8_t*>(&input_info), sizeof(input_info)),
+		    {thread_group_x, thread_group_y, thread_group_z});
 	}
 	RebindImages(bindings);
 	RebindBuffers(bindings);
@@ -394,6 +454,17 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	if (use_thread_dimensions) {
+		// The shader masks lanes past these counts, as the hardware does for partial groups.
+		static_assert(std::size(input_info.dispatch_threads_num) ==
+		              ShaderRecompiler::IR::PushData::DispatchThreadDwordCount);
+		vk_buffer.pushConstants(pipeline.pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+		                        sizeof(input_info.dispatch_threads_num),
+		                        input_info.dispatch_threads_num);
+	}
+	MarkDispatchCheckpoint(m_context.GetGraphics(), vk_buffer, GpuCheckpointKind::Dispatch,
+	                       submit_id, input_info, bindings, thread_group_x, thread_group_y,
+	                       thread_group_z);
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 
 	if (const auto watched = FrameDumpWatchAddress(); watched != 0) {
@@ -431,6 +502,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	MarkGpuCheckpoint(m_context.GetGraphics(), vk_buffer, GpuCheckpointKind::DispatchDone,
+	                  submit_id, {&program.shader_hash, 1});
 	ResetBindings();
 }
 
@@ -451,12 +524,17 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderComputeInputInfo input_info {};
 	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
 	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	if (!compute_program) {
+		// Temporary until RT is implemented.
+		return;
+	}
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	FindBuffers(bindings);
 	const auto& program = *input_info.stage.program;
+	RecordWrittenBuffers(program, bindings, {0u, 0u, 0u});
 	if (program.info.uses_dma) {
 		PrepareDmaSources(bindings);
 		m_context.PrepareBda();
@@ -488,8 +566,14 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
 	                          1, &barrier, 0, nullptr, 0, nullptr);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	// The group counts live in GPU memory; the arguments name the guest address they come from.
+	MarkDispatchCheckpoint(m_context.GetGraphics(), vk_buffer, GpuCheckpointKind::DispatchIndirect,
+	                       submit_id, input_info, bindings, static_cast<uint32_t>(args_addr),
+	                       static_cast<uint32_t>(args_addr >> 32u), 0);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	MarkGpuCheckpoint(m_context.GetGraphics(), vk_buffer, GpuCheckpointKind::DispatchDone,
+	                  submit_id, {&program.shader_hash, 1});
 	ResetBindings();
 }
 

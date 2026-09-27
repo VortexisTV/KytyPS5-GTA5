@@ -39,6 +39,8 @@
 #include <deque>
 #include <initializer_list>
 #include <iterator>
+#include <set>
+#include <source_location>
 #include <span>
 #include <sstream>
 #include <string>
@@ -55,9 +57,11 @@
 namespace Libs::Graphics {
 namespace {
 
-void Check(bool value, const char *text) {
+void Check(bool value, const char *text,
+           std::source_location where = std::source_location::current()) {
   if (!value) {
-    std::fprintf(stderr, "ShaderCfgTests: failed: %s\n", text);
+    std::fprintf(stderr, "ShaderCfgTests: failed (line %u): %s\n",
+                 static_cast<unsigned>(where.line()), text);
     std::abort();
   }
 }
@@ -287,6 +291,37 @@ uint32_t SpirvInstructionOpcodeCount(const std::vector<uint32_t> &binary,
     i += word_count;
   }
   return count;
+}
+
+// OpSelectionMerge instructions of the shader's own control flow. The loop watchdog adds three to
+// each loop latch it watches (its rare path, its report and its claim), each latch counting one
+// trip-count OpAtomicIAdd on the "loop_watchdog" buffer.
+uint32_t SpirvSelectionMergeCount(const std::vector<uint32_t> &binary) {
+  uint32_t watchdog = 0;
+  std::set<uint32_t> watchdog_pointers;
+  uint32_t watched_latches = 0;
+  for (size_t i = 5; i < binary.size();) {
+    const uint32_t op = binary[i] & 0xffffu;
+    const uint32_t word_count = binary[i] >> 16u;
+    if (word_count == 0 || i + word_count > binary.size()) {
+      break;
+    }
+    if (op == 5 && word_count >= 3) { // OpName
+      const auto *name = reinterpret_cast<const char *>(&binary[i + 2]);
+      if (std::strncmp(name, "loop_watchdog", (word_count - 2) * 4) == 0) {
+        watchdog = binary[i + 1];
+      }
+    } else if (op == 65 && word_count >= 4 && watchdog != 0 &&
+               binary[i + 3] == watchdog) { // OpAccessChain
+      watchdog_pointers.insert(binary[i + 2]);
+    } else if (op == 230 && word_count >= 4 &&
+               watchdog_pointers.contains(binary[i + 3])) {
+      // OpAtomicCompareExchange: each watched latch claims the first cut once.
+      watched_latches++;
+    }
+    i += word_count;
+  }
+  return SpirvInstructionOpcodeCount(binary, 247) - 3u * watched_latches;
 }
 
 void CheckSpirvPhiParents(const std::vector<uint32_t> &binary) {
@@ -7743,8 +7778,8 @@ void TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured() {
   const auto original_block_count = graph.blocks.size();
   const auto original_coverage =
       CfgInstructionCoverage(graph, decoded.instructions.size());
-  Check(ShaderRecompiler::CFG::Structurize(graph),
-        graph.unsupported_reason.c_str());
+  const bool structured = ShaderRecompiler::CFG::Structurize(graph);
+  Check(structured, graph.unsupported_reason.c_str());
   Check(graph.natural_loops.size() == 1u, "DS loop was not preserved");
   Check(graph.blocks.size() == original_block_count + 1u,
         "DS loop structurization did not add exactly one empty header");
@@ -7874,7 +7909,7 @@ void TestNewShaderRecompilerCfgLoopEarlyBreakNoSelection() {
         "loop early-break CFG did not stay on structured path");
   Check(SpirvInstructionOpcodeCount(result.spirv, 246) != 0,
         "loop early-break SPIR-V lacks OpLoopMerge");
-  Check(SpirvInstructionOpcodeCount(result.spirv, 247) == 0,
+  Check(SpirvSelectionMergeCount(result.spirv) == 0,
         "loop early-break SPIR-V unexpectedly used OpSelectionMerge");
   Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0,
         "loop early-break CFG unexpectedly used dispatcher OpSwitch");
@@ -7929,7 +7964,7 @@ void TestNewShaderRecompilerCfgNestedLoopLocalExitNoSelection() {
         "nested local loop exit did not stay on structured path");
   Check(SpirvInstructionOpcodeCount(result.spirv, 246) >= 2,
         "nested local loop exit SPIR-V lacks both OpLoopMerge instructions");
-  Check(SpirvInstructionOpcodeCount(result.spirv, 247) == 0,
+  Check(SpirvSelectionMergeCount(result.spirv) == 0,
         "nested local loop exit SPIR-V unexpectedly used OpSelectionMerge");
   Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0,
         "nested local loop exit unexpectedly used dispatcher OpSwitch");
@@ -7960,8 +7995,8 @@ void TestNewShaderRecompilerCfgNestedLoopExitTailMergeSplit() {
   ShaderRecompiler::CFG::Graph graph;
   graph = ShaderRecompiler::CFG::BuildGraph(program);
   const auto original_block_count = graph.blocks.size();
-  Check(ShaderRecompiler::CFG::Structurize(graph),
-        graph.unsupported_reason.c_str());
+  const bool structured = ShaderRecompiler::CFG::Structurize(graph);
+  Check(structured, graph.unsupported_reason.c_str());
   Check(graph.blocks.size() > original_block_count,
         "nested loop exit tails did not create a private inner merge");
 
@@ -7983,6 +8018,13 @@ void TestNewShaderRecompilerCfgNestedLoopExitTailMergeSplit() {
             inner_merge->terminator.true_block ==
                 outer_header->terminator.continue_block,
         "private inner merge does not forward to the outer continue target");
+
+  // Each exit leaves through a selection whose merge stays in the loop body; without one the
+  // conditional has two targets that are not a break or continue and SPIR-V rejects it.
+  auto result = RecompileForTest(shader, MakeCompileOptions(ShaderType::Compute));
+  Check(!result.program.dispatcher_fallback,
+        "nested loop exit tails did not stay on the structured path");
+  CheckSpirvBinaryValidates(result.spirv);
 }
 
 void TestNewShaderRecompilerCfgMixedContinueNonmergeExitDispatcher() {
@@ -8029,7 +8071,7 @@ void TestNewShaderRecompilerCfgConditionalLatchNoSelection() {
         "conditional latch did not stay on structured path");
   Check(SpirvInstructionOpcodeCount(result.spirv, 246) != 0,
         "conditional latch SPIR-V lacks OpLoopMerge");
-  Check(SpirvInstructionOpcodeCount(result.spirv, 247) == 0,
+  Check(SpirvSelectionMergeCount(result.spirv) == 0,
         "conditional latch SPIR-V unexpectedly used OpSelectionMerge");
   Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0,
         "conditional latch unexpectedly used dispatcher OpSwitch");
@@ -8052,7 +8094,7 @@ void TestNewShaderRecompilerCfgDirectConditionalLatchNoSelection() {
         "direct conditional latch did not stay on structured path");
   Check(SpirvInstructionOpcodeCount(result.spirv, 246) != 0,
         "direct conditional latch SPIR-V lacks OpLoopMerge");
-  Check(SpirvInstructionOpcodeCount(result.spirv, 247) == 0,
+  Check(SpirvSelectionMergeCount(result.spirv) == 0,
         "direct conditional latch SPIR-V unexpectedly used OpSelectionMerge");
   Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0,
         "direct conditional latch unexpectedly used dispatcher OpSwitch");
@@ -8084,7 +8126,7 @@ void TestNewShaderRecompilerCfgLoopEarlyContinuesNoSelection() {
         "loop early continues should stay on structured path");
   Check(SpirvInstructionOpcodeCount(result.spirv, 246) != 0,
         "loop early continues SPIR-V lacks OpLoopMerge");
-  Check(SpirvInstructionOpcodeCount(result.spirv, 247) == 0,
+  Check(SpirvSelectionMergeCount(result.spirv) == 0,
         "loop early continues SPIR-V unexpectedly used OpSelectionMerge");
   Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0,
         "loop early continues unexpectedly used dispatcher OpSwitch");
@@ -8112,8 +8154,8 @@ void TestNewShaderRecompilerCfgLoopGatewaySelection() {
   graph = ShaderRecompiler::CFG::BuildGraph(decoded);
   const auto original_coverage =
       CfgInstructionCoverage(graph, decoded.instructions.size());
-  Check(ShaderRecompiler::CFG::Structurize(graph),
-        graph.unsupported_reason.c_str());
+  const bool structured = ShaderRecompiler::CFG::Structurize(graph);
+  Check(structured, graph.unsupported_reason.c_str());
   Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
             original_coverage,
         "loop gateway structurization duplicated semantic instructions");
@@ -8126,7 +8168,7 @@ void TestNewShaderRecompilerCfgLoopGatewaySelection() {
         "loop-control gateway selection unexpectedly selected dispatcher");
   Check(SpirvInstructionOpcodeCount(result.spirv, 246) == 1u,
         "loop-control gateway SPIR-V has the wrong loop-merge count");
-  Check(SpirvInstructionOpcodeCount(result.spirv, 247) == 1u,
+  Check(SpirvSelectionMergeCount(result.spirv) == 1u,
         "loop-control gateway SPIR-V has the wrong selection-merge count");
   Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
         "loop-control gateway SPIR-V unexpectedly contains OpSwitch");
@@ -8151,8 +8193,8 @@ void TestNewShaderRecompilerCfgConditionalLoopHeaderSelection() {
   ShaderRecompiler::CFG::Graph graph;
   graph = ShaderRecompiler::CFG::BuildGraph(decoded);
   const auto original_block_count = graph.blocks.size();
-  Check(ShaderRecompiler::CFG::Structurize(graph),
-        graph.unsupported_reason.c_str());
+  const bool structured = ShaderRecompiler::CFG::Structurize(graph);
+  Check(structured, graph.unsupported_reason.c_str());
   Check(graph.blocks.size() > original_block_count,
         "conditional guest loop header did not create a synthetic header");
 
@@ -8178,7 +8220,7 @@ void TestNewShaderRecompilerCfgConditionalLoopHeaderSelection() {
   auto result = RecompileForTest(shader, options);
   Check(SpirvInstructionOpcodeCount(result.spirv, 246) == 1u,
         "conditional loop-header SPIR-V has the wrong loop-merge count");
-  Check(SpirvInstructionOpcodeCount(result.spirv, 247) == 1u,
+  Check(SpirvSelectionMergeCount(result.spirv) == 1u,
         "conditional loop-header SPIR-V has the wrong selection-merge count");
   Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
         "conditional loop-header unexpectedly used dispatcher OpSwitch");
@@ -8204,8 +8246,8 @@ void TestNewShaderRecompilerCfgMultipleLoopLatches() {
   const auto original_block_count = graph.blocks.size();
   Check(graph.back_edges.size() == 2u,
         "multiple-latch fixture lacks two native backedges");
-  Check(ShaderRecompiler::CFG::Structurize(graph),
-        graph.unsupported_reason.c_str());
+  const bool structured = ShaderRecompiler::CFG::Structurize(graph);
+  Check(structured, graph.unsupported_reason.c_str());
   Check(graph.blocks.size() == original_block_count + 2u,
         "multiple native latches did not create one synthetic continue and one "
         "empty header");
@@ -8222,7 +8264,7 @@ void TestNewShaderRecompilerCfgMultipleLoopLatches() {
   auto result = RecompileForTest(shader, options);
   Check(SpirvInstructionOpcodeCount(result.spirv, 246) == 1u,
         "multiple-latch SPIR-V has the wrong loop-merge count");
-  Check(SpirvInstructionOpcodeCount(result.spirv, 247) == 0u,
+  Check(SpirvSelectionMergeCount(result.spirv) == 0u,
         "multiple-latch SPIR-V unexpectedly used a selection merge");
   Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
         "multiple-latch SPIR-V unexpectedly used dispatcher OpSwitch");
@@ -8315,7 +8357,7 @@ void TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders() {
   Check(!result.program.dispatcher_fallback &&
             (result.ir_dump.find("mode=structured") != std::string::npos),
         "nested early-exit loop unexpectedly selected dispatcher fallback");
-  Check(SpirvInstructionOpcodeCount(result.spirv, 247) == 3u &&
+  Check(SpirvSelectionMergeCount(result.spirv) == 3u &&
             SpirvInstructionOpcodeCount(result.spirv, 246) == 1u &&
             SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
         "nested early-exit SPIR-V has the wrong structured control flow");
@@ -8343,8 +8385,8 @@ void TestNewShaderRecompilerCfgExecSccSharedArm() {
   Check(std::ranges::all_of(original_coverage,
                             [](uint32_t uses) { return uses == 1u; }),
         "shared-arm fixture already duplicated a semantic instruction");
-  Check(ShaderRecompiler::CFG::Structurize(graph),
-        graph.unsupported_reason.c_str());
+  const bool structured = ShaderRecompiler::CFG::Structurize(graph);
+  Check(structured, graph.unsupported_reason.c_str());
   uint32_t route_selects = 0;
   uint32_t route_sets = 0;
   for (const auto &block : graph.blocks) {
@@ -8364,7 +8406,7 @@ void TestNewShaderRecompilerCfgExecSccSharedArm() {
   Check(!result.program.dispatcher_fallback &&
             (result.ir_dump.find("mode=structured") != std::string::npos),
         "EXEC/SCC shared-arm epilogue did not stay structured");
-  Check(SpirvInstructionOpcodeCount(result.spirv, 247) == 2u,
+  Check(SpirvSelectionMergeCount(result.spirv) == 2u,
         "EXEC/SCC shared-arm SPIR-V has the wrong selection-merge count");
   Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
         "EXEC/SCC shared-arm SPIR-V unexpectedly used dispatcher OpSwitch");
@@ -8392,8 +8434,8 @@ void TestSharedReturnPreservesDescriptorDominance() {
   auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
   const auto original_coverage =
       CfgInstructionCoverage(graph, decoded.instructions.size());
-  Check(ShaderRecompiler::CFG::Structurize(graph),
-        graph.unsupported_reason.c_str());
+  const bool structured = ShaderRecompiler::CFG::Structurize(graph);
+  Check(structured, graph.unsupported_reason.c_str());
   const auto *overwrite = graph.FindBlockByPc(0x10u);
   const auto *body = graph.FindBlockByPc(0x20u);
   Check(graph.blocks.size() == 5u && overwrite != nullptr && body != nullptr &&
@@ -8453,8 +8495,8 @@ void TestNewShaderRecompilerCfgNestedTailEarlyExit() {
   graph = ShaderRecompiler::CFG::BuildGraph(decoded);
   const auto original_coverage =
       CfgInstructionCoverage(graph, decoded.instructions.size());
-  Check(ShaderRecompiler::CFG::Structurize(graph),
-        graph.unsupported_reason.c_str());
+  const bool structured = ShaderRecompiler::CFG::Structurize(graph);
+  Check(structured, graph.unsupported_reason.c_str());
   Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
             original_coverage,
         "nested-tail routing changed semantic instruction coverage");
@@ -8503,8 +8545,8 @@ void TestNewShaderRecompilerCfgSharedReturnAfterNestedSelections() {
   graph = ShaderRecompiler::CFG::BuildGraph(decoded);
   const auto original_coverage =
       CfgInstructionCoverage(graph, decoded.instructions.size());
-  Check(ShaderRecompiler::CFG::Structurize(graph),
-        graph.unsupported_reason.c_str());
+  const bool structured = ShaderRecompiler::CFG::Structurize(graph);
+  Check(structured, graph.unsupported_reason.c_str());
   Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
             original_coverage,
         "shared-exit route ordering changed semantic instruction coverage");
@@ -8552,7 +8594,8 @@ void TestNewShaderRecompilerCfgAlternatingSharedReturns() {
   auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
   const auto coverage = CfgInstructionCoverage(graph, decoded.instructions.size());
   Check(graph.blocks.size() == 5u, "alternating returns fixture has the wrong CFG");
-  Check(ShaderRecompiler::CFG::Structurize(graph), graph.unsupported_reason.c_str());
+  const bool structured = ShaderRecompiler::CFG::Structurize(graph);
+  Check(structured, graph.unsupported_reason.c_str());
   Check(CfgInstructionCoverage(graph, decoded.instructions.size()) == coverage,
         "alternating returns duplicated a terminal epilogue");
 
@@ -8656,8 +8699,8 @@ void TestNewShaderRecompilerCfgSharedRegionBeforeEarlyBreakLoop() {
       CfgInstructionCoverage(graph, decoded.instructions.size());
   Check(graph.blocks.size() == 9u && graph.natural_loops.size() == 1u,
         "shared-region/early-break fixture has the wrong native CFG");
-  Check(ShaderRecompiler::CFG::Structurize(graph),
-        graph.unsupported_reason.c_str());
+  const bool structured = ShaderRecompiler::CFG::Structurize(graph);
+  Check(structured, graph.unsupported_reason.c_str());
   Check(graph.natural_loops.size() == 1u && graph.back_edges.size() == 1u,
         "selection routing introduced a cycle around a structured loop exit");
   Check(std::ranges::count_if(graph.blocks, [](const auto &block) {
@@ -8826,8 +8869,8 @@ void TestNewShaderRecompilerCfgEarlyReturnSharedLoopContinuation() {
   auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
   const auto original_coverage =
       CfgInstructionCoverage(graph, decoded.instructions.size());
-  Check(ShaderRecompiler::CFG::Structurize(graph),
-        graph.unsupported_reason.c_str());
+  const bool structured = ShaderRecompiler::CFG::Structurize(graph);
+  Check(structured, graph.unsupported_reason.c_str());
   Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
                 original_coverage &&
             graph.natural_loops.size() == 2u,
@@ -8869,8 +8912,8 @@ void TestNewShaderRecompilerCfgSharedTerminalEarlyExit() {
   graph = ShaderRecompiler::CFG::BuildGraph(decoded);
   const auto original_coverage =
       CfgInstructionCoverage(graph, decoded.instructions.size());
-  Check(ShaderRecompiler::CFG::Structurize(graph),
-        graph.unsupported_reason.c_str());
+  const bool structured = ShaderRecompiler::CFG::Structurize(graph);
+  Check(structured, graph.unsupported_reason.c_str());
   Check(
       CfgInstructionCoverage(graph, decoded.instructions.size()) ==
           original_coverage,
@@ -8905,8 +8948,8 @@ void TestNewShaderRecompilerCfgPrunesUnreachableSelectionEntry() {
       CfgInstructionCoverage(graph, decoded.instructions.size());
   Check(original_coverage[1] == 0u,
         "CFG retained an unreachable external selection entry");
-  Check(ShaderRecompiler::CFG::Structurize(graph),
-        graph.unsupported_reason.c_str());
+  const bool structured = ShaderRecompiler::CFG::Structurize(graph);
+  Check(structured, graph.unsupported_reason.c_str());
   Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
             original_coverage,
         "selection structurization changed reachable semantic code");
@@ -13247,6 +13290,8 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
                           ShaderType stage = ShaderType::Compute) {
     auto options = MakeCompileOptions(stage);
     options.dump_ir = true;
+    // The baselines measure the translation itself, without the loop watchdog's counting.
+    options.loop_watchdog = false;
 
     auto result = RecompileForTest(shader, options);
     CheckSpirvBinaryValidates(result.spirv);
@@ -13496,6 +13541,8 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
   CheckSpirvPhiParents(dispatcher_result.spirv);
 }
 
+#include "ShaderRayTracingTests.inc"
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -13503,6 +13550,7 @@ int main() {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  TestRayTracingDispatchDetection();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
   TestNativeShaderResourceDependencies();

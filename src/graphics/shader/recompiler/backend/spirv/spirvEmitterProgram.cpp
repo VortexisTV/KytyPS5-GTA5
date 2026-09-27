@@ -1,8 +1,10 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <functional>
 #include <optional>
@@ -50,9 +52,19 @@ struct DeferredPhiPatch {
 	uint32_t        half        = 0;
 };
 
+// A latch that is its loop's continue target and leaves the loop on one branch takes its back
+// edge through an empty continue block of its own. Left in the continue construct, the loop body
+// and its subgroup operations miscompile on NVIDIA (GeForce driver 616.56): lanes that already
+// left the loop stay in readfirstlane's ballot, so a GTA V skinning waterfall never ends.
+struct SplitLatch {
+	uint32_t         continue_label = 0;
+	const IR::Block* header         = nullptr;
+};
+
 struct StructuredFunctionState {
-	std::unordered_map<const IR::Block*, uint32_t> block_exit_labels;
-	std::vector<DeferredPhiPatch>                  deferred_phis;
+	std::unordered_map<const IR::Block*, uint32_t>   block_exit_labels;
+	std::unordered_map<const IR::Block*, SplitLatch> split_latches;
+	std::vector<DeferredPhiPatch>                    deferred_phis;
 };
 
 struct DispatcherFunctionState {
@@ -121,16 +133,204 @@ uint32_t BranchCondition(ValueEmitContext& ctx, const IR::BlockInfo& info) {
 	return result;
 }
 
+uint32_t LoopWatchdogElement(EmitterState& state, uint32_t index) {
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+	                          state.loop_watchdog_variable, ConstantU32(state, 0),
+	                          ConstantU32(state, index));
+	return pointer;
+}
+
+// Whether the invocation has used up its loop iterations.
+uint32_t EmitLoopWatchdogExhausted(EmitterState& state) {
+	const auto count = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), count, state.loop_watchdog_counter);
+	const auto exhausted = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), exhausted, count,
+	                          ConstantU32(state, IR::LoopWatchdog::IterationLimit));
+	return exhausted;
+}
+
+// The branch condition of a block that can leave a watched loop, taking the exit once the
+// invocation's iterations are used up. The exit edge exists already, so no phi gains a predecessor.
+uint32_t EmitLoopWatchdogExit(ValueEmitContext& ctx, const IR::BlockInfo& info, bool exit_on_true) {
+	auto&      state     = ctx.state;
+	const auto condition = BranchCondition(ctx, info);
+	const auto exhausted = EmitLoopWatchdogExhausted(state);
+	const auto result    = state.builder.AllocateId();
+	if (exit_on_true) {
+		state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), result, condition, exhausted);
+	} else {
+		const auto within = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLogicalNot, TypeBool(state), within, exhausted);
+		state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), result, condition, within);
+	}
+	return result;
+}
+
+// Counts one back-edge check of a structured loop latch. An invocation that reaches the limit or,
+// when loops are timed, outlasts its tick budget is cut and records the cut, the first one the
+// shader and loop header; every AbortCheckInterval checks an invocation also uses up its
+// iterations once any cut has happened. A conditional latch then leaves through its exit edge, and
+// its branch condition is returned; an unconditional one leaves at the loop's next exit branch
+// (EmitLoopWatchdogExit), and 0 is returned.
+uint32_t EmitLoopWatchdog(ValueEmitContext& ctx, const IR::BlockInfo& latch,
+                          const IR::BlockInfo& header, bool conditional, bool back_edge_on_true) {
+	using Watchdog       = IR::LoopWatchdog;
+	auto&      state     = ctx.state;
+	const auto condition = conditional ? BranchCondition(ctx, latch) : 0u;
+	const auto previous  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), previous, state.loop_watchdog_counter);
+	const auto count = EmitAddU32(state, previous, ConstantU32(state, 1));
+	state.builder.AddFunction(spv::OpStore, state.loop_watchdog_counter, count);
+	auto tripped = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), tripped, count,
+	                          ConstantU32(state, Watchdog::IterationLimit));
+	// A latch about to leave its loop anyway is not cut.
+	const auto continuing = [&](uint32_t cut) {
+		if (!conditional) {
+			return cut;
+		}
+		auto takes_back_edge = condition;
+		if (!back_edge_on_true) {
+			takes_back_edge = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLogicalNot, TypeBool(state), takes_back_edge,
+			                          condition);
+		}
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), result, takes_back_edge, cut);
+		return result;
+	};
+	tripped          = continuing(tripped);
+	const auto phase = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), phase, count,
+	                          ConstantU32(state, Watchdog::AbortCheckInterval - 1u));
+	const auto periodic = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), periodic, phase,
+	                          ConstantU32(state, 0));
+	const auto rare = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), rare, tripped, periodic);
+	EmitIfCondition(state, rare, [&]() {
+		const auto scope   = ConstantU32(state, spv::ScopeDevice);
+		const auto relaxed = ConstantU32(state, spv::MemorySemanticsMaskNone);
+		auto       cut_now = tripped;
+		if (state.loop_watchdog_start != 0) {
+			// Only the low clock word is kept: it wraps after seconds, well past any budget.
+			const auto clock = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpReadClockKHR, TypeU32Vector(state, 2), clock, scope);
+			const auto now = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), now, clock, 0);
+			const auto first_check = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpIEqual, TypeBool(state), first_check, count,
+			                          ConstantU32(state, Watchdog::AbortCheckInterval));
+			const auto saved = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLoad, TypeU32(state), saved,
+			                          state.loop_watchdog_start);
+			const auto start = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpSelect, TypeU32(state), start, first_check, now,
+			                          saved);
+			state.builder.AddFunction(spv::OpStore, state.loop_watchdog_start, start);
+			const auto elapsed = EmitBinaryU32(state, spv::OpISub, now, start);
+			const auto budget  = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLoad, TypeU32(state), budget,
+			                          LoopWatchdogElement(state, Watchdog::TickBudget));
+			const auto expired = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), expired, elapsed,
+			                          budget);
+			const auto limit_reached = cut_now;
+			cut_now                  = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), cut_now, limit_reached,
+			                          continuing(expired));
+		}
+		const auto hash = state.program.shader_hash;
+		const auto slot = Watchdog::Slot(hash);
+		EmitIfCondition(state, cut_now, [&]() {
+			const auto trips = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAtomicIAdd, TypeU32(state), trips,
+			                          LoopWatchdogElement(state, Watchdog::TripCount), scope,
+			                          relaxed, ConstantU32(state, 1));
+			const auto slot_trips = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAtomicIAdd, TypeU32(state), slot_trips,
+			                          LoopWatchdogElement(state, slot + Watchdog::SlotTrips), scope,
+			                          relaxed, ConstantU32(state, 1));
+			const std::array<std::pair<uint32_t, uint32_t>, 3> slot_record {{
+			    {slot + Watchdog::SlotHashLow, static_cast<uint32_t>(hash)},
+			    {slot + Watchdog::SlotHashHigh, static_cast<uint32_t>(hash >> 32u)},
+			    {slot + Watchdog::SlotLoopPc, header.start_pc},
+			}};
+			for (const auto& [index, value]: slot_record) {
+				state.builder.AddFunction(spv::OpStore, LoopWatchdogElement(state, index),
+				                          ConstantU32(state, value));
+			}
+			const auto claimed = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAtomicCompareExchange, TypeU32(state), claimed,
+			                          LoopWatchdogElement(state, Watchdog::Claimed), scope, relaxed,
+			                          relaxed, ConstantU32(state, 1), ConstantU32(state, 0));
+			const auto first = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpIEqual, TypeBool(state), first, claimed,
+			                          ConstantU32(state, 0));
+			EmitIfCondition(state, first, [&]() {
+				const std::array<std::pair<uint32_t, uint32_t>, 3> record {{
+				    {Watchdog::HashLow, static_cast<uint32_t>(hash)},
+				    {Watchdog::HashHigh, static_cast<uint32_t>(hash >> 32u)},
+				    {Watchdog::LoopPc, header.start_pc},
+				}};
+				for (const auto& [index, value]: record) {
+					state.builder.AddFunction(spv::OpStore, LoopWatchdogElement(state, index),
+					                          ConstantU32(state, value));
+				}
+			});
+		});
+		// The invocation's own cut, if any, counts: its iterations are used up too. Only cuts of this
+		// shader do: another shader's runaway must not cut short a loop that would have finished.
+		const auto trips = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(state), trips,
+		                          LoopWatchdogElement(state, slot + Watchdog::SlotTrips), scope,
+		                          relaxed);
+		const auto cut = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), cut, trips,
+		                          ConstantU32(state, 0));
+		const auto remaining = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), remaining, cut,
+		                          ConstantU32(state, Watchdog::IterationLimit), count);
+		state.builder.AddFunction(spv::OpStore, state.loop_watchdog_counter, remaining);
+	});
+	if (!conditional) {
+		return 0;
+	}
+	const auto exhausted = EmitLoopWatchdogExhausted(state);
+	const auto result    = state.builder.AllocateId();
+	if (back_edge_on_true) {
+		const auto within = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLogicalNot, TypeBool(state), within, exhausted);
+		state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), result, condition, within);
+	} else {
+		state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), result, condition, exhausted);
+	}
+	return result;
+}
+
 void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
-                              const IR::BlockInfo& info) {
+                              const IR::BlockInfo& info, uint32_t precomputed_condition = 0,
+                              const StructuredFunctionState* structured = nullptr) {
 	const auto& program = ctx.state.program;
 	const auto& term       = info.terminator;
-	const auto  emit_merge = [&]() {
+	const auto  split_latch = [&](const IR::Block* latch) -> const SplitLatch* {
+		if (structured == nullptr) {
+			return nullptr;
+		}
+		const auto found = structured->split_latches.find(latch);
+		return found != structured->split_latches.end() ? &found->second : nullptr;
+	};
+	const auto emit_merge = [&]() {
 		if (term.loop_header) {
 			const auto* merge = TargetBlock(program, term.merge_block);
 			const auto* cont  = TargetBlock(program, term.continue_block);
 			if (merge != nullptr && cont != nullptr) {
-				ctx.state.builder.AddFunction(spv::OpLoopMerge, ctx.Label(merge), ctx.Label(cont),
+				const auto* split = split_latch(cont);
+				ctx.state.builder.AddFunction(spv::OpLoopMerge, ctx.Label(merge),
+				                              split != nullptr ? split->continue_label
+				                                               : ctx.Label(cont),
 				                              spv::LoopControlMaskNone);
 			}
 		} else if (term.kind == CFG::TerminatorKind::ConditionalBranch &&
@@ -160,10 +360,20 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 				EmitReturn(ctx);
 				return;
 			}
-			const auto condition = BranchCondition(ctx, info);
+			const auto condition =
+			    precomputed_condition != 0 ? precomputed_condition : BranchCondition(ctx, info);
 			emit_merge();
-			ctx.state.builder.AddFunction(spv::OpBranchConditional, condition,
-			                              ctx.Label(true_block), ctx.Label(false_block));
+			const auto* split = split_latch(block);
+			const auto  label = [&](const IR::Block* target) {
+				return split != nullptr && target == split->header ? split->continue_label
+				                                                   : ctx.Label(target);
+			};
+			ctx.state.builder.AddFunction(spv::OpBranchConditional, condition, label(true_block),
+			                              label(false_block));
+			if (split != nullptr) {
+				EmitLabel(ctx.state, split->continue_label);
+				ctx.state.builder.AddFunction(spv::OpBranch, ctx.Label(split->header));
+			}
 			return;
 		}
 		default: EmitReturn(ctx); return;
@@ -350,23 +560,62 @@ void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structu
 			if (found == structured.block_exit_labels.end()) {
 				ctx.Fail(*deferred.instruction, "has a predecessor that was not emitted");
 			}
+			auto label = found->second;
+			// A split latch reaches its header through its own continue block.
+			if (const auto split = structured.split_latches.find(predecessor);
+			    split != structured.split_latches.end() &&
+			    split->second.header == deferred.instruction->Parent()) {
+				label = split->second.continue_label;
+			}
 			ctx.state.builder.PatchDeferredPhi(
-			    deferred.phi, index, lane.Def(deferred.instruction->Arg(index)), found->second);
+			    deferred.phi, index, lane.Def(deferred.instruction->Arg(index)), label);
 		}
 	}
 }
 
 void EmitStructuredFunction(ValueEmitContext& ctx) {
 	const auto& program = ctx.state.program;
-	StructuredFunctionState structured;
+	StructuredFunctionState      structured;
+	std::unordered_set<uint32_t> watched_merges;
+	for (size_t index = 0; index < program.blocks.size(); index++) {
+		bool conditional = false;
+		bool on_true     = false;
+		const auto* header = IR::LoopLatchHeader(program, index, conditional, on_true);
+		if (header == nullptr) {
+			continue;
+		}
+		watched_merges.insert(header->terminator.merge_block);
+		if (conditional) {
+			structured.split_latches.emplace(
+			    program.blocks[index],
+			    SplitLatch {ctx.state.builder.AllocateId(), TargetBlock(program, header->id)});
+		}
+	}
 	ctx.state.builder.AddFunction(spv::OpBranch, ctx.Label(program.blocks.front()));
 	for (size_t index = 0; index < program.blocks.size(); index++) {
 		const auto* block = program.blocks[index];
 		EmitBlock(ctx, block, [&](ValueEmitContext& lane, const IR::Inst& inst) {
 			EmitStructuredInstruction(lane, structured, inst);
 		});
+		const auto& info        = program.block_info[index];
+		const auto& term        = info.terminator;
+		uint32_t    condition   = 0;
+		bool        conditional = false;
+		bool        on_true     = false;
+		if (ctx.state.loop_watchdog_counter != 0) {
+			if (const auto* header = IR::LoopLatchHeader(program, index, conditional, on_true)) {
+				condition = EmitLoopWatchdog(ctx, info, *header, conditional, on_true);
+			} else if (term.kind == CFG::TerminatorKind::ConditionalBranch &&
+			           !info.condition.IsEmpty() &&
+			           watched_merges.contains(term.true_block) !=
+			               watched_merges.contains(term.false_block)) {
+				condition =
+				    EmitLoopWatchdogExit(ctx, info, watched_merges.contains(term.true_block));
+			}
+		}
+		// The watchdog may have split the block; its branch leaves from the current label.
 		structured.block_exit_labels.emplace(block, ctx.state.current_label);
-		EmitStructuredTerminator(ctx, block, program.block_info[index]);
+		EmitStructuredTerminator(ctx, block, program.block_info[index], condition, &structured);
 	}
 	PatchStructuredPhis(ctx, structured);
 }
@@ -413,8 +662,19 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 		          [&](ValueEmitContext& lane, const IR::Inst& inst) {
 			          EmitDispatcherInstruction(lane, dispatcher, inst);
 		          });
-		const auto selected = EmitDispatcherNextPc(ctx, dispatcher, state.program.blocks[index],
-		                                           state.program.block_info[index]);
+		auto selected = EmitDispatcherNextPc(ctx, dispatcher, state.program.blocks[index],
+		                                     state.program.block_info[index]);
+		// A dispatcher has no loop exit to leave through, so a cut invocation ends.
+		if (state.loop_watchdog_counter != 0) {
+			if (const auto* target = IR::DispatcherBackEdgeTarget(state.program, index)) {
+				EmitLoopWatchdog(ctx, state.program.block_info[index], *target, false, false);
+				const auto exhausted = EmitLoopWatchdogExhausted(state);
+				const auto next      = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpSelect, TypeU32(state), next, exhausted,
+				                          ConstantU32(state, UINT32_MAX), selected);
+				selected = next;
+			}
+		}
 		next_pc_words.push_back(selected);
 		next_pc_words.push_back(state.current_label);
 		state.builder.AddFunction(spv::OpBranch, dispatcher.after_switch_label);
@@ -715,6 +975,12 @@ void EmitProgram(EmitterState& state) {
 			break;
 		}
 	}
+	if (state.loop_watchdog_variable != 0) {
+		state.loop_watchdog_counter = state.builder.AllocateId();
+		if (state.program.loop_watchdog_clock) {
+			state.loop_watchdog_start = state.builder.AllocateId();
+		}
+	}
 	state.builder.AddFunction(spv::OpFunction, TypeVoid(state),
 	                          state.mesh_guest_func != 0 ? state.mesh_guest_func : state.main_func,
 	                          spv::FunctionControlMaskNone, TypeFunction(state));
@@ -737,6 +1003,18 @@ void EmitProgram(EmitterState& state) {
 		state.builder.AddFunction(spv::OpVariable,
 		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
 		                          state.pixel_valid_mask_variable, spv::StorageClassFunction);
+	}
+	if (state.loop_watchdog_counter != 0) {
+		state.builder.AddFunction(spv::OpVariable,
+		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+		                          state.loop_watchdog_counter, spv::StorageClassFunction,
+		                          ConstantU32(state, 0));
+	}
+	if (state.loop_watchdog_start != 0) {
+		state.builder.AddFunction(spv::OpVariable,
+		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+		                          state.loop_watchdog_start, spv::StorageClassFunction,
+		                          ConstantU32(state, 0));
 	}
 	for (uint32_t half = 0; half < state.lane_count; half++) {
 		auto& lane = half == 0 ? ctx : high;

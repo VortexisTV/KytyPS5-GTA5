@@ -18,6 +18,10 @@ struct CompileOptions {
 	uint64_t                    shader_hash     = 0;
 	bool                        dump_ir                    = true;
 	bool                        early_dump                 = false;
+	// Watch structured loops for runaway iteration (see IR::LoopWatchdog).
+	bool                        loop_watchdog              = true;
+	// Also time loops with the device clock; needs shaderDeviceClock enabled on the device.
+	bool                        loop_watchdog_clock        = false;
 	const char*                 dump_label                 = nullptr;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
@@ -28,6 +32,7 @@ struct TranslateResult {
 	IR::Program program;
 	std::string decoded_dump;
 	std::string cfg_dump;
+	bool        skip_dispatch = false;
 };
 
 struct CompileResult {

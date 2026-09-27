@@ -5,6 +5,7 @@
 #include "common/perfStats.h"
 #include "common/profiler.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/gpuCrashDiagnostics.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/frameDump.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -710,7 +711,9 @@ Swapchain::Status Swapchain::Present() {
 		case vk::Result::eErrorSurfaceLostKHR:
 			LOGF("vkQueuePresentKHR returned vk::Result::eErrorSurfaceLostKHR\n");
 			return Status::SurfaceLost;
-		default: EXIT("vkQueuePresentKHR failed: %s\n", vk::to_string(result).c_str());
+		default:
+			ReportGpuFailure(m_window.graphic_ctx, "vkQueuePresentKHR", result);
+			EXIT("vkQueuePresentKHR failed: %s\n", vk::to_string(result).c_str());
 	}
 	m_frame_index = (m_frame_index + 1u) % static_cast<uint32_t>(m_images.size());
 	return Status::Success;

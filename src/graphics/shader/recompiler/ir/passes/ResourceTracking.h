@@ -9,6 +9,12 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 // descriptor_sources, then writes dense indices to handle flags and MemoryInfo.
 void TrackResources(Program& program);
 
+// A compute shader's images whose descriptors it picks per lane, such as the material textures of
+// ray-tracing hits, read a mid-grey, opaque stand-in until such texture tables are bound, rather
+// than the dispatch being skipped. Runs before the SRT plan, so the descriptor reads that fed them
+// fall away with the other dead code.
+void StandInRuntimeImages(Program& program);
+
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_RESOURCETRACKING_H_ */

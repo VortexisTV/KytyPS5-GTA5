@@ -139,6 +139,11 @@ inline constexpr auto EmitFPFloor32     = EmitGlsl<GLSLstd450Floor, IR::Type::F3
 inline constexpr auto EmitFPCeil32      = EmitGlsl<GLSLstd450Ceil, IR::Type::F32, uint32_t>;
 inline constexpr auto EmitFPTrunc32     = EmitGlsl<GLSLstd450Trunc, IR::Type::F32, uint32_t>;
 inline constexpr auto EmitFPFract32     = EmitGlsl<GLSLstd450Fract, IR::Type::F32, uint32_t>;
+uint32_t              EmitFPFma64(EmitterState& state, uint32_t a, uint32_t b, uint32_t c);
+uint32_t              EmitFPFract64(EmitterState& state, uint32_t value);
+uint32_t              EmitConvertF64S32(EmitterState& state, uint32_t value);
+uint32_t              EmitConvertF64F32(EmitterState& state, uint32_t value);
+uint32_t              EmitConvertF32F64(EmitterState& state, uint32_t value);
 uint32_t              EmitFPSin(EmitterState& state, uint32_t arg0);
 uint32_t              EmitFPCos(EmitterState& state, uint32_t arg0);
 #undef EMIT_NATIVE
@@ -155,6 +160,7 @@ inline constexpr auto EmitInstPrefetch = EmitVoid;
 void                  EmitBarrier(EmitterState& state);
 void                  EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitDispatchThreadCount(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitGetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitSetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitGetUserData(EmitterState& state, IR::ScalarReg reg);
@@ -271,6 +277,7 @@ inline constexpr auto EmitImageAtomicUMax32    = EmitImage;
 inline constexpr auto EmitImageAtomicAnd32     = EmitImage;
 inline constexpr auto EmitImageAtomicOr32      = EmitImage;
 inline constexpr auto EmitImageAtomicXor32     = EmitImage;
+uint32_t              EmitBvhIntersectRay(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitUnreachable(ValueEmitContext& ctx, const IR::Inst& inst);
 inline constexpr auto EmitPhi                        = EmitUnreachable;
 inline constexpr auto EmitTessellationBase           = EmitUnreachable;
