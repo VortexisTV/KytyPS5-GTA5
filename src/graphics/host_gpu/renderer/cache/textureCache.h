@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include <map>
+#include <optional>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -71,8 +72,18 @@ public:
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
-	[[nodiscard]] bool ClearMeta(uint64_t address);
+	// Marks the metadata at `address` cleared for every slice. A CMASK is cleared only by a fill
+	// whose value is known and is not 0xFFFFFFFF, which marks the surface expanded instead.
+	[[nodiscard]] bool ClearMeta(uint64_t address, std::optional<uint32_t> fill_value = {});
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
+
+	// A colour target with CMASK fast clears is cleared by a fill of its CMASK, not by writing its
+	// pixels. The first binding registers the CMASK; a later one reports, and consumes, a clear of
+	// `slice` made since.
+	[[nodiscard]] bool ConsumeColorFastClear(uint64_t cmask_address, uint32_t slice);
+	// Clears a colour target's subresources to its fast-clear colour, outside any render pass.
+	void ApplyColorFastClear(ImageId id, vk::Format format, const vk::ImageSubresourceRange& range,
+	                         const vk::ClearColorValue& color);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();

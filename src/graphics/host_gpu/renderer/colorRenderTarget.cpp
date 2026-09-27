@@ -138,8 +138,13 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	// Color-control state selects the color-buffer operation and logical blend operation.
 	// The normal copy operation is a regular color write, not an attachment clear.
 	// Nonlinear clear values are still stored as normalized components.
-	// Fast color clears are metadata driven and must be handled explicitly when
-	// that metadata path is implemented; render-pass load must preserve contents.
+	// Fast color clears are metadata driven: a fill of the CMASK clears the target, which the
+	// renderer applies when it next binds it. Render-pass load otherwise preserves contents.
+	if (rt.info.cmask_fast_clear_enable && rt.cmask.addr != 0) {
+		r.cmask_address = rt.cmask.addr;
+		r.clear_word0   = rt.clear_word0.word0;
+		r.clear_word1   = rt.clear_word1.word1;
+	}
 	uint32_t   width  = 0;
 	uint32_t   height = 0;
 	uint32_t   pitch  = 0;

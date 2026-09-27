@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/frameDump.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
@@ -372,6 +373,24 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	PerfStats::Add(PerfStats::CounterId::ImageCreates);
 	if (!info.data.Empty()) {
 		RegisterImage(id);
+	}
+	// A multisampled colour image is never uploaded: guest memory cannot describe its samples
+	// without the FMASK. It would otherwise start as whatever its allocation last held, which the
+	// guest hides with a CMASK fast clear; a draw never covers every sample of it. GTA V's
+	// reflection target showed that leftover memory as NaN blocks that spread into reflections.
+	auto& image = m_slot_images[id];
+	if (image.info.samples > 1 && !image.info.IsDepth() && image.backing.image != nullptr &&
+	    m_scheduler.Active()) {
+		auto& command = m_scheduler.Current();
+		command.EndRendering();
+		image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {},
+		              command.Handle());
+		const vk::ClearColorValue       zero {};
+		const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0,
+		                                      VK_REMAINING_MIP_LEVELS, 0,
+		                                      VK_REMAINING_ARRAY_LAYERS};
+		command.Handle().clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
+		                                 &zero, 1, &range);
 	}
 	return id;
 }
@@ -1978,6 +1997,17 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
                               const vk::ImageSubresourceRange& range, const vk::ClearValue& clear) {
 	auto& image = m_slot_images[id];
+	if (FrameDumpWatchAddress() == image.info.data.address) {
+		const auto& c = clear.color;
+		FrameDumpWatchNote(image.info.data.address,
+		                   fmt::format("cleared {} levels {}+{} layers {}+{} to float ({:g} {:g} {:g} "
+		                               "{:g}) bits ({:08x} {:08x} {:08x} {:08x}) depth {:g}",
+		                               vk::to_string(format), range.baseMipLevel, range.levelCount,
+		                               range.baseArrayLayer, range.layerCount, c.float32[0],
+		                               c.float32[1], c.float32[2], c.float32[3], c.uint32[0],
+		                               c.uint32[1], c.uint32[2], c.uint32[3],
+		                               clear.depthStencil.depth));
+	}
 	const auto aspects = image.info.IsDepth() ? ImageViewOps::DepthAspectMask(image.backing.format)
 	                                          : vk::ImageAspectFlagBits::eColor;
 	EXIT_IF(range.baseMipLevel >= image.info.resources.levels);
@@ -2339,14 +2369,41 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
 	return (found->second.clear_mask & (1u << slice)) != 0;
 }
 
-bool TextureCache::ClearMeta(uint64_t address) {
+bool TextureCache::ClearMeta(uint64_t address, std::optional<uint32_t> fill_value) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end()) {
 		return false;
 	}
+	// CMASK 0xF marks tiles expanded (uncompressed), the state a surface is put in before its
+	// pixels are read directly; any other fill value is a fast clear.
+	if (found->second.type == MetaDataInfo::Type::CMask &&
+	    (!fill_value || *fill_value == UINT32_MAX)) {
+		return false;
+	}
 	found->second.clear_mask = UINT32_MAX;
 	return true;
+}
+
+bool TextureCache::ConsumeColorFastClear(uint64_t cmask_address, uint32_t slice) {
+	std::scoped_lock lock {m_lock};
+	const auto [found, inserted] = m_surface_metas.try_emplace(
+	    cmask_address, MetaDataInfo {.type = MetaDataInfo::Type::CMask, .clear_mask = 0});
+	if (inserted || found->second.type != MetaDataInfo::Type::CMask || slice >= 32 ||
+	    (found->second.clear_mask & (1u << slice)) == 0) {
+		return false;
+	}
+	found->second.clear_mask &= ~(1u << slice);
+	return true;
+}
+
+void TextureCache::ApplyColorFastClear(ImageId id, vk::Format format,
+                                       const vk::ImageSubresourceRange& range,
+                                       const vk::ClearColorValue&       color) {
+	std::scoped_lock lock {m_lock};
+	vk::ClearValue   clear {};
+	clear.color = color;
+	ClearImage(m_scheduler.Current(), id, format, range, clear);
 }
 
 bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {

@@ -459,6 +459,75 @@ struct DrawCallInfo {
 	[[nodiscard]] const char* Name() const { return IsIndexed() ? "DrawIndex" : "DrawIndexAuto"; }
 };
 
+namespace {
+
+// A 16-, 11- or 10-bit float with a 5-bit exponent, as half floats and packed 11/11/10 hold it.
+float SmallFloatToFloat(uint32_t bits, uint32_t mantissa_bits, bool has_sign) {
+	const uint32_t mantissa = bits & ((1u << mantissa_bits) - 1u);
+	const uint32_t exponent = (bits >> mantissa_bits) & 0x1fu;
+	const bool     negative = has_sign && ((bits >> (mantissa_bits + 5u)) & 1u) != 0;
+	const auto     scale    = static_cast<float>(1u << mantissa_bits);
+	float          value    = 0.0f;
+	if (exponent == 0) {
+		value = std::ldexp(static_cast<float>(mantissa) / scale, -14);
+	} else if (exponent == 31) {
+		value = mantissa != 0 ? std::numeric_limits<float>::quiet_NaN()
+		                      : std::numeric_limits<float>::infinity();
+	} else {
+		value = std::ldexp(1.0f + static_cast<float>(mantissa) / scale,
+		                   static_cast<int>(exponent) - 15);
+	}
+	return negative ? -value : value;
+}
+
+// CB_COLOR_CLEAR_WORD0/1 hold a fast-clear colour in the target's own pixel encoding.
+bool DecodeFastClearColor(vk::Format format, uint32_t word0, uint32_t word1,
+                          vk::ClearColorValue& color) {
+	if (DecodePackedColorClear(format, word0, color)) {
+		return true;
+	}
+	color              = {};
+	const auto half    = [](uint32_t bits) { return SmallFloatToFloat(bits & 0xffffu, 10, true); };
+	const auto unorm16 = [](uint32_t bits) { return static_cast<float>(bits & 0xffffu) / 65535.0f; };
+	switch (format) {
+		case vk::Format::eB10G11R11UfloatPack32:
+			color.float32[0] = SmallFloatToFloat(word0 & 0x7ffu, 6, false);
+			color.float32[1] = SmallFloatToFloat((word0 >> 11u) & 0x7ffu, 6, false);
+			color.float32[2] = SmallFloatToFloat((word0 >> 22u) & 0x3ffu, 5, false);
+			color.float32[3] = 1.0f;
+			return true;
+		case vk::Format::eR16Sfloat: color.float32[0] = half(word0); return true;
+		case vk::Format::eR16G16Sfloat:
+			color.float32[0] = half(word0);
+			color.float32[1] = half(word0 >> 16u);
+			return true;
+		case vk::Format::eR16G16B16A16Sfloat:
+			color.float32[0] = half(word0);
+			color.float32[1] = half(word0 >> 16u);
+			color.float32[2] = half(word1);
+			color.float32[3] = half(word1 >> 16u);
+			return true;
+		case vk::Format::eR16Unorm: color.float32[0] = unorm16(word0); return true;
+		case vk::Format::eR16G16Unorm:
+			color.float32[0] = unorm16(word0);
+			color.float32[1] = unorm16(word0 >> 16u);
+			return true;
+		case vk::Format::eR16G16B16A16Unorm:
+			color.float32[0] = unorm16(word0);
+			color.float32[1] = unorm16(word0 >> 16u);
+			color.float32[2] = unorm16(word1);
+			color.float32[3] = unorm16(word1 >> 16u);
+			return true;
+		case vk::Format::eR32G32Sfloat:
+			color.float32[0] = std::bit_cast<float>(word0);
+			color.float32[1] = std::bit_cast<float>(word1);
+			return true;
+		default: return false;
+	}
+}
+
+} // namespace
+
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
                                                  uint32_t color_count, RenderDepthInfo& depth,
                                                  vk::ImageAspectFlags& feedback_aspects,
@@ -478,6 +547,35 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		if (owner == nullptr || (!owner->registered && !owner->info.data.Empty()) ||
 		    owner->binding.needs_rebind) {
 			EXIT("color target changed after render-state discovery\n");
+		}
+		if (target.cmask_address != 0 &&
+		    cache.ConsumeColorFastClear(target.cmask_address, target.guest_array_layer)) {
+			const auto&         view   = target.desc.view_info;
+			const auto          format = view.format;
+			vk::ClearColorValue color {};
+			if (DecodeFastClearColor(format, target.clear_word0, target.clear_word1, color)) {
+				cache.ApplyColorFastClear(
+				    target.image_id, format,
+				    {vk::ImageAspectFlagBits::eColor, view.base_level, 1, view.base_layer,
+				     view.layer_count},
+				    color);
+				static std::once_flag applied_once;
+				std::call_once(applied_once, [&] {
+					std::printf("Colour fast clear (CMASK) applied, first to target 0x%010" PRIx64
+					            " %s samples=%u colour (%g %g %g %g)\n",
+					            target.desc.info.data.address, vk::to_string(format).c_str(),
+					            target.desc.info.samples, color.float32[0], color.float32[1],
+					            color.float32[2], color.float32[3]);
+				});
+			} else {
+				static std::once_flag warning_once;
+				std::call_once(warning_once, [&] {
+					std::printf("Warning: a colour fast clear was skipped: clear colour of format %s "
+					            "is not decoded (0x%08x 0x%08x)\n",
+					            vk::to_string(format).c_str(), target.clear_word0,
+					            target.clear_word1);
+				});
+			}
 		}
 		const auto image_view = cache.FindRenderTarget(target.image_id, target.desc);
 		auto&      image      = cache.GetImage(target.image_id);
@@ -1212,9 +1310,44 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			// The watch records a copy, which a render pass does not allow; the next draw begins
 			// the pass again.
 			m_context.GetCommandScheduler().EndRendering();
-			FrameDumpWatchOperation(m_context, watched, draw.Name(),
-			                        buffer.GetShaders().GetVs().es_regs.data_addr,
-			                        buffer.GetShaders().GetPs().ps_regs.data_addr);
+			// How the target and its depth are set up says whether the draw could write at all.
+			const auto& hw       = buffer.GetRegisters();
+			const auto& rt       = hw.GetRenderTarget(state.color_info[i].target_slot);
+			const auto& depth    = state.depth_info;
+			const auto& metadata = depth.desc.info.metadata;
+			const auto  details  = fmt::format(
+                "rt{} fast_clear={} cmask=0x{:x} fmask=0x{:x} fmask_comp={} dcc={} "
+                "clear=({:08x} {:08x}) cb_mode={} | depth=0x{:x} test={} write={} op={} "
+                "clear={} load_clear={} htile=0x{:x}",
+                state.color_info[i].target_slot, rt.info.cmask_fast_clear_enable, rt.cmask.addr,
+                rt.fmask.addr, rt.info.fmask_compression_enable, rt.info.dcc_compression_enable,
+                rt.clear_word0.word0, rt.clear_word1.word1, hw.GetColorControl().mode,
+                depth.desc.info.data.address, depth.depth_test_enable, depth.depth_write_enable,
+                vk::to_string(depth.depth_compare_op), depth.depth_clear_enable,
+                depth.depth_load_clear_enable,
+                metadata.kind == ImageMetadataKind::Htile ? metadata.range.address : 0);
+			if (!FrameDumpWatchOperation(m_context, watched, draw.Name(),
+			                             buffer.GetShaders().GetVs().es_regs.data_addr,
+			                             buffer.GetShaders().GetPs().ps_regs.data_addr, details)) {
+				break;
+			}
+			// A draw spoils its target through what it samples as often as through its own code.
+			auto&      texture_cache = m_context.GetTextureCache();
+			const auto watch_inputs  = [&](const PreparedBindings& stage, const char* role) {
+				for (const auto& binding: stage.images) {
+					const auto* image   = texture_cache.m_slot_images.try_get(binding.image_id);
+					const auto  address = image != nullptr ? image->info.data.address : 0;
+					if (address != 0 && address != watched) {
+						FrameDumpWatchInput(m_context, address, role);
+					}
+				}
+			};
+			for (uint32_t stage = 0; stage < vertex_stages.size(); stage++) {
+				watch_inputs(bindings.vertex[stage], "vertex texture");
+			}
+			if (state.ps_active && bindings.pixel) {
+				watch_inputs(*bindings.pixel, "pixel texture");
+			}
 			break;
 		}
 	}
@@ -1485,6 +1618,14 @@ bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer, uint32_t render_
 	auto& destination = cache.GetImage(dst.image_id);
 	destination.Resolve(source, {src.guest_mip_level, 1, src.guest_array_layer, 1},
 	                    {dst.guest_mip_level, 1, dst.guest_array_layer, 1});
+	if (const auto watched = FrameDumpWatchAddress();
+	    watched != 0 && dst.desc.info.data.address == watched) {
+		const auto details = fmt::format("from 0x{:010x} samples={}", src.desc.info.data.address,
+		                                 static_cast<uint32_t>(source.backing.samples));
+		if (FrameDumpWatchOperation(m_context, watched, "Resolve", 0, 0, details)) {
+			FrameDumpWatchInput(m_context, src.desc.info.data.address, "resolve source");
+		}
+	}
 	return true;
 }
 

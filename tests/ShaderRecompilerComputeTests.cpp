@@ -5107,6 +5107,47 @@ public:
             write_only_consumed &&
                 texture_cache.IsMetaCleared(write_only_meta, 0),
             "a metadata write-only fill was not consumed as a clear");
+
+    // A CMASK is registered by its colour target's first binding, and only a fill with a known
+    // value other than 0xFFFFFFFF (expanded) clears it.
+    constexpr uint64_t cmask_meta = 0x0000000204202200ull;
+    Require(name, "CMASK registration",
+            !texture_cache.ConsumeColorFastClear(cmask_meta, 0) &&
+                texture_cache.IsMeta(cmask_meta) &&
+                !texture_cache.ConsumeColorFastClear(cmask_meta, 0),
+            "a first CMASK binding reported a clear or did not register");
+    const auto cmask_dispatch = [&](std::optional<uint32_t> fill_value) {
+      ShaderRecompiler::IR::CompiledShaderInfo program{};
+      ShaderRecompiler::IR::ResourceSnapshot snapshot;
+      const auto input = MakeInput(cmask_meta, false, true, program, snapshot);
+      if (fill_value) {
+        snapshot.uniform_fill.kind = ShaderRecompiler::IR::UniformFillKind::Buffer;
+        snapshot.uniform_fill.resource = 0;
+        snapshot.uniform_fill.value = *fill_value;
+      }
+      return RenderExecutorTestAccess::TryConsumeComputeMetaClear(executor, input,
+                                                                  command);
+    };
+    Require(name, "CMASK unknown fill preserved",
+            !cmask_dispatch(std::nullopt) &&
+                !texture_cache.ConsumeColorFastClear(cmask_meta, 0),
+            "a CMASK write of unknown value was taken as a fast clear");
+    Require(name, "CMASK expand preserved",
+            !cmask_dispatch(0xFFFFFFFFu) &&
+                !texture_cache.ClearMeta(cmask_meta, 0xFFFFFFFFu) &&
+                !texture_cache.ConsumeColorFastClear(cmask_meta, 0),
+            "a CMASK expand (0xFFFFFFFF) was taken as a fast clear");
+    Require(name, "CMASK compute clear consumed once",
+            cmask_dispatch(0xCCCCCCCCu) &&
+                texture_cache.ConsumeColorFastClear(cmask_meta, 0) &&
+                !texture_cache.ConsumeColorFastClear(cmask_meta, 0),
+            "a CMASK fill did not report exactly one fast clear");
+    Require(name, "CMASK DMA clear per slice",
+            texture_cache.ClearMeta(cmask_meta, 0u) &&
+                texture_cache.ConsumeColorFastClear(cmask_meta, 1) &&
+                texture_cache.ConsumeColorFastClear(cmask_meta, 0) &&
+                !texture_cache.ConsumeColorFastClear(cmask_meta, 1),
+            "a CMASK fill did not clear each slice once");
     scheduler.Finish();
     std::printf("[host]    %-32s ok\n", name);
   }
@@ -35811,6 +35852,11 @@ int main(int argc, char **argv) {
       RunGraphicsCase(&vulkan, test);
     }
     std::printf("ShaderRecompilerComputeTests: all compute and graphics cases passed\n");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--meta-clear-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckComputeMetaClearClassification();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--loop-watchdog-only") == 0) {

@@ -94,7 +94,13 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 			if (resource.written) {
 				const auto descriptor =
 				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-				if (cache.ClearMeta(descriptor.Base48())) {
+				// The value matters to a CMASK, which a fill can expand instead of clear.
+				const auto& fill       = resources.uniform_fill;
+				const auto  fill_value = fill.kind == ShaderRecompiler::IR::UniformFillKind::Buffer &&
+				                                 fill.resource == i
+				                             ? std::optional<uint32_t> {fill.value}
+				                             : std::nullopt;
+				if (cache.ClearMeta(descriptor.Base48(), fill_value)) {
 					return true;
 				}
 			}

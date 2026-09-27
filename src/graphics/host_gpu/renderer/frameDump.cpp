@@ -389,13 +389,16 @@ constexpr const char* WATCH_TRIGGER_FILE   = "kyty_watch.trigger";
 constexpr const char* WATCH_FILE           = "watch.txt";
 // Each watched operation holds a copy of the target until its readback runs, so the cap keeps
 // a frame's worth of them from filling host-visible memory. It is far more than a jump needs.
-constexpr uint32_t    WATCH_MAX_OPERATIONS = 32;
+constexpr uint32_t    WATCH_MAX_OPERATIONS = 1024;
+// The copies of one watch together stay under this, whatever the size of the watched image.
+constexpr uint64_t    WATCH_MAX_COPY_BYTES = 768ull * 1024ull * 1024ull;
 // No ordinary colour comes near this, so counting the texels above it says whether an operation
 // left something wild behind.
 constexpr float WATCH_LOUD_VALUE = 1000.0F;
 
 std::atomic<uint64_t> g_watch_address {0};
 std::atomic<uint32_t> g_watch_operations {0};
+std::atomic<uint64_t> g_watch_copy_bytes {0};
 
 struct WatchMeta {
 	vk::Format  format  = vk::Format::eUndefined;
@@ -405,8 +408,15 @@ struct WatchMeta {
 	uint64_t    bytes   = 0;
 	uint32_t    ordinal = 0;
 	std::string label;
+	// Written as a preview beside the watch log, so a stray value can be seen, not only counted.
+	std::string preview;
 };
 
+std::atomic<uint32_t>        g_watch_previews {0};
+// Inputs are copied the first time an operation reads them in a watch: the same few textures
+// feed most draws into one target, and each copy holds host-visible memory until it is read.
+std::mutex                   g_watch_input_mutex;
+std::unordered_set<uint64_t> g_watch_inputs;
 std::mutex                   g_watch_shader_mutex;
 std::unordered_set<uint64_t> g_watch_shaders;
 
@@ -426,6 +436,7 @@ void WatchStats(const WatchMeta& meta, const uint8_t* data) {
 	}
 	std::array<float, 4>    max_value {};
 	std::array<uint64_t, 4> loud {};
+	std::array<uint64_t, 4> non_finite {};
 	std::array<float, 4>    texel {};
 	const uint64_t          texels = static_cast<uint64_t>(meta.width) * meta.height * meta.depth;
 	for (uint64_t i = 0; i < texels; i++) {
@@ -434,13 +445,24 @@ void WatchStats(const WatchMeta& meta, const uint8_t* data) {
 			if (std::isfinite(texel[c])) {
 				max_value[c] = std::max(max_value[c], texel[c]);
 				loud[c] += (texel[c] > WATCH_LOUD_VALUE ? 1 : 0);
+			} else {
+				non_finite[c]++;
 			}
 		}
 	}
 	static constexpr std::array channel_names {'R', 'G', 'B', 'A'};
-	auto                        line = fmt::format("{}", meta.label);
+	auto                        line = fmt::format("{} {}", meta.label, vk::to_string(meta.format));
 	for (uint32_t c = 0; c < layout.channels; c++) {
-		line += fmt::format(" | {}: max={:.6g} loud={}", channel_names[c], max_value[c], loud[c]);
+		line += fmt::format(" | {}: max={:.6g} loud={} nonfinite={}", channel_names[c],
+		                    max_value[c], loud[c], non_finite[c]);
+	}
+	if (!meta.preview.empty()) {
+		line += fmt::format(" -> watch/{}.ppm", meta.preview);
+		const auto      dir = std::filesystem::path("_FrameDump") / "watch";
+		std::error_code error;
+		std::filesystem::create_directories(dir, error);
+		WriteImage({dir, meta.preview, meta.format, meta.width, meta.height, meta.depth, meta.bytes},
+		           data);
 	}
 	WatchReport(line);
 }
@@ -475,11 +497,38 @@ void UpdateWatch(RenderContext& context) {
 		return;
 	}
 	g_watch_operations.store(0);
+	g_watch_copy_bytes.store(0);
+	{
+		std::lock_guard lock(g_watch_input_mutex);
+		g_watch_inputs.clear();
+	}
 	g_watch_address.store(address);
 	WatchReport(fmt::format("watch 0x{:010x}: armed for one frame", address));
 	// What the frame starts from tells a target that arrives spoiled apart from one an operation
 	// spoils.
 	WatchImage(context, address, "     at arm ");
+	// "clear" after the address wipes the target to zero first, so every value it holds at the
+	// flip was written this frame, by an operation the watch names.
+	if (text.find("clear") != std::string::npos) {
+		auto&                cache = context.GetTextureCache();
+		std::vector<ImageId> targets;
+		cache.DebugForEachImage([&](ImageId id, Image& image) {
+			if (image.info.data.address == address && image.backing.image != nullptr &&
+			    !image.info.IsDepth()) {
+				targets.push_back(id);
+			}
+		});
+		for (const auto id: targets) {
+			const auto& info = cache.GetImage(id).info;
+			cache.ApplyColorFastClear(id, cache.GetImage(id).backing.format,
+			                          {vk::ImageAspectFlagBits::eColor, 0, info.resources.levels, 0,
+			                           info.TransferLayers()},
+			                          {});
+		}
+		WatchReport(fmt::format("watch 0x{:010x}: {} image(s) cleared to zero at arm", address,
+		                        targets.size()));
+		WatchImage(context, address, "     cleared");
+	}
 }
 
 } // namespace
@@ -521,17 +570,48 @@ void WatchImage(RenderContext& context, uint64_t address, const std::string& lab
 	auto& graphics  = context.GetGraphics();
 	cache.DebugForEachImage([&](ImageId /*id*/, Image& image) {
 		const auto& backing = image.backing;
-		if (image.info.data.address != address || backing.image == nullptr ||
-		    backing.samples != 1 || image.info.IsDepth()) {
+		if (image.info.data.address != address || backing.image == nullptr) {
 			return;
 		}
 		const auto     layout = LayoutOf(backing.format);
 		const auto     depth = backing.image_type == vk::ImageType::e3D ? backing.extent.depth : 1U;
 		const uint64_t bytes = static_cast<uint64_t>(backing.extent.width) * backing.extent.height *
 		                       depth * layout.bytes;
-		if (layout.bytes == 0 || bytes == 0 || bytes > MAX_IMAGE_BYTES ||
-		    !(backing.usage & vk::ImageUsageFlagBits::eTransferSrc)) {
+		// A multisampled target is resolved into a scratch image first; a sample holding NaN
+		// keeps its pixel NaN, which is what the watch looks for.
+		const bool multisampled = backing.samples != 1;
+		// An image the watch cannot copy is still named, so a chain through it is not lost.
+		const char* skip = image.info.IsDepth()        ? "depth"
+		                   : layout.bytes == 0         ? "format not decoded"
+		                   : bytes == 0 || bytes > MAX_IMAGE_BYTES ? "size"
+		                   : multisampled && (depth != 1 || image.info.IsVolume())
+		                       ? "multisampled volume"
+		                   : !(backing.usage & vk::ImageUsageFlagBits::eTransferSrc)
+		                       ? "no transfer source"
+		                   : g_watch_copy_bytes.fetch_add(bytes) + bytes > WATCH_MAX_COPY_BYTES
+		                       ? "watch copy budget spent"
+		                       : nullptr;
+		if (skip != nullptr) {
+			WatchReport(fmt::format("{} 0x{:010x} {}x{} {} samples={}: not copied ({})", label,
+			                        address, backing.extent.width, backing.extent.height,
+			                        vk::to_string(backing.format),
+			                        static_cast<uint32_t>(backing.samples), skip));
 			return;
+		}
+		std::shared_ptr<Image> resolved;
+		Image*                 source = &image;
+		if (multisampled) {
+			auto info             = image.info;
+			info.data             = {};
+			info.stencil          = {};
+			info.metadata         = {};
+			info.samples          = 1;
+			info.pixel_format     = backing.format;
+			info.resources.levels = 1;
+			info.resources.layers = 1;
+			resolved = std::make_shared<Image>(graphics, scheduler, info);
+			resolved->Resolve(image, {0, 1, 0, 1}, {0, 1, 0, 1});
+			source = resolved.get();
 		}
 		auto buffer = std::make_shared<Buffer>(graphics, scheduler, MemoryUsage::Download, 0,
 		                                       vk::BufferUsageFlagBits::eTransferDst, bytes);
@@ -539,7 +619,7 @@ void WatchImage(RenderContext& context, uint64_t address, const std::string& lab
 		copy.bufferOffset     = 0;
 		copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
 		copy.imageExtent      = {backing.extent.width, backing.extent.height, depth};
-		image.Download(std::span {&copy, 1}, buffer->Handle(), 0, bytes);
+		source->Download(std::span {&copy, 1}, buffer->Handle(), 0, bytes);
 		WatchMeta meta {backing.format,
 		                backing.extent.width,
 		                backing.extent.height,
@@ -547,23 +627,28 @@ void WatchImage(RenderContext& context, uint64_t address, const std::string& lab
 		                bytes,
 		                0,
 		                fmt::format("{} 0x{:010x} {}x{}", label, address, backing.extent.width,
-		                            backing.extent.height)};
-		scheduler.DeferPriorityOperation([buffer, meta] {
+		                            backing.extent.height),
+		                fmt::format("{:03}_{:010x}", g_watch_previews.fetch_add(1), address)};
+		if (multisampled) {
+			meta.label += fmt::format(" samples={} resolved", static_cast<uint32_t>(backing.samples));
+		}
+		// The scratch image lives until the copy out of it has run.
+		scheduler.DeferPriorityOperation([buffer, meta, resolved] {
 			buffer->Invalidate(0, meta.bytes);
 			WatchStats(meta, buffer->Mapped().data());
 		});
 	});
 }
 
-void FrameDumpWatchOperation(RenderContext& context, uint64_t address, const char* kind,
+bool FrameDumpWatchOperation(RenderContext& context, uint64_t address, const char* kind,
                              uint64_t first_shader, uint64_t second_shader,
                              const std::string& details) {
 	if (g_watch_address.load(std::memory_order_relaxed) != address) {
-		return;
+		return false;
 	}
 	const auto ordinal = g_watch_operations.fetch_add(1);
 	if (ordinal >= WATCH_MAX_OPERATIONS) {
-		return;
+		return false;
 	}
 	FrameDumpWatchShader(first_shader);
 	FrameDumpWatchShader(second_shader);
@@ -573,11 +658,25 @@ void FrameDumpWatchOperation(RenderContext& context, uint64_t address, const cha
 		label += " " + details;
 	}
 	WatchImage(context, address, label);
+	return true;
+}
+
+void FrameDumpWatchNote(uint64_t address, const std::string& text) {
+	if (address == 0 || g_watch_address.load(std::memory_order_relaxed) != address) {
+		return;
+	}
+	WatchReport(fmt::format("     note 0x{:010x}: {}", address, text));
 }
 
 void FrameDumpWatchInput(RenderContext& context, uint64_t address, const char* role) {
 	if (g_watch_address.load(std::memory_order_relaxed) == 0) {
 		return;
+	}
+	{
+		std::lock_guard lock(g_watch_input_mutex);
+		if (!g_watch_inputs.insert(address).second) {
+			return;
+		}
 	}
 	WatchImage(context, address, fmt::format("     read {}", role));
 }
