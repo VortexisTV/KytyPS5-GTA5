@@ -457,8 +457,9 @@ void TestSaveAllocations() {
 	CHECK(search.hit_num == 0 && search.set_num == 0);
 	CHECK(fs::file_size(metadata) == 7);
 	CHECK(fs::remove(metadata));
-	CHECK(SaveDataDirNameSearch(&cond, &search) == SAVE_DATA_ERROR_BROKEN);
-	CHECK(search.hit_num == 0 && search.set_num == 0);
+	CHECK(SaveDataDirNameSearch(&cond, &search) == OK && search.set_num == 2);
+	CHECK(infos[0].blocks == SAVE_DATA_BLOCKS_MAX && infos[0].free_blocks == SAVE_DATA_BLOCKS_MAX);
+	CHECK(infos[1].blocks == allocations[1]);
 	CHECK(!fs::exists(metadata));
 }
 
@@ -472,6 +473,11 @@ void TestClassicSaveParams() {
 	mount.blocks     = 48;
 	SaveDataMountResult mounted {};
 	CHECK(SaveDataMount3(&mount, &mounted) == OK);
+	const fs::path saved = "_SaveData/PARAMS/slot";
+	CHECK(!fs::exists(saved / "sce_param.bin") && !fs::exists(saved / "sce_sys/param.bin"));
+	SaveDataParam loaded {};
+	CHECK(SaveDataGetParam(&mounted.mount_point, 0, &loaded, sizeof(loaded), nullptr) == OK);
+	CHECK(loaded.title[0] == '\0' && loaded.sub_title[0] == '\0' && loaded.user_param == 0);
 	SaveDataParam param {};
 	std::strcpy(param.title, "First save");
 	std::strcpy(param.sub_title, "Chapter 2");
@@ -482,26 +488,25 @@ void TestClassicSaveParams() {
 	CHECK(SaveDataSetParam(&mounted.mount_point, 0, &param, sizeof(param) - 1) ==
 	      SAVE_DATA_ERROR_PARAMETER);
 	CHECK(SaveDataSetParam(&mounted.mount_point, 0, &param, sizeof(param)) == OK);
-	const fs::path saved = "_SaveData/PARAMS/slot";
-	CHECK(fs::exists(saved / "sce_sys/param.bin"));
+	CHECK(fs::file_size(saved / "sce_param.bin") == sizeof(SaveDataParam));
+	CHECK(!fs::exists(saved / "sce_sys/param.bin"));
 	fs::create_directory(saved / "nested");
 	std::ofstream(saved / "nested/progress") << "payload";
-	SaveDataParam loaded {};
 	size_t got = 0;
 	CHECK(SaveDataGetParam(&mounted.mount_point, 0, &loaded, sizeof(loaded), &got) == OK);
 	CHECK(got == sizeof(loaded) && std::string(loaded.title) == "First save");
 	CHECK(std::string(loaded.sub_title) == "Chapter 2" && loaded.user_param == 42);
 	CHECK(loaded.mtime > 0);
 	fs::last_write_time(saved / "nested/progress",
-	                    fs::last_write_time(saved / "sce_sys/param.bin") + std::chrono::hours(2));
+	                    fs::last_write_time(saved / "sce_param.bin") + std::chrono::hours(2));
 	CHECK(SaveDataGetParam(&mounted.mount_point, 0, &loaded, sizeof(loaded), nullptr) == OK);
 	const int64_t nested_mtime = loaded.mtime;
 	CHECK(nested_mtime > static_cast<int64_t>(std::time(nullptr)) + 3600);
-	fs::create_directory(saved / "sce_sys/param.bin.tmp");
+	fs::create_directory(saved / "sce_param.bin.tmp");
 	std::strcpy(param.title, "Failed update");
 	CHECK(SaveDataSetParam(&mounted.mount_point, 0, &param, sizeof(param)) ==
 	      SAVE_DATA_ERROR_INTERNAL);
-	CHECK(fs::remove(saved / "sce_sys/param.bin.tmp"));
+	CHECK(fs::remove(saved / "sce_param.bin.tmp"));
 	CHECK(SaveDataGetParam(&mounted.mount_point, 0, &loaded, sizeof(loaded), nullptr) == OK);
 	CHECK(std::string(loaded.title) == "First save");
 	std::strcpy(param.title, "Updated save");
@@ -579,35 +584,85 @@ void TestClassicSaveParams() {
 	CHECK(params[0].mtime == nested_mtime);
 }
 
-void TestLegacySaveParams() {
-	Reset("LEGACY");
-	// The compact record older builds wrote, byte for byte as GTA V's story save left it.
-	const std::string legacy("KSDP\x01\0\0\0\0\0\0\0\xb4\x60\xb3\x6a\0\0\0\0"
-	                         "\x12\0\0\0Grand Theft Auto V"
-	                         "\x11\0\0\0Father/Son (4.0%)"
-	                         "\0\0\0\0",
-	                         67);
-	const fs::path param_path = "_SaveData/LEGACY/SAVEDATASGTA50002/sce_sys/param.bin";
-	fs::create_directories(param_path.parent_path());
-	std::ofstream(param_path, std::ios::binary) << legacy;
+// GTA V saves copied in from elsewhere: only the profile carries sce_param.bin and no save has
+// sce_sys. The game asks for each story slot by its exact name before offering to load it.
+void TestCopiedInSaves() {
+	Reset("COPIED");
+	const fs::path root = "_SaveData/COPIED";
+	SaveDataParam  profile {};
+	std::strcpy(profile.title, "Grand Theft Auto V");
+	std::strcpy(profile.sub_title, "Profile");
+	const auto write_param = [&](const fs::path& path) {
+		std::ofstream(path, std::ios::binary)
+		    .write(reinterpret_cast<const char*>(&profile), sizeof(profile));
+	};
+	fs::create_directories(root / "SAVEDATAPROFILE");
+	write_param(root / "SAVEDATAPROFILE/sce_param.bin");
+	std::ofstream(root / "SAVEDATAPROFILE/Profile") << "profile";
+	fs::create_directories(root / "SAVEDATASGTA50000");
+	std::ofstream(root / "SAVEDATASGTA50000/SGTA50000") << "story";
+	// Older builds kept parameters under sce_sys; those are no longer read.
+	fs::create_directories(root / "SAVEDATASGTA50001/sce_sys");
+	std::ofstream(root / "SAVEDATASGTA50001/SGTA50001") << "story";
+	write_param(root / "SAVEDATASGTA50001/sce_sys/param.bin");
 
 	const auto pattern = DirName("SAVEDATA%");
-	std::array<SceSaveDataDirName, 2> names {};
-	std::array<SaveDataParam, 2> params {};
-	SaveDataDirNameSearchCond cond {};
+	std::array<SceSaveDataDirName, 4> names {};
+	std::array<SaveDataParam, 4>      params {};
+	std::array<SaveDataSearchInfo, 4> infos {};
+	SaveDataDirNameSearchCond         cond {};
 	cond.user_id  = 1;
 	cond.dir_name = &pattern;
 	SaveDataDirNameSearchResult result {};
 	result.dir_names     = names.data();
 	result.dir_names_num = names.size();
 	result.params        = params.data();
-	CHECK(SaveDataDirNameSearch(&cond, &result) == OK && result.set_num == 1);
-	CHECK(std::string(names[0].data) == "SAVEDATASGTA50002");
+	result.infos         = infos.data();
+	CHECK(SaveDataDirNameSearch(&cond, &result) == OK && result.set_num == 3);
+	CHECK(std::string(names[0].data) == "SAVEDATAPROFILE");
+	CHECK(std::string(names[1].data) == "SAVEDATASGTA50000");
+	CHECK(std::string(names[2].data) == "SAVEDATASGTA50001");
 	CHECK(std::string(params[0].title) == "Grand Theft Auto V");
-	CHECK(std::string(params[0].sub_title) == "Father/Son (4.0%)");
-	CHECK(params[0].detail[0] == '\0' && params[0].user_param == 0 && params[0].mtime > 0);
+	CHECK(std::string(params[0].sub_title) == "Profile" && params[0].mtime > 0);
+	for (size_t i = 1; i < 3; i++) {
+		CHECK(params[i].title[0] == '\0' && params[i].sub_title[0] == '\0' && params[i].mtime > 0);
+	}
+	for (size_t i = 0; i < 3; i++) {
+		CHECK(infos[i].blocks == SAVE_DATA_BLOCKS_MAX && infos[i].free_blocks == SAVE_DATA_BLOCKS_MAX);
+	}
 
-	fs::resize_file(param_path, legacy.size() - 1);
+	const auto slot      = DirName("SAVEDATASGTA50000");
+	cond.dir_name        = &slot;
+	result.dir_names_num = 1;
+	CHECK(SaveDataDirNameSearch(&cond, &result) == OK && result.hit_num == 1);
+	CHECK(std::string(names[0].data) == "SAVEDATASGTA50000");
+
+	// Saving into the slot: the game's own title gives it a parameter file, and nothing more.
+	struct SaveDataMount3 mount {};
+	mount.user_id    = 1;
+	mount.dir_name   = &slot;
+	mount.mount_mode = 34;
+	mount.blocks     = SAVE_DATA_BLOCKS_MAX;
+	SaveDataMountResult mounted {};
+	CHECK(SaveDataMount3(&mount, &mounted) == OK && mounted.mount_status == 0);
+	SaveDataParam loaded {};
+	CHECK(SaveDataGetParam(&mounted.mount_point, 0, &loaded, sizeof(loaded), nullptr) == OK);
+	CHECK(loaded.title[0] == '\0' && loaded.mtime > 0);
+	SaveDataMountInfo info {};
+	CHECK(SaveDataGetMountInfo(&mounted.mount_point, &info) == OK);
+	CHECK(info.blocks == SAVE_DATA_BLOCKS_MAX);
+	CHECK(!fs::exists(root / "SAVEDATASGTA50000/sce_param.bin"));
+	constexpr char sub_title[] = "Father/Son (4.0%)";
+	CHECK(SaveDataSetParam(&mounted.mount_point, 2, sub_title, sizeof(sub_title)) == OK);
+	CHECK(SaveDataGetParam(&mounted.mount_point, 0, &loaded, sizeof(loaded), nullptr) == OK);
+	CHECK(loaded.title[0] == '\0' && std::string(loaded.sub_title) == sub_title);
+	CHECK(SaveDataUmount2(0, &mounted.mount_point) == OK);
+	CHECK(fs::file_size(root / "SAVEDATASGTA50000/sce_param.bin") == sizeof(SaveDataParam));
+	CHECK(!fs::exists(root / "SAVEDATASGTA50000/sce_sys"));
+
+	fs::resize_file(root / "SAVEDATAPROFILE/sce_param.bin", sizeof(SaveDataParam) - 1);
+	cond.dir_name        = &pattern;
+	result.dir_names_num = names.size();
 	CHECK(SaveDataDirNameSearch(&cond, &result) == SAVE_DATA_ERROR_BROKEN);
 	CHECK(result.hit_num == 0 && result.set_num == 0);
 }
@@ -654,7 +709,7 @@ int main(int argc, char** argv) {
 	TestClassicSavePaths();
 	TestSaveAllocations();
 	TestClassicSaveParams();
-	TestLegacySaveParams();
+	TestCopiedInSaves();
 	CHECK(SaveDataTerminate() == OK);
 	fs::current_path(previous);
 	fs::remove_all(temp);
