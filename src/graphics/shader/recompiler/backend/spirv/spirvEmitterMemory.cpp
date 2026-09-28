@@ -1589,18 +1589,7 @@ void EmitSharedFloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst) {
 			    AtomicUpdate(
 			        ctx.state, EmitMemoryElementPointer(ctx.state, access.resource, access.index),
 			        mem.kind, [&](uint32_t old) {
-				        const auto old_f =
-				            Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), old);
-				        const auto compare_f =
-				            Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), ctx.Arg(inst, 2));
-				        const auto data_f =
-				            Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), data);
-				        const auto compare = Binary(
-				            ctx.state, max_value ? spv::OpFOrdGreaterThan : spv::OpFOrdLessThan,
-				            TypeBool(ctx.state), max_value ? old_f : compare_f,
-				            max_value ? compare_f : old_f);
-				        return Unary(ctx.state, spv::OpBitcast, TypeU32(ctx.state),
-				                     Select(ctx.state, TypeF32(ctx.state), compare, data_f, old_f));
+				        return EmitFloatAtomicReplacement(ctx.state, old, data, max_value);
 			        });
 		    });
 	});

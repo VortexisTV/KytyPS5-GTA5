@@ -332,23 +332,50 @@ static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 51u);
 struct LoopWatchdog {
 	static constexpr uint32_t IterationLimit     = 1u << 20;
 	static constexpr uint32_t AbortCheckInterval = 1u << 8;
-	// 134 ms on NVIDIA's nanosecond device clock and 1.3 s on AMD's 100 MHz one, both inside the
-	// 2 s Windows GPU timeout.
+	// 1.3 s on AMD's 100 MHz device clock, inside the 2 s Windows GPU timeout.
 	static constexpr uint32_t DefaultTickBudget = 1u << 27;
+	// NVIDIA's device clock counts nanoseconds, where DefaultTickBudget is only 134 ms. That cut
+	// GTA V's ray traversals, which were not looping: with millions of rays sharing the GPU, the
+	// slowest took over 134 ms after about 25,000 iterations. This is 805 ms.
+	static constexpr uint32_t NvidiaTickBudget = 3u << 28;
+	[[nodiscard]] static constexpr uint32_t TickBudgetFor(uint32_t vendor_id) {
+		return vendor_id == 0x10deu ? NvidiaTickBudget : DefaultTickBudget;
+	}
 	static constexpr uint32_t TripCount      = 0;
 	static constexpr uint32_t Claimed        = 1;
 	static constexpr uint32_t HashLow        = 2;
 	static constexpr uint32_t HashHigh       = 3;
 	static constexpr uint32_t LoopPc         = 4;
 	static constexpr uint32_t TickBudget     = 5;
+	// Of the cuts, how many the time budget made before the iteration limit, and the most back
+	// edges a cut invocation had taken: a slow loop that would have ended shows as time cuts at
+	// counts far below IterationLimit.
+	static constexpr uint32_t TimeCuts       = 6;
+	static constexpr uint32_t CutIterations  = 7;
+	// Device clock ticks one compute dispatch may run, from the first abort check any of its
+	// invocations makes; 0 turns the limit off. TickBudget bounds each invocation from its own
+	// start, which does not bound a dispatch whose waves each end in time but start one after
+	// another: GTA V's 4K ray dispatch ran past the 2 s Windows GPU timeout that way.
+	static constexpr uint32_t DispatchTickBudget = 8;
+	// 1.07 s on NVIDIA's nanosecond clock and 1.3 s on AMD's 100 MHz one.
+	static constexpr uint32_t NvidiaDispatchTickBudget  = 1u << 30;
+	static constexpr uint32_t DefaultDispatchTickBudget = 1u << 27;
+	[[nodiscard]] static constexpr uint32_t DispatchTickBudgetFor(uint32_t vendor_id) {
+		return vendor_id == 0x10deu ? NvidiaDispatchTickBudget : DefaultDispatchTickBudget;
+	}
 	// Per-shader slots: shaders whose hashes share a slot also share its count.
-	static constexpr uint32_t SlotBase       = 8;
+	static constexpr uint32_t SlotBase       = 16;
 	static constexpr uint32_t SlotCount      = 64;
 	static constexpr uint32_t SlotHashLow    = 0;
 	static constexpr uint32_t SlotHashHigh   = 1;
 	static constexpr uint32_t SlotLoopPc     = 2;
 	static constexpr uint32_t SlotTrips      = 3;
-	static constexpr uint32_t SlotDwords     = 4;
+	// The device clock at the dispatch's first abort check, never 0; 0 until then. The renderer
+	// clears it before each dispatch of a compute shader with watched loops.
+	static constexpr uint32_t SlotStart      = 4;
+	// How many of the slot's cuts were for time, not the iteration limit.
+	static constexpr uint32_t SlotTimeCuts   = 5;
+	static constexpr uint32_t SlotDwords     = 8;
 	static constexpr uint32_t DwordCount     = SlotBase + SlotCount * SlotDwords;
 
 	[[nodiscard]] static constexpr uint32_t Slot(uint64_t hash) {

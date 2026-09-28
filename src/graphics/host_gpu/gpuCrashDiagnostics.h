@@ -126,6 +126,12 @@ using DiagnosticMemoryReader =
                        std::vector<uint8_t>& cpu, std::string& note)>;
 void RegisterDiagnosticMemoryReader(DiagnosticMemoryReader reader);
 
+// The guest range of the cached buffer that holds `address`, or {0, 0} when none does. Set by the
+// buffer cache beside the reader, so a dump can take a whole structure the GPU built in a buffer,
+// such as a ray-tracing BVH pool whose trees a shader reaches through pointers.
+using DiagnosticBufferExtent = std::function<std::pair<uint64_t, uint64_t>(uint64_t address)>;
+void RegisterDiagnosticBufferExtent(DiagnosticBufferExtent extent);
+
 // Guest shaders the loop watchdog was recorded cutting in this many separate reports.
 constexpr uint32_t RunawayShaderReports = 3;
 
@@ -133,6 +139,13 @@ constexpr uint32_t RunawayShaderReports = 3;
 // whenever one is added, so a caller can keep its own copy and refresh it cheaply.
 [[nodiscard]] uint32_t              RunawayShaderGeneration();
 [[nodiscard]] std::vector<uint64_t> RunawayShaders();
+
+// A shader the watchdog cuts only for time is slow, not stuck: instead of listing it as a runaway,
+// its direct dispatches run in this many bands of workgroup rows, each its own submission, so none
+// nears the Windows GPU timeout. Starts at 1 and doubles after each report that cut it, up to
+// MaxDispatchSplit; only then do its cuts count towards RunawayShaderReports.
+constexpr uint32_t                  MaxDispatchSplit = 64;
+[[nodiscard]] uint32_t              DispatchSplit(uint64_t hash);
 
 } // namespace Libs::Graphics
 

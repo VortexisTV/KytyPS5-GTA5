@@ -637,6 +637,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
 
 	vk::ComputePipelineCreateInfo info {};
+	// A slow dispatch can run in bands of workgroup rows (DispatchSplit).
+	info.flags             = vk::PipelineCreateFlagBits::eDispatchBase;
 	info.stage             = comp_shader_stage_info;
 	info.layout            = pipeline.pipeline_layout;
 	info.basePipelineIndex = -1;

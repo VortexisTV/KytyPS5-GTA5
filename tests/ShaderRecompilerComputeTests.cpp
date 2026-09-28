@@ -1234,6 +1234,8 @@ struct TestCase {
   u32 expected_watchdog_loop_pc = UINT32_MAX;
   // Device clock ticks a timed loop may run before the watchdog cuts it.
   u32 watchdog_tick_budget = ShaderRecompiler::IR::LoopWatchdog::DefaultTickBudget;
+  // Off unless a case sets it, as for dispatches the renderer did not reset.
+  u32 watchdog_dispatch_budget = 0;
   // Cuts of another shader the watchdog buffer counts before the dispatch.
   u32 watchdog_prior_trips = 0;
   // DWORDs of the fault buffer (index, value) as the dispatch leaves them.
@@ -3659,6 +3661,10 @@ public:
       const auto shaders = RunawayShaders();
       return std::ranges::find(shaders, hash) != shaders.end();
     };
+    const auto budget = reinterpret_cast<u32 *>(buffer->Mapped().data())[Watchdog::TickBudget];
+    Require(name, "budget",
+            budget == Watchdog::DefaultTickBudget || budget == Watchdog::NvidiaTickBudget,
+            "the watchdog buffer did not start with a vendor's tick budget");
     for (u32 report = 1; report <= RunawayShaderReports; report++) {
       auto *words = reinterpret_cast<u32 *>(buffer->Mapped().data());
       words[Watchdog::TripCount] = 1;
@@ -3670,20 +3676,61 @@ public:
       ReportLoopWatchdog();
       Require(name, "report", words[Watchdog::TripCount] == 0 && words[Watchdog::Claimed] == 0,
               "the report did not clear the trip count");
-      Require(name, "report", words[Watchdog::TickBudget] == Watchdog::DefaultTickBudget,
+      Require(name, "report", words[Watchdog::TickBudget] == budget,
               "the report changed the tick budget");
       const bool last = report == RunawayShaderReports;
       Require(name, "runaway", listed() == last && (RunawayShaderGeneration() != generation) == last,
               last ? "a shader cut in every report was not listed as a runaway"
                    : "a shader was listed as a runaway too early");
     }
+    // A shader cut only for time is slow, not stuck: each report doubles how many parts its
+    // dispatches run in, and only once that cannot grow do its cuts count towards turning it off.
+    constexpr uint64_t slow_hash = 0x00c0ffee87654321ull;
+    RegisterDiagnosticShader(slow_hash, code);
+    const auto slow_listed = [&] {
+      const auto shaders = RunawayShaders();
+      return std::ranges::find(shaders, slow_hash) != shaders.end();
+    };
+    const auto report_time_cut = [&] {
+      auto *words = reinterpret_cast<u32 *>(buffer->Mapped().data());
+      const auto slot = Watchdog::Slot(slow_hash);
+      words[Watchdog::TripCount] = 4;
+      words[Watchdog::Claimed] = 1;
+      words[Watchdog::HashLow] = static_cast<u32>(slow_hash);
+      words[Watchdog::HashHigh] = static_cast<u32>(slow_hash >> 32u);
+      words[Watchdog::LoopPc] = 0x40;
+      words[Watchdog::TimeCuts] = 4;
+      words[Watchdog::CutIterations] = 5000;
+      words[slot + Watchdog::SlotHashLow] = static_cast<u32>(slow_hash);
+      words[slot + Watchdog::SlotHashHigh] = static_cast<u32>(slow_hash >> 32u);
+      words[slot + Watchdog::SlotLoopPc] = 0x40;
+      words[slot + Watchdog::SlotTrips] = 4;
+      words[slot + Watchdog::SlotTimeCuts] = 4;
+      buffer->Flush(0, Watchdog::DwordCount * sizeof(u32));
+      ReportLoopWatchdog();
+    };
+    Require(name, "split", DispatchSplit(slow_hash) == 1u,
+            "a shader the watchdog never cut does not run whole");
+    for (u32 split = 2; split <= MaxDispatchSplit; split *= 2) {
+      report_time_cut();
+      Require(name, "split", DispatchSplit(slow_hash) == split && !slow_listed(),
+              "a slow shader's dispatches were not split further, or it was turned off");
+    }
+    for (u32 report = 1; report <= RunawayShaderReports; report++) {
+      report_time_cut();
+    }
+    Require(name, "split", slow_listed() && DispatchSplit(slow_hash) == MaxDispatchSplit,
+            "a shader still cut at the largest split was not turned off");
+
     std::error_code error;
-    const auto dump =
-        Config::GetShaderLogFolder() / "diagnostics" / "00c0ffee12345678_loop_watchdog";
-    for (const auto *extension : {".bin", ".rdna2"}) {
-      auto path = dump;
-      path += extension;
-      std::filesystem::remove(path, error);
+    for (const auto *dump_name :
+         {"00c0ffee12345678_loop_watchdog", "00c0ffee87654321_loop_watchdog"}) {
+      const auto dump = Config::GetShaderLogFolder() / "diagnostics" / dump_name;
+      for (const auto *extension : {".bin", ".rdna2"}) {
+        auto path = dump;
+        path += extension;
+        std::filesystem::remove(path, error);
+      }
     }
     std::printf("[host]    %-32s ok\n", name);
   }
@@ -4768,11 +4815,13 @@ public:
       const auto summary = read_file(folder / "00d15ea5e0000001_dispatch.txt");
       const auto gpu = read_file(folder / "00d15ea5e0000001_mem_0207000000_gpu.bin");
       const auto cpu = read_file(folder / "00d15ea5e0000001_mem_0207000000_cpu.bin");
-      const auto filled = [](const std::string &bytes, uint32_t value) {
-        if (bytes.size() != dump_size) {
+      // The whole cached buffer is dumped, so pointers the shader follows stay inside the dump;
+      // the recorded range is its start.
+      const auto filled = [&buffer](const std::string &bytes, uint32_t value) {
+        if (bytes.size() != buffer.Size() || bytes.size() < dump_size) {
           return false;
         }
-        for (size_t offset = 0; offset < bytes.size(); offset += sizeof(uint32_t)) {
+        for (size_t offset = 0; offset < dump_size; offset += sizeof(uint32_t)) {
           uint32_t word = 0;
           std::memcpy(&word, bytes.data() + offset, sizeof(word));
           if (word != value) {
@@ -13947,6 +13996,7 @@ public:
       using Watchdog = ShaderRecompiler::IR::LoopWatchdog;
       std::vector<u32> watchdog_initial(Watchdog::DwordCount, 0u);
       watchdog_initial[Watchdog::TickBudget] = test.watchdog_tick_budget;
+      watchdog_initial[Watchdog::DispatchTickBudget] = test.watchdog_dispatch_budget;
       if (test.watchdog_prior_trips != 0) {
         // Another shader, in the slot after this one's, was cut first.
         const auto own = Watchdog::Slot(compiled.program.shader_hash);
@@ -20692,6 +20742,35 @@ void CheckLoopWatchdogTimesLoops(VulkanHarness *vulkan) {
               watchdog[Watchdog::Claimed] == 1u && watchdog[Watchdog::LoopPc] == 8u,
           "the watchdog did not record the timed-out loop");
   std::printf("[gpu]     %-32s ok (cut after %u iterations)\n", test.name, lanes[1]);
+
+  // A dispatch is timed as a whole too: with no budget per invocation, a dispatch budget of one
+  // tick cuts the loop at an abort check after the first, as a time cut.
+  auto dispatch = LoopWatchdogCutsRunawayLoop();
+  dispatch.name = "LoopWatchdogTimesDispatches";
+  dispatch.watchdog_tick_budget = UINT32_MAX;
+  dispatch.watchdog_dispatch_budget = 1;
+  const auto dispatch_compiled = CompileCase(dispatch, 32);
+  auto dispatch_buffer =
+      vulkan->CreateStorageBuffer(dispatch.name, {}, dispatch.expected.size());
+  vulkan->Dispatch(dispatch, dispatch_compiled, dispatch_buffer, nullptr, nullptr, nullptr,
+                   nullptr, nullptr);
+  const auto dispatch_lanes =
+      vulkan->ReadBuffer(dispatch.name, dispatch_buffer, dispatch.expected.size());
+  vulkan->DestroyBuffer(&dispatch_buffer);
+  bool dispatch_cut = dispatch_lanes[0] == 1;
+  for (size_t lane = 1; lane < dispatch_lanes.size(); lane++) {
+    dispatch_cut &= dispatch_lanes[lane] > Watchdog::AbortCheckInterval &&
+                    dispatch_lanes[lane] < Watchdog::IterationLimit &&
+                    dispatch_lanes[lane] % Watchdog::AbortCheckInterval == 0;
+  }
+  const auto &dispatch_watchdog = vulkan->LastLoopWatchdog();
+  Require(dispatch.name, "loop watchdog",
+          dispatch_cut && !dispatch_watchdog.empty() &&
+              dispatch_watchdog[Watchdog::TimeCuts] != 0 &&
+              dispatch_watchdog[Watchdog::CutIterations] < Watchdog::IterationLimit,
+          "the dispatch budget did not cut the loop as a time cut");
+  std::printf("[gpu]     %-32s ok (cut after %u iterations)\n", dispatch.name,
+              dispatch_lanes[1]);
 }
 
 TestCase VectorAddcUsesPerLaneCarryIn() {
@@ -21804,6 +21883,92 @@ TestCase VectorLaneWave32RuntimeSelectorWraps() {
   test.compute_info.wave_size = 32;
   test.compute_info.thread_ids_num = 1;
   test.compute_info.workgroup_register = 4;
+  test.has_compute_info = true;
+  return test;
+}
+
+// GTA V's ray traversal (shader 8395e43f382309df) keeps each lane's node stack in v42 as two
+// packed 16-bit counters: the low half an LDS byte address and the high half a depth that starts
+// at -56 and turns into a scratch offset once it reaches zero. These are its own instruction words.
+TestCase TraversalStackPackedCounters() {
+  using O = ShaderOpcode;
+  constexpr std::array<u32, 3> push{0xcc02482au, 0x100254ffu, 0x01000004u}; // v_pk_add_i16
+  constexpr std::array<u32, 3> pop{0xcc03502au, 0x0801ff2au, 0x01000004u};  // v_pk_sub_i16
+  constexpr std::array<u32, 2> low_address{0x261454f9u, 0x0504062au}; // v_min_u32 sdwa words
+  constexpr std::array<u32, 3> aperture{0xd559000bu, 0x04a9fe65u, 0x70000000u}; // v_med3_u32
+  constexpr std::array<u32, 2> empty{0x7d84c8f9u, 0x8405002au};     // v_cmp_eq_u32 sdwa
+  constexpr std::array<u32, 2> in_lds{0x7d32c6f9u, 0x8605002au};    // v_cmpx_lt_i16 sdwa, s99
+  constexpr std::array<u32, 2> has_room{0x7d32c8f9u, 0x8505002au};  // v_cmpx_lt_i16 sdwa, s100
+  constexpr std::array<u32, 2> depth_word{0x7e0002f9u, 0x0005062au};   // v_mov_b32 sdwa word 1
+  constexpr std::array<u32, 2> address_word{0x7e0002f9u, 0x0004062au}; // v_mov_b32 sdwa word 0
+
+  std::vector<u32> code;
+  const auto raw = [&code](const auto &words) {
+    code.insert(code.end(), words.begin(), words.end());
+  };
+  // Stores the exec mask a v_cmpx left, then gives the lane back its exec.
+  const auto store_exec = [&code](u32 dword_index) {
+    code.push_back(EncodeSMovB32(20, 126));
+    code.push_back(EncodeSMovB32(126, InlineU32(1)));
+    AppendStoreSgpr(&code, 20, dword_index);
+  };
+  AppendSMovLiteral(&code, 101, 0x80000000u);
+  AppendSMovLiteral(&code, 100, 0x00d4ffc8u);
+  code.push_back(EncodeSMovB32(99, InlineU32(0)));
+
+  AppendVMovLiteral(&code, 42, 0xffc80010u);
+  raw(empty);
+  AppendStoreSgpr(&code, 106, 0);
+  raw(push);
+  AppendStoreVgpr(&code, 42, 1);
+  raw(low_address);
+  AppendStoreVgpr(&code, 10, 2);
+  raw(aperture);
+  AppendStoreVgpr(&code, 11, 3);
+  raw(empty);
+  AppendStoreSgpr(&code, 106, 4);
+  raw(in_lds);
+  store_exec(5);
+  raw(has_room);
+  store_exec(6);
+  raw(pop);
+  AppendStoreVgpr(&code, 42, 7);
+
+  // The fifteenth entry crosses into scratch.
+  AppendVMovLiteral(&code, 42, 0xfffc0d10u);
+  raw(push);
+  AppendStoreVgpr(&code, 42, 8);
+  raw(low_address);
+  AppendStoreVgpr(&code, 10, 9);
+  raw(aperture);
+  AppendStoreVgpr(&code, 11, 10);
+  raw(in_lds);
+  store_exec(11);
+  raw(depth_word);
+  AppendStoreVgpr(&code, 0, 12);
+  raw(address_word);
+  AppendStoreVgpr(&code, 0, 13);
+  raw(pop);
+  AppendStoreVgpr(&code, 42, 14);
+
+  // A full stack has no room left.
+  AppendVMovLiteral(&code, 42, 0x00d40000u);
+  raw(has_room);
+  store_exec(15);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "TraversalStackPackedCounters";
+  test.code = std::move(code);
+  test.expected = {1u,          0xffcc0110u, 0x110u, 0x80000000u, 0u, 1u, 1u, 0xffc80010u,
+                   0x00000e10u, 0u,          0x70000000u, 0u, 0u, 0xe10u, 0xfffc0d10u, 0u};
+  test.opcodes = {O::S_MOV_B32,    O::V_MOV_B32,    O::V_CMP_EQ_U32, O::V_PK_ADD_I16,
+                  O::V_MIN_U32,    O::V_MED3_U32,   O::V_CMPX_LT_I16, O::V_PK_SUB_I16,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 1;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
   test.has_compute_info = true;
   return test;
 }
@@ -25314,6 +25479,107 @@ TestCase BvhIntersectRayNodes() {
   return test;
 }
 
+// A triangle node holds five vertices, and a triangle pointer's type picks one of four triangles
+// from them: (v0, v1, v2), (v1, v3, v2), (v2, v3, v4) or (v2, v4, v0), the way GTA V's BVH refit
+// (5981037b07e391d5) reads them. Rays go up through each triangle; the last lane's type 1 triangle
+// is missed by a ray through the type 0 one. Barycentrics are for the second and third vertex.
+TestCase BvhIntersectRayTriangleTypes() {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  constexpr uint64_t BvhOffset = 0x1000;
+  constexpr uint64_t BvhBase = GuestBase + BvhOffset;
+  constexpr u32 BvhDword = BvhOffset / 4;
+  constexpr u32 NodeByte = 256;
+  constexpr u32 InputDword = 512;
+  constexpr u32 Lanes = 5;
+  const auto f = [](float value) { return std::bit_cast<u32>(value); };
+  const u32 inf = 0x7f800000u;
+
+  TestCase test;
+  test.name = "BvhIntersectRayTriangleTypes";
+  test.initial.resize(2048);
+  const std::array<std::array<float, 3>, 5> vertices{
+      {{0, 0, 5}, {1, 0, 5}, {0, 1, 5}, {1, 1, 5}, {-1, 2, 5}}};
+  for (u32 vertex = 0; vertex < 5; ++vertex) {
+    for (u32 axis = 0; axis < 3; ++axis) {
+      test.initial[BvhDword + NodeByte / 4 + vertex * 3 + axis] = f(vertices[vertex][axis]);
+    }
+  }
+  const u32 node = NodeByte >> 3u;
+  const std::array<std::pair<u32, std::array<float, 2>>, Lanes> rays{{
+      {node | 0u, {0.25f, 0.25f}},
+      {node | 1u, {0.75f, 0.75f}},
+      {node | 2u, {0.25f, 1.25f}},
+      {node | 3u, {-0.25f, 0.75f}},
+      {node | 1u, {0.25f, 0.25f}},
+  }};
+  for (u32 lane = 0; lane < Lanes; ++lane) {
+    auto *input = &test.initial[InputDword + lane * 16];
+    input[0] = rays[lane].first;
+    input[1] = f(100.0f);
+    input[2] = f(rays[lane].second[0]);
+    input[3] = f(rays[lane].second[1]);
+    input[4] = f(0.0f);
+    input[5] = f(0.0f);
+    input[6] = f(0.0f);
+    input[7] = f(1.0f);
+    input[8] = inf;
+    input[9] = inf;
+    input[10] = f(1.0f);
+  }
+  using Result = std::array<u32, 4>;
+  const std::array<Result, Lanes> results{{
+      {f(-5), f(-1), f(-0.25f), f(-0.25f)},
+      {f(-5), f(-1), f(-0.5f), f(-0.25f)},
+      {f(-5), f(-1), f(-0.5f), f(-0.25f)},
+      {f(-5), f(-1), f(-0.25f), f(-0.5f)},
+      {inf, f(1), 0, 0},
+  }};
+  test.expected.assign(test.initial.begin(), test.initial.begin() + 64);
+  for (u32 lane = 0; lane < Lanes; ++lane) {
+    for (u32 k = 0; k < 4; ++k) {
+      test.expected[lane * 4 + k] = results[lane][k];
+    }
+  }
+
+  const std::array<u32, 4> descriptor{static_cast<u32>(BvhBase >> 8u),
+                                      static_cast<u32>((BvhBase >> 40u) & 0xffu) | (1u << 31u),
+                                      0xffffffffu, 0x3ffu | (1u << 24u) | (1u << 31u)};
+  for (u32 k = 0; k < 4; ++k) {
+    AppendSMovLiteral(&test.code, 20 + k, descriptor[k]);
+  }
+  test.code.push_back(EncodeVop2(0x1a, 2, InlineU32(6), 0)); // v_lshlrev_b32 v2, 6, v0
+  AppendVMovU32(&test.code, 3, InputDword * 4);
+  test.code.push_back(EncodeVop2(0x25, 2, Vgpr(3), 2));      // v_add_nc_u32 v2, v3, v2
+  for (u32 k = 0; k < 11; ++k) {
+    // buffer_load_dword v[10 + k], v2, s[0:3] offen offset:4k
+    test.code.push_back(EncodeMubuf0(0x0c, k * 4, false, true));
+    test.code.push_back(EncodeMubuf1(10 + k, 0, 2));
+  }
+  // image_bvh_intersect_ray v[44:47], v[10:20], s[20:23]
+  test.code.push_back(EncodeMimg0(0xe6, 0xf, 0, false, 0, true));
+  test.code.push_back(EncodeMimg1(44, 10, 5));
+  test.code.push_back(EncodeVop2(0x1a, 4, InlineU32(4), 0)); // v_lshlrev_b32 v4, 4, v0
+  for (u32 k = 0; k < 4; ++k) {
+    // buffer_store_dword v[44 + k], v4, s[48:51] offen offset:4k
+    test.code.push_back(EncodeMubuf0(0x1c, k * 4, false, true));
+    test.code.push_back(EncodeMubuf1(44 + k, 12, 4));
+  }
+  AppendEnd(&test.code);
+  test.bda_mappings = {{GuestBase, 0}};
+  test.opcodes = {O::S_MOV_B32,         O::V_LSHLREV_B32,     O::V_MOV_B32,
+                  O::V_ADD_NC_U32,      O::BUFFER_LOAD_DWORD, O::IMAGE_BVH_INTERSECT_RAY,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer"};
+  test.compute_info.wave_size = 32;
+  test.compute_info.threads_num[0] = Lanes;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 // GTA V skinning stores through a descriptor each lane picks: a readfirstlane waterfall keeps EXEC
 // in vcc_hi, stores for the lanes sharing the first active key, restores EXEC and retires them.
 // On NVIDIA this loop never ended while its body sat in the SPIR-V continue construct.
@@ -27718,7 +27984,60 @@ TestCase DsMiscVariants() {
   return test;
 }
 
-TestCase DsFloatMinMaxUsesSeparateCompareOperand() {
+// GTA V's ray traversal 2d3d16845fdb022a keeps per-lane variables in LDS with M0 = 0 and the
+// instruction offset naming the variable: 256-byte rows of one DWORD per lane of a wave64.
+TestCase DsAddtidOffsetsSeparateWave64Rows() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  code.push_back(EncodeSMovB32(124, InlineU32(0)));
+  code.push_back(EncodeVop2(0x1c, 1, 255, 0)); // v1 = 0x1000 | lane
+  code.push_back(0x1000u);
+  code.push_back(EncodeVop2(0x1c, 2, 255, 0)); // v2 = 0x2000 | lane
+  code.push_back(0x2000u);
+  code.push_back(EncodeDs0(0xb0, 0));
+  code.push_back(EncodeDs1(0, 1, 0));
+  code.push_back(EncodeDs0(0xb0, 256));
+  code.push_back(EncodeDs1(0, 2, 0));
+  code.push_back(EncodeDs0(0xb1, 0));
+  code.push_back(EncodeDs1(3, 0, 0));
+  code.push_back(EncodeDs0(0xb1, 256));
+  code.push_back(EncodeDs1(4, 0, 0));
+  // The second row is at byte 256 + lane * 4, where an ordinary read finds it.
+  code.push_back(EncodeVop2(0x1a, 6, InlineU32(2), 0));
+  code.push_back(EncodeDs0(0x36, 256));
+  code.push_back(EncodeDs1(5, 0, 6));
+  AppendStoreVgprAtLaneDwordOffset(&code, 3, 0, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, 4, 0, 64);
+  AppendStoreVgprAtLaneDwordOffset(&code, 5, 0, 128);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DsAddtidOffsetsSeparateWave64Rows";
+  test.code = code;
+  test.initial = std::vector<u32>(192, 0);
+  for (u32 row = 0; row < 3u; row++) {
+    for (u32 lane = 0; lane < 64u; lane++) {
+      test.expected.push_back((row == 0u ? 0x1000u : 0x2000u) | lane);
+    }
+  }
+  test.opcodes = {O::S_MOV_B32,           O::V_OR_B32,           O::DS_WRITE_ADDTID_B32,
+                  O::DS_READ_ADDTID_B32,  O::V_LSHLREV_B32,      O::DS_READ_B32,
+                  O::V_ADD_NC_U32,        O::V_MOV_B32,          O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 64;
+  test.compute_info.lds_size_dwords = 1024;
+  test.has_compute_info = true;
+  return test;
+}
+
+// DS_MIN_F32 and DS_MAX_F32 take the minimum or maximum of memory and the data operand; the
+// second data field (a compare value in the ISA manual's description) does not take part.
+TestCase DsFloatMinMaxIgnoreSecondDataOperand() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
@@ -27729,12 +28048,12 @@ TestCase DsFloatMinMaxUsesSeparateCompareOperand() {
   AppendVMovLiteral(&code, 3, 0x40800000u);
   code.push_back(EncodeDs0(0x0d, 4));
   code.push_back(EncodeDs1(0, 3, 1));
-  AppendVMovLiteral(&code, 4, 0x41100000u);
-  AppendVMovLiteral(&code, 5, 0x40000000u);
+  AppendVMovLiteral(&code, 4, 0x40000000u); // min(4, 2) with 9 in the second data field
+  AppendVMovLiteral(&code, 5, 0x41100000u);
   code.push_back(EncodeDs0(0x12, 0));
   code.push_back(EncodeDs1Ex(0, 5, 4, 1));
-  AppendVMovLiteral(&code, 6, 0x3f800000u);
-  AppendVMovLiteral(&code, 7, 0x40400000u);
+  AppendVMovLiteral(&code, 6, 0x40c00000u); // max(4, 6) with 7 in the second data field
+  AppendVMovLiteral(&code, 7, 0x40e00000u);
   code.push_back(EncodeDs0(0x13, 4));
   code.push_back(EncodeDs1Ex(0, 7, 6, 1));
   code.push_back(EncodeDs0(0x36, 0));
@@ -27746,16 +28065,66 @@ TestCase DsFloatMinMaxUsesSeparateCompareOperand() {
   AppendEnd(&code);
 
   TestCase test;
-  test.name = "DsFloatMinMaxUsesSeparateCompareOperand";
+  test.name = "DsFloatMinMaxIgnoreSecondDataOperand";
   test.code = code;
   test.initial = std::vector<u32>(2, 0);
-  test.expected = {0x41100000u, 0x3f800000u};
+  test.expected = {0x40000000u, 0x40c00000u};
   test.opcodes = {O::V_MOV_B32,  O::DS_WRITE_B32, O::DS_MIN_F32,
                   O::DS_MAX_F32, O::DS_READ_B32,  O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   test.compute_info.threads_num[0] = 1;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+// GTA V's BVH refit (5981037b07e391d5) merges a node's four child boxes: lane 0 of each quad
+// writes an empty box (+inf minimum, -inf maximum) to LDS, every lane folds its child in with
+// DS_MIN_F32 and DS_MAX_F32 (second data field v0, the lane id), and the box is read back.
+TestCase DsFloatMinMaxMergeLaneBoxes() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 0);
+  AppendVMovLiteral(&code, 2, 0x7f800000u);
+  code.push_back(EncodeDs0(0x0d, 0));
+  code.push_back(EncodeDs1(0, 2, 1));
+  AppendVMovLiteral(&code, 3, 0xff800000u);
+  code.push_back(EncodeDs0(0x0d, 4));
+  code.push_back(EncodeDs1(0, 3, 1));
+  code.push_back(EncodeSopp(0x0c, 0));
+  code.push_back(EncodeVop1(0x06, 4, Vgpr(0))); // v4 = float(lane)
+  code.push_back(EncodeVop2(0x04, 4, 255, 4));  // v4 = 1.5 - v4: 1.5, 0.5, -0.5, -1.5
+  code.push_back(0x3fc00000u);
+  code.push_back(EncodeDs0(0x12, 0));
+  code.push_back(EncodeDs1Ex(0, 0, 4, 1));
+  code.push_back(EncodeDs0(0x13, 4));
+  code.push_back(EncodeDs1Ex(0, 0, 4, 1));
+  code.push_back(EncodeSopp(0x0c, 0));
+  code.push_back(EncodeDs0(0x36, 0));
+  code.push_back(EncodeDs1(5, 0, 1));
+  code.push_back(EncodeDs0(0x36, 4));
+  code.push_back(EncodeDs1(6, 0, 1));
+  code.push_back(EncodeSopp(0x0c, 0));
+  AppendStoreVgprAtLaneDwordOffset(&code, 5, 0, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, 6, 0, 4);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DsFloatMinMaxMergeLaneBoxes";
+  test.code = code;
+  test.initial = std::vector<u32>(8, 0);
+  test.expected = {0xbfc00000u, 0xbfc00000u, 0xbfc00000u, 0xbfc00000u,
+                   0x3fc00000u, 0x3fc00000u, 0x3fc00000u, 0x3fc00000u};
+  test.opcodes = {O::V_MOV_B32,     O::DS_WRITE_B32,  O::S_WAITCNT,    O::V_CVT_F32_U32,
+                  O::V_SUB_F32,     O::DS_MIN_F32,    O::DS_MAX_F32,   O::DS_READ_B32,
+                  O::V_LSHLREV_B32, O::V_ADD_NC_U32,  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 4;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.lds_size_dwords = 64;
   test.has_compute_info = true;
   return test;
 }
@@ -30599,6 +30968,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorWritelaneIgnoresExecMask);
   AddCase(VectorReadlaneFromInactiveWrittenLane);
   AddCase(VectorLaneWave32RuntimeSelectorWraps);
+  AddCase(TraversalStackPackedCounters);
+  AddCase(DsAddtidOffsetsSeparateWave64Rows);
   AddCase(VectorReadlaneSelectsTwoKeysWithinWave);
   AddCase(VectorPermlanex16);
   AddCase(VectorPermlane16FetchInactiveZero);
@@ -30683,6 +31054,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferStoresGpuSelectedDescriptors);
   AddCase(BufferAtomicsGpuSelectedDescriptors);
   AddCase(BvhIntersectRayNodes);
+  AddCase(BvhIntersectRayTriangleTypes);
   AddCase(BufferFormattedLoadsGpuSelectedDescriptors);
   AddCase(RayTracingImageStandIn);
   AddCase(Float64HashAndWideCompares);
@@ -30775,7 +31147,8 @@ std::vector<TestCase> MakeCases() {
     }
   }
   AddCase(DsMiscVariants);
-  AddCase(DsFloatMinMaxUsesSeparateCompareOperand);
+  AddCase(DsFloatMinMaxIgnoreSecondDataOperand);
+  AddCase(DsFloatMinMaxMergeLaneBoxes);
   AddCase(DsSwizzleInvalidSourceLaneZero);
   AddCase(DsBpermuteCapturedExecOffsetAndWrap);
   AddCase(DsBpermuteWave64UsesIndependentHalves);
@@ -35612,11 +35985,16 @@ int ReplayDispatch(const std::string &folder, const std::string &hash_text, int 
 
   std::map<uint64_t, std::filesystem::path> ranges;
   const auto prefix = hash_text + "_mem_";
-  for (const auto &entry : std::filesystem::directory_iterator(folder)) {
-    const auto name = entry.path().filename().string();
-    if (name.rfind(prefix, 0) == 0 && name.size() >= prefix.size() + 18 &&
-        name.substr(name.size() - 8) == "_gpu.bin") {
-      ranges[std::strtoull(name.substr(prefix.size(), 10).c_str(), nullptr, 16)] = entry.path();
+  // The GPU's copy of each range is what the shader saw; a range no buffer cached has only the
+  // guest's copy, such as the tables its user data points at.
+  for (const auto *suffix : {"_gpu.bin", "_cpu.bin"}) {
+    for (const auto &entry : std::filesystem::directory_iterator(folder)) {
+      const auto name = entry.path().filename().string();
+      if (name.rfind(prefix, 0) == 0 && name.size() >= prefix.size() + 18 &&
+          name.substr(name.size() - 8) == suffix) {
+        ranges.try_emplace(std::strtoull(name.substr(prefix.size(), 10).c_str(), nullptr, 16),
+                           entry.path());
+      }
     }
   }
   // Ranges that overlap or touch share one region, so every access to a guest byte reaches the
@@ -35879,6 +36257,8 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--bvh-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, BvhIntersectRayNodes());
+    RunCase(&vulkan, BvhIntersectRayTriangleTypes());
+    RunCase(&vulkan, DsFloatMinMaxMergeLaneBoxes());
     RunCase(&vulkan, RayTracingImageStandIn());
     RunCase(&vulkan, Float64HashAndWideCompares());
     RunCase(&vulkan, FlatStoresReachGuestMemory());
@@ -36246,6 +36626,12 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--readlane-key-guard-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorReadlaneSelectsTwoKeysWithinWave());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--traversal-stack-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, TraversalStackPackedCounters());
+    RunCase(&vulkan, DsAddtidOffsetsSeparateWave64Rows());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--bda-sync-only") == 0) {

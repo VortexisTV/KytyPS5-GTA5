@@ -183,8 +183,11 @@ uint32_t EmitLoopWatchdog(ValueEmitContext& ctx, const IR::BlockInfo& latch,
 	state.builder.AddFunction(spv::OpLoad, TypeU32(state), previous, state.loop_watchdog_counter);
 	const auto count = EmitAddU32(state, previous, ConstantU32(state, 1));
 	state.builder.AddFunction(spv::OpStore, state.loop_watchdog_counter, count);
+	// Only the back edge that reaches the limit is a cut. An invocation made to leave its loops
+	// after another's cut has its count set to the limit, and its next back edge, in an outer
+	// loop, passes it without being counted again.
 	auto tripped = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), tripped, count,
+	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), tripped, count,
 	                          ConstantU32(state, Watchdog::IterationLimit));
 	// A latch about to leave its loop anyway is not cut.
 	const auto continuing = [&](uint32_t cut) {
@@ -214,6 +217,9 @@ uint32_t EmitLoopWatchdog(ValueEmitContext& ctx, const IR::BlockInfo& latch,
 		const auto scope   = ConstantU32(state, spv::ScopeDevice);
 		const auto relaxed = ConstantU32(state, spv::MemorySemanticsMaskNone);
 		auto       cut_now = tripped;
+		uint32_t   by_time = 0;
+		const auto hash    = state.program.shader_hash;
+		const auto slot    = Watchdog::Slot(hash);
 		if (state.loop_watchdog_start != 0) {
 			// Only the low clock word is kept: it wraps after seconds, well past any budget.
 			const auto clock = state.builder.AllocateId();
@@ -234,16 +240,85 @@ uint32_t EmitLoopWatchdog(ValueEmitContext& ctx, const IR::BlockInfo& latch,
 			const auto budget  = state.builder.AllocateId();
 			state.builder.AddFunction(spv::OpLoad, TypeU32(state), budget,
 			                          LoopWatchdogElement(state, Watchdog::TickBudget));
-			const auto expired = state.builder.AllocateId();
+			auto expired = state.builder.AllocateId();
 			state.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), expired, elapsed,
 			                          budget);
+			if (state.program.stage == ShaderType::Compute) {
+				// The dispatch's clock starts at its first invocation's first abort check.
+				const auto slot_start = LoopWatchdogElement(state, slot + Watchdog::SlotStart);
+				const auto now_is_zero = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpIEqual, TypeBool(state), now_is_zero, now,
+				                          ConstantU32(state, 0));
+				const auto stamp = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpSelect, TypeU32(state), stamp, now_is_zero,
+				                          ConstantU32(state, 1), now);
+				const auto current = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(state), current, slot_start,
+				                          scope, relaxed);
+				const auto unset = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpIEqual, TypeBool(state), unset, current,
+				                          ConstantU32(state, 0));
+				const auto dispatch_start = EmitValueOrDefaultIfCondition(
+				    state, unset, TypeU32(state), current, [&]() {
+					    const auto original = state.builder.AllocateId();
+					    state.builder.AddFunction(spv::OpAtomicCompareExchange, TypeU32(state),
+					                              original, slot_start, scope, relaxed, relaxed,
+					                              stamp, ConstantU32(state, 0));
+					    const auto won = state.builder.AllocateId();
+					    state.builder.AddFunction(spv::OpIEqual, TypeBool(state), won, original,
+					                              ConstantU32(state, 0));
+					    const auto chosen = state.builder.AllocateId();
+					    state.builder.AddFunction(spv::OpSelect, TypeU32(state), chosen, won, stamp,
+					                              original);
+					    return chosen;
+				    });
+				// Another invocation's stamp may be a little ahead of this one's clock: a difference
+				// that wrapped is not an overrun.
+				const auto dispatch_elapsed = EmitBinaryU32(state, spv::OpISub, now, dispatch_start);
+				const auto forward          = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpULessThan, TypeBool(state), forward,
+				                          dispatch_elapsed, ConstantU32(state, 0x80000000u));
+				const auto dispatch_budget = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpLoad, TypeU32(state), dispatch_budget,
+				                          LoopWatchdogElement(state, Watchdog::DispatchTickBudget));
+				const auto enabled = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), enabled,
+				                          dispatch_budget, ConstantU32(state, 0));
+				const auto over = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), over,
+				                          dispatch_elapsed, dispatch_budget);
+				auto dispatch_expired = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), dispatch_expired,
+				                          enabled, over);
+				const auto counted = dispatch_expired;
+				dispatch_expired   = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), dispatch_expired,
+				                          counted, forward);
+				const auto per_invocation = expired;
+				expired                   = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), expired, per_invocation,
+				                          dispatch_expired);
+			}
+			// An invocation already made to leave its loops is not timed out again.
+			const auto below_limit = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpULessThan, TypeBool(state), below_limit, count,
+			                          ConstantU32(state, Watchdog::IterationLimit));
+			const auto timed = expired;
+			expired          = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), expired, timed,
+			                          below_limit);
 			const auto limit_reached = cut_now;
+			const auto expired_now   = continuing(expired);
 			cut_now                  = state.builder.AllocateId();
 			state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), cut_now, limit_reached,
-			                          continuing(expired));
+			                          expired_now);
+			const auto under_limit = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLogicalNot, TypeBool(state), under_limit,
+			                          limit_reached);
+			by_time = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), by_time, under_limit,
+			                          expired_now);
 		}
-		const auto hash = state.program.shader_hash;
-		const auto slot = Watchdog::Slot(hash);
 		EmitIfCondition(state, cut_now, [&]() {
 			const auto trips = state.builder.AllocateId();
 			state.builder.AddFunction(spv::OpAtomicIAdd, TypeU32(state), trips,
@@ -253,6 +328,23 @@ uint32_t EmitLoopWatchdog(ValueEmitContext& ctx, const IR::BlockInfo& latch,
 			state.builder.AddFunction(spv::OpAtomicIAdd, TypeU32(state), slot_trips,
 			                          LoopWatchdogElement(state, slot + Watchdog::SlotTrips), scope,
 			                          relaxed, ConstantU32(state, 1));
+			const auto most = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAtomicUMax, TypeU32(state), most,
+			                          LoopWatchdogElement(state, Watchdog::CutIterations), scope,
+			                          relaxed, count);
+			if (by_time != 0) {
+				EmitIfCondition(state, by_time, [&]() {
+					const auto time_cuts = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpAtomicIAdd, TypeU32(state), time_cuts,
+					                          LoopWatchdogElement(state, Watchdog::TimeCuts), scope,
+					                          relaxed, ConstantU32(state, 1));
+					const auto slot_time_cuts = state.builder.AllocateId();
+					state.builder.AddFunction(
+					    spv::OpAtomicIAdd, TypeU32(state), slot_time_cuts,
+					    LoopWatchdogElement(state, slot + Watchdog::SlotTimeCuts), scope, relaxed,
+					    ConstantU32(state, 1));
+				});
+			}
 			const std::array<std::pair<uint32_t, uint32_t>, 3> slot_record {{
 			    {slot + Watchdog::SlotHashLow, static_cast<uint32_t>(hash)},
 			    {slot + Watchdog::SlotHashHigh, static_cast<uint32_t>(hash >> 32u)},

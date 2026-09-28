@@ -236,8 +236,7 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 			case Decoder::Opcode::DS_WRITE_ADDTID_B32:
 				return index == 0u ? decoded.src1 : MakeM0Operand();
 			case Decoder::Opcode::DS_MIN_F32:
-			case Decoder::Opcode::DS_MAX_F32:
-				return index == 0u ? decoded.src1 : index == 1u ? decoded.src0 : decoded.src2;
+			case Decoder::Opcode::DS_MAX_F32: return index == 0u ? decoded.src1 : decoded.src0;
 			case Decoder::Opcode::DS_WRITE_B8:
 			case Decoder::Opcode::DS_WRITE_B16:
 			case Decoder::Opcode::DS_WRITE_B8_D16_HI:
@@ -870,11 +869,14 @@ bool Translator::DS_WRITE2(const Decoder::Instruction& inst) {
 	return true;
 }
 
+// The ISA manual describes DS_MIN_F32 and DS_MAX_F32 as comparing against a second data operand,
+// but the hardware (and LLVM and ACO, which emit them for LDS atomic fmin and fmax) takes the
+// minimum or maximum of memory and the one data operand. GTA V's BVH refit merges child boxes
+// this way with the second data field left at v0.
 bool Translator::DS_MINMAX_F32(const Decoder::Instruction& inst, IR::ValueOpcode opcode) {
 	const auto memory = MemoryInfoFromDecoded(inst);
 	ir.Emit(opcode,
-	        {ReadU32(MemorySourceAt(inst, 1)), ReadU32(MemorySourceAt(inst, 0)),
-	         ReadU32(MemorySourceAt(inst, 2)), ir.GetExec()},
+	        {ReadU32(MemorySourceAt(inst, 1)), ReadU32(MemorySourceAt(inst, 0)), ir.GetExec()},
 	        AddMemoryInfo(memory, inst.pc));
 	return true;
 }

@@ -263,8 +263,10 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	std::memset(m_loop_watchdog_buffer.Mapped().data(), 0, m_loop_watchdog_buffer.Size());
 	{
 		using Watchdog = ShaderRecompiler::IR::LoopWatchdog;
-		reinterpret_cast<uint32_t*>(m_loop_watchdog_buffer.Mapped().data())[Watchdog::TickBudget] =
-		    Watchdog::DefaultTickBudget;
+		auto*      words  = reinterpret_cast<uint32_t*>(m_loop_watchdog_buffer.Mapped().data());
+		const auto vendor = m_graphics.physical_device_properties.vendorID;
+		words[Watchdog::TickBudget]         = Watchdog::TickBudgetFor(vendor);
+		words[Watchdog::DispatchTickBudget] = Watchdog::DispatchTickBudgetFor(vendor);
 	}
 	m_loop_watchdog_buffer.Flush(0, m_loop_watchdog_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_loop_watchdog_buffer.Handle(), "Loop Watchdog");
@@ -272,6 +274,14 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	RegisterDiagnosticMemoryReader([this](uint64_t vaddr, uint64_t size, std::vector<uint8_t>& gpu,
 	                                      std::vector<uint8_t>& cpu, std::string& note) {
 		ReadDiagnosticMemory(vaddr, size, gpu, cpu, note);
+	});
+	RegisterDiagnosticBufferExtent([this](uint64_t vaddr) -> std::pair<uint64_t, uint64_t> {
+		const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+		if (owner == nullptr || !*owner) {
+			return {0, 0};
+		}
+		const auto& buffer = m_slot_buffers[*owner];
+		return {buffer.CpuAddress(), buffer.Size()};
 	});
 	const auto null_id =
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
@@ -294,6 +304,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 BufferCache::~BufferCache() {
 	RegisterLoopWatchdog(nullptr);
 	RegisterDiagnosticMemoryReader({});
+	RegisterDiagnosticBufferExtent({});
 	if (!m_gpu_modified_ranges.Empty()) {
 		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");
 	}

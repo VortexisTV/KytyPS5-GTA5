@@ -11,7 +11,9 @@
 // - a box node returns its four child pointers, the ones the ray hits first, nearest first when
 //   the descriptor enables sorting, and 0xffffffff for the rest;
 // - a triangle node returns t and the barycentrics as numerators over one denominator, or its
-//   triangle id and hit status when the descriptor asks for that instead.
+//   triangle id and hit status when the descriptor asks for that instead;
+// - a triangle node holds five vertices, and a triangle pointer's type picks one of four triangles
+//   from them (TriangleVertexWords), as GTA V's BVH refit reads them.
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
@@ -103,8 +105,22 @@ struct NodeReader {
 	uint32_t      host = 0;
 
 	uint32_t Word(uint32_t index) const {
-		const auto address = Binary(state, spv::OpIAdd, TypeScalarU64(state), host,
-		                            U64Constant(state, index * 4ull));
+		return Load(Binary(state, spv::OpIAdd, TypeScalarU64(state), host,
+		                   U64Constant(state, index * 4ull)));
+	}
+
+	// A word whose index is known only at run time.
+	uint32_t WordAt(uint32_t index) const {
+		const auto offset = Binary(state, spv::OpShiftLeftLogical, TypeScalarU64(state),
+		                           Unary(state, spv::OpUConvert, TypeScalarU64(state), index),
+		                           U64Constant(state, 2));
+		return Load(Binary(state, spv::OpIAdd, TypeScalarU64(state), host, offset));
+	}
+
+	uint32_t Float(uint32_t index) const { return AsFloat(state, Word(index)); }
+
+private:
+	uint32_t Load(uint32_t address) const {
 		const auto pointer = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
 		                          address);
@@ -113,9 +129,15 @@ struct NodeReader {
 		                          spv::MemoryAccessAlignedMask, 4u);
 		return value;
 	}
-
-	uint32_t Float(uint32_t index) const { return AsFloat(state, Word(index)); }
 };
+
+// The first word of each vertex of the triangle a pointer type (0-3) picks: (v0, v1, v2),
+// (v1, v3, v2), (v2, v3, v4) or (v2, v4, v0), with vertex k at word 3k.
+constexpr std::array<std::array<uint32_t, 4>, 3> TriangleVertexWords {{
+    {0, 3, 6, 6},
+    {3, 9, 9, 12},
+    {6, 6, 12, 0},
+}};
 
 uint32_t BoxResult(EmitterState& state, const NodeReader& node, bool half, const Ray& ray,
                    uint32_t sort) {
@@ -194,14 +216,24 @@ uint32_t BoxResult(EmitterState& state, const NodeReader& node, bool half, const
 
 // Watertight ray/triangle intersection (Woop, Benthin and Wald, JCGT 2013), as RADV emulates it.
 uint32_t TriangleResult(EmitterState& state, const NodeReader& node, const Ray& ray,
-                        uint32_t return_ij) {
+                        uint32_t type, uint32_t return_ij) {
 	const auto f32  = TypeF32(state);
 	const auto u32  = TypeU32(state);
 	const auto zero = ConstantF32Value(state, 0.0f);
+	const auto is_type = [&](uint32_t value) {
+		return Compare(state, spv::OpIEqual, type, ConstantU32(state, value));
+	};
 	std::array<Vec3, 3> vertices {};
 	for (uint32_t vertex = 0; vertex < 3u; vertex++) {
+		const auto& words = TriangleVertexWords[vertex];
+		const auto  first =
+		    Select(state, u32, is_type(1), ConstantU32(state, words[1]),
+		           Select(state, u32, is_type(2), ConstantU32(state, words[2]),
+		                  Select(state, u32, is_type(3), ConstantU32(state, words[3]),
+		                         ConstantU32(state, words[0]))));
 		for (uint32_t axis = 0; axis < 3u; axis++) {
-			vertices[vertex][axis] = node.Float(vertex * 3u + axis);
+			vertices[vertex][axis] = AsFloat(
+			    state, node.WordAt(Binary(state, spv::OpIAdd, u32, first, ConstantU32(state, axis))));
 		}
 	}
 	// The dimension where the ray direction is largest becomes z.
@@ -388,7 +420,7 @@ uint32_t EmitBvhIntersectRay(ValueEmitContext& ctx, const IR::Inst& inst) {
 		        boxes, [&]() {
 			        return EmitValueOrDefaultIfCondition(
 			            state, present, result_type, triangle_miss,
-			            [&]() { return TriangleResult(state, reader, ray, return_ij); });
+			            [&]() { return TriangleResult(state, reader, ray, type, return_ij); });
 		        });
 	    });
 }

@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
@@ -220,6 +221,35 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 		     input.stage.program->shader_hash, descriptor.Base48(), size, packed_clear);
 	}
 	return true;
+}
+
+// A compute shader with watched loops times each dispatch from the first abort check any of its
+// invocations makes, which its watchdog slot records; each dispatch starts that clock afresh.
+static void ResetLoopWatchdogDispatchClock(RenderContext& context, vk::CommandBuffer vk_buffer,
+                                           const ShaderRecompiler::IR::CompiledShaderInfo& program) {
+	using Watchdog = ShaderRecompiler::IR::LoopWatchdog;
+	if (ShaderRecompiler::IR::FindBinding(program.bindings,
+	                                      ShaderRecompiler::IR::DescriptorBindingKind::LoopWatchdog) ==
+	    nullptr) {
+		return;
+	}
+	const auto* watchdog = context.GetBufferCache().GetLoopWatchdogBuffer();
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+	                          vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0,
+	                          nullptr);
+	vk_buffer.fillBuffer(watchdog->Handle(),
+	                     (Watchdog::Slot(program.shader_hash) + Watchdog::SlotStart) *
+	                         sizeof(uint32_t),
+	                     sizeof(uint32_t), 0);
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                          vk::PipelineStageFlagBits::eComputeShader, {}, 1, &after, 0, nullptr,
+	                          0, nullptr);
 }
 
 // Marks a dispatch for the GPU crash report with its user data and the constant buffers it reads.
@@ -427,24 +457,6 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	auto& pipeline =
 	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
-	PrepareBindings(input_info.stage, bindings);
-	FindBuffers(bindings);
-	RecordWrittenBuffers(program, bindings, {thread_group_x, thread_group_y, thread_group_z});
-	if (program.info.uses_dma) {
-		PrepareDmaSources(bindings);
-		m_context.PrepareBda();
-		RecordDmaDispatchShape(
-		    program.shader_hash,
-		    std::span(reinterpret_cast<const uint8_t*>(&input_info), sizeof(input_info)),
-		    {thread_group_x, thread_group_y, thread_group_z});
-	}
-	RebindImages(bindings);
-	RebindBuffers(bindings);
-
-	auto              vk_buffer        = buffer.Handle();
-	PreparedBindings* descriptor_stage = &bindings;
-	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
-	               std::span {&descriptor_stage, 1u});
 	bool has_storage_writes = HasShaderBufferWrites(input_info.stage);
 	has_storage_writes =
 	    std::any_of(program.info.images.begin(), program.info.images.end(),
@@ -454,24 +466,70 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
 	                }) ||
 	    has_storage_writes;
-	if (has_storage_writes) {
-		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
-		// while allowing the queue to execute asynchronously.
-		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	// A shader the loop watchdog found slow runs in bands of workgroup rows, each its own
+	// submission, so no single submission nears the Windows GPU timeout (DispatchSplit). Each
+	// band binds its resources afresh: the stream-buffer space they use belongs to a submission.
+	const uint32_t parts =
+	    thread_group_y > 1u ? std::min(DispatchSplit(program.shader_hash), thread_group_y) : 1u;
+	const uint32_t rows = (thread_group_y + parts - 1u) / parts;
+	auto           vk_buffer = buffer.Handle();
+	for (uint32_t part = 0; part < parts; part++) {
+		const uint32_t first_row = part * rows;
+		if (parts > 1u && first_row >= thread_group_y) {
+			break;
+		}
+		if (part != 0) {
+			m_context.GetCommandScheduler().Flush();
+		}
+		PrepareBindings(input_info.stage, bindings);
+		FindBuffers(bindings);
+		if (part == 0) {
+			RecordWrittenBuffers(program, bindings,
+			                     {thread_group_x, thread_group_y, thread_group_z});
+		}
+		if (program.info.uses_dma) {
+			PrepareDmaSources(bindings);
+			m_context.PrepareBda();
+			if (part == 0) {
+				RecordDmaDispatchShape(
+				    program.shader_hash,
+				    std::span(reinterpret_cast<const uint8_t*>(&input_info), sizeof(input_info)),
+				    {thread_group_x, thread_group_y, thread_group_z});
+			}
+		}
+		RebindImages(bindings);
+		RebindBuffers(bindings);
+
+		vk_buffer                          = buffer.Handle();
+		PreparedBindings* descriptor_stage = &bindings;
+		CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
+		               std::span {&descriptor_stage, 1u});
+		if (has_storage_writes) {
+			// A host fence used to serialize every dispatch. Preserve its read-before-write
+			// ordering while allowing the queue to execute asynchronously.
+			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		}
+		ResetLoopWatchdogDispatchClock(m_context, vk_buffer, program);
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+		if (use_thread_dimensions) {
+			// The shader masks lanes past these counts, as the hardware does for partial groups.
+			static_assert(std::size(input_info.dispatch_threads_num) ==
+			              ShaderRecompiler::IR::PushData::DispatchThreadDwordCount);
+			vk_buffer.pushConstants(pipeline.pipeline_layout, vk::ShaderStageFlagBits::eCompute,
+			                        0, sizeof(input_info.dispatch_threads_num),
+			                        input_info.dispatch_threads_num);
+		}
+		MarkDispatchCheckpoint(m_context.GetGraphics(), vk_buffer, GpuCheckpointKind::Dispatch,
+		                       submit_id, input_info, bindings, thread_group_x, thread_group_y,
+		                       thread_group_z);
+		if (parts == 1u) {
+			vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		} else {
+			vk_buffer.dispatchBase(0, first_row, 0, thread_group_x,
+			                       std::min(rows, thread_group_y - first_row), thread_group_z);
+			ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		}
 	}
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	if (use_thread_dimensions) {
-		// The shader masks lanes past these counts, as the hardware does for partial groups.
-		static_assert(std::size(input_info.dispatch_threads_num) ==
-		              ShaderRecompiler::IR::PushData::DispatchThreadDwordCount);
-		vk_buffer.pushConstants(pipeline.pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
-		                        sizeof(input_info.dispatch_threads_num),
-		                        input_info.dispatch_threads_num);
-	}
-	MarkDispatchCheckpoint(m_context.GetGraphics(), vk_buffer, GpuCheckpointKind::Dispatch,
-	                       submit_id, input_info, bindings, thread_group_x, thread_group_y,
-	                       thread_group_z);
-	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 
 	if (const auto watched = FrameDumpWatchAddress(); watched != 0) {
 		auto&      texture_cache = m_context.GetTextureCache();
@@ -571,6 +629,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                              vk::PipelineStageFlagBits::eTransfer,
 	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
 	                          1, &barrier, 0, nullptr, 0, nullptr);
+	ResetLoopWatchdogDispatchClock(m_context, vk_buffer, program);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	// The group counts live in GPU memory; the arguments name the guest address they come from.
 	MarkDispatchCheckpoint(m_context.GetGraphics(), vk_buffer, GpuCheckpointKind::DispatchIndirect,

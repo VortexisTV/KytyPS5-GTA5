@@ -94,12 +94,14 @@ std::atomic<Buffer*> g_loop_watchdog {nullptr};
 std::mutex                             g_runaway_mutex;
 std::unordered_map<uint64_t, uint32_t> g_runaway_reports;
 std::vector<uint64_t>                  g_runaway_shaders;
+std::unordered_map<uint64_t, uint32_t> g_dispatch_splits;
 std::atomic<uint32_t>                  g_runaway_generation {0};
 
 struct LoopWatchdogCut {
-	uint64_t hash  = 0;
-	uint32_t pc    = 0;
-	uint32_t trips = 0;
+	uint64_t hash      = 0;
+	uint32_t pc        = 0;
+	uint32_t trips     = 0;
+	uint32_t time_cuts = 0;
 };
 
 struct LoopWatchdogRecord {
@@ -107,6 +109,8 @@ struct LoopWatchdogRecord {
 	bool                         claimed = false;
 	uint64_t                     hash    = 0;
 	uint32_t                     pc      = 0;
+	uint32_t                     time_cuts      = 0;
+	uint32_t                     cut_iterations = 0;
 	// Each shader slot that counted cuts.
 	std::vector<LoopWatchdogCut> cuts;
 };
@@ -127,7 +131,9 @@ bool ReadLoopWatchdog(LoopWatchdogRecord& record, bool invalidate) {
 	record.claimed = words[Watchdog::Claimed] != 0;
 	record.hash    = (static_cast<uint64_t>(words[Watchdog::HashHigh]) << 32u) |
 	              words[Watchdog::HashLow];
-	record.pc = words[Watchdog::LoopPc];
+	record.pc             = words[Watchdog::LoopPc];
+	record.time_cuts      = words[Watchdog::TimeCuts];
+	record.cut_iterations = words[Watchdog::CutIterations];
 	record.cuts.clear();
 	for (uint32_t slot = Watchdog::SlotBase; slot < Watchdog::DwordCount;
 	     slot += Watchdog::SlotDwords) {
@@ -135,7 +141,8 @@ bool ReadLoopWatchdog(LoopWatchdogRecord& record, bool invalidate) {
 			record.cuts.push_back(
 			    {(static_cast<uint64_t>(words[slot + Watchdog::SlotHashHigh]) << 32u) |
 			         words[slot + Watchdog::SlotHashLow],
-			     words[slot + Watchdog::SlotLoopPc], words[slot + Watchdog::SlotTrips]});
+			     words[slot + Watchdog::SlotLoopPc], words[slot + Watchdog::SlotTrips],
+			     words[slot + Watchdog::SlotTimeCuts]});
 		}
 	}
 	return true;
@@ -150,6 +157,9 @@ std::string DescribeLoopWatchdog(const LoopWatchdogRecord& record, uint32_t trip
 		text += fmt::format("; the first was shader 0x{:016x}, loop at pc 0x{:x}", record.hash,
 		                    record.pc);
 	}
+	text += fmt::format("; {} of the cuts were by the time budget, and the longest cut loop had "
+	                    "taken {} iterations",
+	                    record.time_cuts, record.cut_iterations);
 	return text + "\n";
 }
 
@@ -422,6 +432,12 @@ std::vector<uint64_t> RunawayShaders() {
 	return g_runaway_shaders;
 }
 
+uint32_t DispatchSplit(uint64_t hash) {
+	std::lock_guard lock(g_runaway_mutex);
+	const auto      found = g_dispatch_splits.find(hash);
+	return found != g_dispatch_splits.end() ? found->second : 1u;
+}
+
 void RegisterLoopWatchdog(Buffer* buffer) {
 	g_loop_watchdog.store(buffer, std::memory_order_release);
 }
@@ -441,6 +457,7 @@ constexpr size_t RecordedDispatches = 64;
 std::mutex                                                  g_dma_dispatch_mutex;
 std::unordered_map<uint64_t, std::deque<DmaDispatchRecord>> g_dma_dispatches;
 DiagnosticMemoryReader                                      g_memory_reader;
+DiagnosticBufferExtent                                      g_buffer_extent;
 
 // The latest compute dispatches and the ranges they wrote, oldest overwritten first.
 struct DispatchWrites {
@@ -534,10 +551,12 @@ size_t NonzeroWords(const std::vector<uint8_t>& bytes) {
 // <hash>_input_<n>.bin) to <hash>_dispatch.txt, and every guest range they named, as the GPU and
 // guest memory hold them after the frame, to <hash>_mem_<address>_gpu.bin and _cpu.bin.
 void DumpDispatchMemory(uint64_t hash) {
-	constexpr uint64_t              MaxRangeBytes = 32ull * 1024ull * 1024ull;
-	constexpr uint64_t              MaxDumpBytes  = 256ull * 1024ull * 1024ull;
+	constexpr uint64_t              MaxRangeBytes  = 32ull * 1024ull * 1024ull;
+	constexpr uint64_t              MaxBufferBytes = 160ull * 1024ull * 1024ull;
+	constexpr uint64_t              MaxDumpBytes   = 512ull * 1024ull * 1024ull;
 	std::deque<DmaDispatchRecord> records;
 	DiagnosticMemoryReader        reader;
+	DiagnosticBufferExtent        extent;
 	{
 		std::lock_guard lock(g_dma_dispatch_mutex);
 		const auto      found = g_dma_dispatches.find(hash);
@@ -546,6 +565,7 @@ void DumpDispatchMemory(uint64_t hash) {
 		}
 		records = found->second;
 		reader  = g_memory_reader;
+		extent  = g_buffer_extent;
 	}
 	const auto      folder = Config::GetShaderLogFolder() / "diagnostics";
 	std::error_code error;
@@ -576,16 +596,27 @@ void DumpDispatchMemory(uint64_t hash) {
 			}
 		}
 	}
-	summary << "ranges:\n";
-	uint64_t dumped_bytes = 0;
+	// A range inside a cached buffer is dumped with the whole buffer when it fits: a shader can
+	// follow pointers from what it binds to anywhere in it, as a ray traversal does from its
+	// top-level BVH to the per-object trees in the same pool.
+	std::map<uint64_t, uint64_t> dumped;
 	for (const auto& [address, range_size]: largest) {
-		if (dumped_bytes >= MaxDumpBytes) {
-			summary << fmt::format("  0x{:010x}+0x{:x}: not dumped, over the dump budget\n", address,
-			                       range_size);
-			continue;
+		auto base = address;
+		auto size = std::min(range_size, MaxRangeBytes);
+		if (extent) {
+			const auto [begin, bytes] = extent(address);
+			if (bytes != 0 && bytes <= MaxBufferBytes && begin <= address &&
+			    address < begin + bytes) {
+				base = begin;
+				size = bytes;
+			}
 		}
-		dumped_bytes += std::min(range_size, MaxRangeBytes);
-		const auto           size = std::min(range_size, MaxRangeBytes);
+		auto& entry = dumped[base];
+		entry       = std::max(entry, size);
+	}
+	summary << "ranges:\n";
+	uint64_t   dumped_bytes = 0;
+	const auto dump_range   = [&](uint64_t address, uint64_t size, uint64_t range_size) {
 		std::vector<uint8_t> gpu;
 		std::vector<uint8_t> cpu;
 		std::string          note;
@@ -599,15 +630,84 @@ void DumpDispatchMemory(uint64_t hash) {
 			file.write(reinterpret_cast<const char*>(bytes->data()),
 			           static_cast<std::streamsize>(bytes->size()));
 		}
-		const auto same = std::min(gpu.size(), cpu.size());
+		const auto same    = std::min(gpu.size(), cpu.size());
+		size_t     differs = 0;
+		for (size_t offset = 0; offset + sizeof(uint32_t) <= same; offset += sizeof(uint32_t)) {
+			differs += std::memcmp(gpu.data() + offset, cpu.data() + offset, sizeof(uint32_t)) != 0
+			               ? 1u
+			               : 0u;
+		}
 		summary << fmt::format(
 		    "  0x{:010x}+0x{:x} (of 0x{:x}): {}; gpu {} bytes {} nonzero words; cpu {} bytes {} "
 		    "nonzero words; {}\n",
 		    address, size, range_size, note, gpu.size(), NonzeroWords(gpu), cpu.size(),
 		    NonzeroWords(cpu),
-		    same == 0 ? "not compared"
-		              : (std::memcmp(gpu.data(), cpu.data(), same) == 0 ? "gpu matches cpu"
-		                                                                 : "gpu differs from cpu"));
+		    same == 0      ? std::string("not compared")
+		    : differs == 0 ? std::string("gpu matches cpu")
+		                   : fmt::format("gpu differs from cpu in {} words", differs));
+		return gpu;
+	};
+	// Cached buffers the dumped bytes point into, by how many pointers name them: a traversal
+	// reaches per-object trees through its instance records, which only the dump itself holds.
+	struct Pointed {
+		uint64_t end        = 0; // of the buffer
+		uint64_t lowest     = UINT64_MAX;
+		uint64_t highest    = 0;
+		uint32_t references = 0;
+	};
+	std::map<uint64_t, Pointed> pointed;
+	for (const auto& [address, range_size]: dumped) {
+		if (dumped_bytes >= MaxDumpBytes) {
+			summary << fmt::format("  0x{:010x}+0x{:x}: not dumped, over the dump budget\n", address,
+			                       range_size);
+			continue;
+		}
+		dumped_bytes += range_size;
+		const auto gpu = dump_range(address, range_size, range_size);
+		if (!extent) {
+			continue;
+		}
+		for (size_t offset = 0; offset + sizeof(uint64_t) <= gpu.size(); offset += sizeof(uint64_t)) {
+			uint64_t value = 0;
+			std::memcpy(&value, gpu.data() + offset, sizeof(value));
+			// Guest mappings sit above 4 GiB and below 1 TiB.
+			if (value < (1ull << 32u) || value >= (1ull << 40u)) {
+				continue;
+			}
+			const auto [begin, bytes] = extent(value);
+			if (bytes == 0 || dumped.contains(begin)) {
+				continue;
+			}
+			auto& entry   = pointed[begin];
+			entry.end     = begin + bytes;
+			entry.lowest  = std::min(entry.lowest, value);
+			entry.highest = std::max(entry.highest, value);
+			entry.references++;
+		}
+	}
+	std::vector<std::pair<uint32_t, uint64_t>> by_references;
+	for (const auto& [begin, entry]: pointed) {
+		by_references.emplace_back(entry.references, begin);
+	}
+	std::sort(by_references.rbegin(), by_references.rend());
+	summary << "buffers the dumped memory points into:\n";
+	for (const auto& [references, begin]: by_references) {
+		// From the lowest pointer to past the highest, with room for the structure it starts.
+		constexpr uint64_t Align = 64ull * 1024ull;
+		constexpr uint64_t Tail  = 8ull * 1024ull * 1024ull;
+		const auto&        entry = pointed[begin];
+		const auto         first = std::max(begin, entry.lowest & ~(Align - 1u));
+		const auto         last  = std::min(entry.end, ((entry.highest + Align) & ~(Align - 1u)) + Tail);
+		const auto         bytes = std::min(last - first, MaxBufferBytes);
+		if (dumped_bytes + bytes > MaxDumpBytes) {
+			summary << fmt::format("  0x{:010x}+0x{:x}: {} pointers, not dumped, over the dump budget\n",
+			                       first, bytes, references);
+			continue;
+		}
+		dumped_bytes += bytes;
+		summary << fmt::format("  {} pointers into 0x{:010x}+0x{:x}:\n", references, begin,
+		                       entry.end - begin);
+		dump_range(first, bytes, last - first);
 	}
 	DumpWriters(hash, largest);
 	Log::WriteToConsoleAndLog(fmt::format("Shader 0x{:016x}: {} recent dispatches and their memory dumped to {}\n",
@@ -669,6 +769,11 @@ void RecordDispatchWrites(uint64_t hash, std::span<const std::pair<uint64_t, uin
 void RegisterDiagnosticMemoryReader(DiagnosticMemoryReader reader) {
 	std::lock_guard lock(g_dma_dispatch_mutex);
 	g_memory_reader = std::move(reader);
+}
+
+void RegisterDiagnosticBufferExtent(DiagnosticBufferExtent extent) {
+	std::lock_guard lock(g_dma_dispatch_mutex);
+	g_buffer_extent = std::move(extent);
 }
 
 namespace {
@@ -805,7 +910,23 @@ void ReportLoopWatchdog() {
 		if (memory_dumped.insert(cut.hash).second) {
 			DumpDispatchMemory(cut.hash);
 		}
+		// Cut only for time, the shader is slow rather than stuck: split its dispatches further,
+		// and turn it off only once they cannot be split more.
+		const auto slot = std::ranges::find(record.cuts, cut.hash, &LoopWatchdogCut::hash);
+		const bool slow = slot != record.cuts.end() && slot->trips != 0 &&
+		                  slot->time_cuts == slot->trips;
 		std::lock_guard lock(g_runaway_mutex);
+		if (slow) {
+			auto& split = g_dispatch_splits[cut.hash];
+			if (split < MaxDispatchSplit) {
+				split = std::max(split, 1u) * 2u;
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "GPU loop watchdog: shader 0x{:016x} is slow, not stuck (every cut was for "
+				    "time, the longest after {} iterations); its dispatches now run in {} parts\n",
+				    cut.hash, record.cut_iterations, split));
+				continue;
+			}
+		}
 		if (++g_runaway_reports[cut.hash] == RunawayShaderReports) {
 			g_runaway_shaders.push_back(cut.hash);
 			g_runaway_generation.fetch_add(1, std::memory_order_release);
@@ -815,9 +936,12 @@ void ReportLoopWatchdog() {
 	static_assert(Watchdog::Claimed == Watchdog::TripCount + 1u);
 	auto* buffer = g_loop_watchdog.load(std::memory_order_acquire);
 	auto* words  = reinterpret_cast<uint32_t*>(buffer->Mapped().data());
-	words[Watchdog::TripCount] = 0;
-	words[Watchdog::Claimed]   = 0;
+	words[Watchdog::TripCount]     = 0;
+	words[Watchdog::Claimed]       = 0;
+	words[Watchdog::TimeCuts]      = 0;
+	words[Watchdog::CutIterations] = 0;
 	buffer->Flush(Watchdog::TripCount * sizeof(uint32_t), 2 * sizeof(uint32_t));
+	buffer->Flush(Watchdog::TimeCuts * sizeof(uint32_t), 2 * sizeof(uint32_t));
 	std::fill(words + Watchdog::SlotBase, words + Watchdog::DwordCount, 0u);
 	buffer->Flush(Watchdog::SlotBase * sizeof(uint32_t),
 	              (Watchdog::DwordCount - Watchdog::SlotBase) * sizeof(uint32_t));
