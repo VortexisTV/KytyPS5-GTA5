@@ -89,7 +89,6 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
-		m_mapping_epoch.fetch_add(1, std::memory_order_release);
 	};
 	if (m_gpu == nullptr) {
 		unmap();
