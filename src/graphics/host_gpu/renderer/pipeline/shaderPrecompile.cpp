@@ -12,7 +12,7 @@ namespace Libs::Graphics::ShaderPrecompile {
 namespace {
 
 constexpr std::array<uint8_t, 8> Magic {'K', 'Y', 'T', 'Y', 'S', 'H', 'D', 'R'};
-constexpr uint32_t               FormatVersion  = 4; // 4: vertex buffer_index, pixel alpha_blend_source_remap.
+constexpr uint32_t               FormatVersion  = 5; // 5: tessellation patch range.
 constexpr uint32_t               MaxCodeWords   = 256u * 1024u;
 constexpr uint32_t               MaxRecordBytes = 4u * 1024u * 1024u;
 constexpr uint64_t               MaxFileBytes   = 256u * 1024u * 1024u;
@@ -157,8 +157,12 @@ void Fields(Archive& a, ShaderVertexInputInfo& i) {
 	Fields(a, static_cast<ShaderWorkgroupInputInfo&>(i.mesh));
 	a(i.mesh.input_primitive, i.mesh.primitives_per_group, i.mesh.vertices_per_group,
 	  i.mesh.max_vertices, i.mesh.max_primitives, i.mesh.provoking_vertex);
+	// The patch range is reflected from the hull program at run time (AnalyzeTessellationPrograms).
+	// A domain record does not hold that program, and the emitter refuses a patch access outside
+	// the range.
 	a(i.tess.input_control_points, i.tess.output_control_points, i.tess.ls_stride, i.tess.hs_stride,
-	  i.tess.domain, i.tess.partitioning, i.tess.output_topology);
+	  i.tess.patch_begin, i.tess.patch_end, i.tess.domain, i.tess.partitioning,
+	  i.tess.output_topology);
 	a(i.fetch_external, i.fetch_embedded);
 }
 
@@ -240,7 +244,8 @@ bool Valid(const PermutationRecord& r) {
 		if (!IsVertexStage(r.stage) || i->logical_stage != r.stage || i->resources_num < 0 ||
 		    i->resources_num > ShaderVertexInputInfo::RES_MAX || i->buffers_num < 0 ||
 		    i->buffers_num > ShaderVertexInputInfo::RES_MAX ||
-		    (i->wave_size != 32u && i->wave_size != 64u))
+		    (i->wave_size != 32u && i->wave_size != 64u) ||
+		    i->tess.patch_begin > i->tess.patch_end)
 			return false;
 		const auto expected_wave = r.stage == ShaderType::Mesh                  ? i->mesh.wave_size
 		                           : r.stage == ShaderType::TessellationControl ? 64u

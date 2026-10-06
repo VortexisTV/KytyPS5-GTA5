@@ -14,7 +14,9 @@
 #include <span>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
@@ -68,6 +70,39 @@ Value CanonicalizeSampleAdjustDword3(Value value) {
 			return value;
 		}
 	}
+}
+
+// As above, through Phis: a sample after a merge sees dword 3 as a Phi of the word with the
+// reserved bits ORed in on one path and without them on another (GTA V's 0x0e5c71b644902aac). When
+// every incoming value canonicalizes to the same word, that word; otherwise the value as it is.
+Value CanonicalizeSampleAdjustDword3(const ResourcePlan& program, Value value) {
+	value            = CanonicalizeSampleAdjustDword3(value);
+	const auto* root = value.TryInstruction();
+	if (root == nullptr || root->GetOpcode() != ValueOpcode::Phi) {
+		return value;
+	}
+	Value                           common;
+	std::vector<Value>              pending {value};
+	std::unordered_set<const Inst*> visited;
+	while (!pending.empty()) {
+		const auto current = CanonicalizeSampleAdjustDword3(pending.back());
+		pending.pop_back();
+		const auto* inst = current.TryInstruction();
+		if (inst != nullptr && inst->GetOpcode() == ValueOpcode::Phi) {
+			if (visited.insert(inst).second) {
+				for (size_t index = 0; index < inst->NumArgs(); index++) {
+					pending.push_back(inst->Arg(index));
+				}
+			}
+			continue;
+		}
+		if (common.IsEmpty()) {
+			common = current;
+		} else if (!EquivalentValue(program, common, current)) {
+			return value;
+		}
+	}
+	return common.IsEmpty() ? value : common;
 }
 
 const char* StageName(ShaderType stage) {
@@ -540,12 +575,13 @@ private:
 		}
 		descriptor.dword_count = width;
 		for (uint32_t i = 0; i < width; i++) {
-			const auto value = base_reg != UINT32_MAX
+			auto value = base_reg != UINT32_MAX
 			    ? NativeDescriptorSource(handle.Arg(i), base_reg + i, pc) : handle.Arg(i);
+			// Before the Phi is lowered: the scratch bits are not a runtime value to select on.
+			if (sample_adjust && i == 3u) {
+				value = CanonicalizeSampleAdjustDword3(m_program, value);
+			}
 			descriptor.dwords[i] = LowerDescriptorPhi(value);
-		}
-		if (sample_adjust) {
-			descriptor.dwords[3] = CanonicalizeSampleAdjustDword3(descriptor.dwords[3]);
 		}
 		const auto dword0 = descriptor.dwords[0].Resolve();
 		if (sampler && dword0.IsImmediate() && dword0.GetType() == Type::U32 &&

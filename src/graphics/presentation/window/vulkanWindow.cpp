@@ -774,6 +774,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    robustness2.nullDescriptor == VK_TRUE &&
 	    robustness2_properties.robustStorageBufferAccessSizeAlignment <= sizeof(uint32_t);
 	ShaderRecompiler::SetHardwareStorageBufferBounds(graphics.hardware_storage_buffer_bounds);
+	// NVIDIA's shader compiler (GeForce driver 617.14) stops the process on a 32-bit OpFDiv in a
+	// module that declares RoundingModeRTE for 32 bits, although the device reports
+	// shaderRoundingModeRTEFloat32. GTA V dispatches such a shader in its Fidelity mode.
+	ShaderRecompiler::SetFloat32RoundingModeRTE(properties2.properties.vendorID != 0x10deu);
 
 	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s robustBufferAccess2=%s "
 	     "nullDescriptor=%s storage alignment=%u hardware storage buffer bounds=%s\n",

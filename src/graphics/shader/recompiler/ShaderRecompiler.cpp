@@ -494,6 +494,16 @@ bool HardwareStorageBufferBounds() {
 	return g_hardware_storage_buffer_bounds.load(std::memory_order_relaxed);
 }
 
+static std::atomic<bool> g_float32_rounding_mode_rte {true};
+
+void SetFloat32RoundingModeRTE(bool enabled) {
+	g_float32_rounding_mode_rte.store(enabled, std::memory_order_relaxed);
+}
+
+bool Float32RoundingModeRTE() {
+	return g_float32_rounding_mode_rte.load(std::memory_order_relaxed);
+}
+
 TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOptions& options) {
 	if (code.empty()) {
 		EXIT("shader recompiler input is empty\n");

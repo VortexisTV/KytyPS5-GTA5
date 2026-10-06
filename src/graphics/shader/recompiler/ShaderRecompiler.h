@@ -50,6 +50,12 @@ struct CompileResult {
 void SetHardwareStorageBufferBounds(bool enabled);
 [[nodiscard]] bool HardwareStorageBufferBounds();
 
+// A shader that uses FP64 declares round-to-nearest-even for its 32-bit results (RoundingModeRTE
+// 32). Cleared before any compile on a host whose compiler cannot take that declaration; the
+// shader then rounds by the host's default, as every shader without FP64 does.
+void SetFloat32RoundingModeRTE(bool enabled);
+[[nodiscard]] bool Float32RoundingModeRTE();
+
 [[nodiscard]] TranslateResult TranslateProgram(std::span<const uint32_t> code,
                                                const CompileOptions& options);
 [[nodiscard]] CompileResult CompileProgram(TranslateResult translated,

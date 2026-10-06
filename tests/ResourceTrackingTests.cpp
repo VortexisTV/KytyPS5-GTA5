@@ -1906,6 +1906,71 @@ void TestSampleAdjustSamplerScratch() {
             descriptor.dwords[3] == 0x80000abcu,
         "SampleAdjust canonicalization lost sampler border fields");
 
+  // A sample after a merge: dword 3 is a Phi of the word with the scratch ORed in on one path
+  // and without it on the other (observed in GTA V's 0x0e5c71b644902aac).
+  {
+    namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+    Fixture merged(ShaderType::Pixel);
+    auto *entry = merged.block;
+    auto *scratch_block = merged.AddBlock();
+    auto *merge = merged.AddBlock();
+    entry->AddBranch(scratch_block);
+    entry->AddBranch(merge);
+    scratch_block->AddBranch(merge);
+    const auto original = merged.UserData(3);
+    merged.program.block_info[0].condition = merged.Emit(
+        ValueOpcode::INotEqual32, {merged.UserData(4), Value(0u)});
+    merged.program.block_info[0].terminator = {
+        .kind = CFG::TerminatorKind::ConditionalBranch,
+        .true_block = 1u,
+        .false_block = 2u};
+    merged.program.block_info[1].terminator = {
+        .kind = CFG::TerminatorKind::Branch, .true_block = 2u};
+    merged.program.block_info[2].terminator = {
+        .kind = CFG::TerminatorKind::Return};
+    merged.block = scratch_block;
+    const auto merged_active = merged.Emit(
+        ValueOpcode::IEqual32, {merged.Emit(ValueOpcode::LaneId), Value(0u)});
+    const auto merged_lane = merged.Emit(
+        ValueOpcode::SelectU32, {merged_active, Value(1u), Value(0u)});
+    const auto merged_scratch = merged.Emit(
+        ValueOpcode::ShiftLeftLogical32,
+        {merged.Emit(ValueOpcode::BitwiseAnd32, {merged_lane, Value(0xffffu)}),
+         Value(12u)});
+    const auto modified = merged.Emit(ValueOpcode::BitwiseOr32,
+                                      {original, merged_scratch});
+    auto &phi = merge->AppendNewInst(ValueOpcode::Phi, {},
+                                     static_cast<uint64_t>(Type::U32));
+    phi.AddPhiOperand(entry, original);
+    phi.AddPhiOperand(scratch_block, modified);
+    merged.block = merge;
+    const auto merged_image =
+        merged.Image({Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+                      Value(0u), Value(0u), Value(0u)},
+                     0x1ec);
+    const auto merged_sampler =
+        merged.Sampler({merged.UserData(0), merged.UserData(1),
+                        merged.UserData(2), Value(&phi)},
+                       0x1ec);
+    MemoryInfo merged_memory;
+    merged_memory.kind = ResourceKind::Image;
+    merged_memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    merged_memory.image_sample_flags = Decoder::ImageSampleFlagAdjust;
+    merged.Emit(ValueOpcode::ImageSampleRaw,
+                {merged_image, merged_sampler, merged.ImageAddress()},
+                merged.AddMemory(merged_memory, 0x1ec));
+    merged.PlanAndTrack();
+
+    const auto merged_source = merged.program.info.samplers[0].source;
+    const auto merged_stored = merged.program.descriptor_sources[merged_source]
+                                   .dwords[3]
+                                   .Resolve()
+                                   .TryInstruction();
+    Check(merged_stored != nullptr &&
+              merged_stored->GetOpcode() == ValueOpcode::GetUserData,
+          "SampleAdjust reserved scratch remained behind a Phi");
+  }
+
   const auto CheckRejected = [](uint32_t flags, uint32_t shift,
                                 const char *message) {
     Fixture rejected(ShaderType::Pixel);

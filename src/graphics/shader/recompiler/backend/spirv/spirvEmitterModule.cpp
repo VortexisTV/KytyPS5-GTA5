@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
+#include "graphics/shader/recompiler/ShaderRecompiler.h"
+
 #include <algorithm>
 #include <bit>
 
@@ -718,13 +720,15 @@ void DefineModule(EmitterState& state) {
 		                     state.input_info.compute->float_mode != 0xc0);
 		// MODE=0xc0 uses round-to-nearest-even and preserves FP64 input/output denormals.
 		state.builder.RequireCapability(spv::CapabilityFloat64);
-		state.builder.RequireCapability(spv::CapabilityRoundingModeRTE);
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
 		                               64u);
 		// FP64 denormal preservation is temporarily disabled.
 		// state.builder.RequireCapability(spv::CapabilityDenormPreserve);
 		// state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDenormPreserve, 64u);
-		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeRoundingModeRTE, 32u);
+		if (Float32RoundingModeRTE()) {
+			state.builder.RequireCapability(spv::CapabilityRoundingModeRTE);
+			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeRoundingModeRTE, 32u);
+		}
 	}
 	if (const auto* cs = ShaderWorkgroupInput(state.program.stage, state.input_info)) {
 		uint32_t local_x = state.requirements.compute_derivatives ? 2u : 1u;

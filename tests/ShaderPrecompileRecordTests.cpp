@@ -116,6 +116,8 @@ PermutationRecord MakeRecord(ShaderType stage) {
               .output_control_points = 4,
               .ls_stride = 16,
               .hs_stride = 32,
+              .patch_begin = 0x7eb0,
+              .patch_end = 0x7ff4,
               .domain = 2,
               .partitioning = 1,
               .output_topology = 3};
@@ -162,6 +164,7 @@ void TestAllStagesRoundTrip() {
                 i->mesh.threads_num[2] == 1 && i->mesh.wave_size == 32 &&
                 i->mesh.max_vertices == 64 &&
                 i->tess.output_control_points == 4 && i->tess.hs_stride == 32 &&
+                i->tess.patch_begin == 0x7eb0 && i->tess.patch_end == 0x7ff4 &&
                 i->tess.output_topology == 3,
             "mesh and tessellation compilation metadata survives");
       Check(i->resources[0].Base48() == 0 &&

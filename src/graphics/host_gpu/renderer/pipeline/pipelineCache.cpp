@@ -181,6 +181,33 @@ bool ReadShaderGuestBlockOnGpuThread(void*, uint64_t address, std::span<uint32_t
 	                                                             values.size_bytes());
 }
 
+// Set while a look-ahead prediction looks its shaders up (see PredictedLookup).
+thread_local bool g_predicted_lookup = false;
+
+// A look-ahead prediction refreshes the resources of a draw or dispatch the command stream has not
+// reached yet. Work before it may still fill its tables in (a compute shader that builds the
+// tables of a later dispatch does), so a pointer read from one now can lead anywhere, and the two
+// readers above would fault on it. A prediction's lookups use the readers below instead.
+struct PredictedLookup {
+	PredictedLookup() { g_predicted_lookup = true; }
+	~PredictedLookup() { g_predicted_lookup = false; }
+	KYTY_CLASS_NO_COPY(PredictedLookup);
+};
+
+// As ReadShaderGuestMemoryOnGpuThread and ReadShaderGuestBlockOnGpuThread, but they read only
+// ranges the guest has mapped and fail otherwise, which fails the prediction.
+bool ReadShaderGuestMemoryPredicted(void*, uint64_t address, std::span<uint32_t> values) {
+	return Libs::LibKernel::Memory::TryClampRangeSize(address, values.size_bytes()) ==
+	           values.size_bytes() &&
+	       ReadShaderGuestMemoryOnGpuThread(nullptr, address, values);
+}
+
+bool ReadShaderGuestBlockPredicted(void*, uint64_t address, std::span<uint32_t> values) {
+	return Libs::LibKernel::Memory::TryClampRangeSize(address, values.size_bytes()) ==
+	           values.size_bytes() &&
+	       ReadShaderGuestBlockOnGpuThread(nullptr, address, values);
+}
+
 // The draw speculation thread's reader for all three kinds of read (userdata: the BufferCache).
 // It reads the backing only, since a guest address can fault, and fails on pages the lock-free
 // hint calls GPU-dirty. Its results only matter when adoption on the GPU thread repeats the read
@@ -686,17 +713,20 @@ struct PipelineCache::ProgramCache {
 		}
 
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
+		const bool predicted = g_predicted_lookup;
 		const ShaderRecompiler::IR::SrtRuntime runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
-		    .read_memory                = ReadShaderGuestMemoryOnGpuThread,
+		    .read_memory                = predicted ? ReadShaderGuestMemoryPredicted
+		                                            : ReadShaderGuestMemoryOnGpuThread,
 		    .read_specialization_memory = stage == ShaderType::Compute
 		                                      ? ReadShaderGuestMemoryWithReadback
 		                                      : ReadShaderGuestMemory,
 		    // TryReadGpuCleanBacking fails for a range when any byte is GPU-dirty or unbacked. A
 		    // read that may be read back is made exactly, so only the bytes it names are waited for.
 		    .specialization_block_reads = stage != ShaderType::Compute,
-		    .read_memory_block          = ReadShaderGuestBlockOnGpuThread,
+		    .read_memory_block          = predicted ? ReadShaderGuestBlockPredicted
+		                                            : ReadShaderGuestBlockOnGpuThread,
 		};
 		// Refreshes a known source and returns its permutation for the refreshed specialization,
 		// if it has one yet.
@@ -940,7 +970,9 @@ struct PipelineCache::ProgramCache {
 		}
 		// The failed pass may have changed the specialization, so the next lookup must search.
 		source.last_permutation = UINT32_MAX;
-		if (!materialize_failures.insert(hash).second) {
+		// A failed prediction skips nothing: the draw or dispatch refreshes again when the stream
+		// reaches it, and reports its own failure then.
+		if (g_predicted_lookup || !materialize_failures.insert(hash).second) {
 			return false;
 		}
 		const auto detail =
@@ -2353,6 +2385,7 @@ uint32_t PipelineCache::PrefetchGraphicsPipeline(const HW::Context& ctx, const H
 	const auto  target_mask = ctx.GetRenderTargetMask();
 	std::array<ShaderVertexInputInfo, 3> vertex_info;
 	ShaderPixelInputInfo                 pixel_info;
+	const PredictedLookup                predicted;
 	const auto programs = GetGraphicsPrograms(vs, ps, sh_regs, ctx, user_config, export_mapping,
 	                                          ps_active, vertex_info, pixel_info, wait);
 	if (programs.pending) {
@@ -2448,6 +2481,7 @@ uint32_t PipelineCache::PrefetchComputePipeline(const HW::Context& ctx, const HW
 	ShaderComputeInputInfo input_info {};
 	input_info.dispatch_thread_dimensions =
 	    (dispatch_initiator & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
+	const PredictedLookup predicted;
 	const auto program = GetComputeProgram(cs, ctx.GetShaderRegisters(), input_info, wait, pending);
 	if (!program) {
 		return 0;
