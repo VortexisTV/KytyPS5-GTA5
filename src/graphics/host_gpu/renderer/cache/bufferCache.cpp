@@ -4,12 +4,14 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/gpuCrashDiagnostics.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/drainStats.h"
 #include "graphics/host_gpu/renderer/gpuZones.h"
@@ -129,6 +131,7 @@ void BufferCache::DeleteBuffer(BufferId id) {
 }
 
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	PerfStats::Span                            span(PerfStats::SpanId::BufferDownload);
 	std::vector<vk::BufferCopy>                copies;
 	std::vector<std::pair<uint64_t, uint64_t>> pages;
 	uint64_t                                   total_size     = 0;
@@ -170,6 +173,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		return true;
 	}
 	DrainStats::Record(DrainStats::Kind::Readback, total_size);
+	PerfStats::Add(PerfStats::CounterId::BufferDownloadBytes, total_size);
 
 	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
 	std::unique_ptr<Buffer> temporary;
@@ -398,6 +402,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	const auto state = m_memory_tracker.QueryReadback(vaddr, size);
 	if (state.gpu_dirty) {
 		EXIT_IF(state.unarmed);
+		const GpuWaitScope wait_scope(PerfStats::SpanId::GpuWaitReadback);
 		m_scheduler.Wait(state.tick);
 		m_scheduler.WaitPriorityOperations(state.tick);
 	}
@@ -448,6 +453,8 @@ void BufferCache::ReadMemoryAsync(uint64_t vaddr, uint64_t size, bool is_write) 
 	if (tick == 0) {
 		return;
 	}
+	PerfStats::Add(PerfStats::CounterId::ReadbacksAsync);
+	PerfStats::Span guest_wait(PerfStats::SpanId::ReadbackGuestWait);
 	{
 		DrainStats::WaitTimer wait(DrainStats::Kind::TickWait);
 		m_scheduler.GetMasterSemaphore().Wait(tick);
@@ -608,8 +615,11 @@ bool BufferCache::ReadGpuCopy(uint64_t vaddr, void* out, uint64_t size) {
 	std::vector<vk::BufferCopy> copies {vk::BufferCopy {vaddr - begin, 0, size}};
 	const auto [mapped, offset] = RecordDownload(buffer, copies, Common::AlignUp(size, 64));
 	const auto tick             = m_scheduler.CurrentTick();
-	m_scheduler.Wait(tick);
-	m_scheduler.WaitPriorityOperations(tick);
+	{
+		const GpuWaitScope wait_scope(PerfStats::SpanId::GpuWaitIndirectArgs);
+		m_scheduler.Wait(tick);
+		m_scheduler.WaitPriorityOperations(tick);
+	}
 	m_download_buffer.Invalidate(offset, size);
 	std::memcpy(out, mapped, size);
 	return true;
@@ -704,6 +714,7 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	size               = end - vaddr;
 	const auto overlap = ResolveOverlaps(vaddr, size);
 	g_allocation_counters.game_buffers_created.fetch_add(1, std::memory_order_relaxed);
+	PerfStats::Add(PerfStats::CounterId::BufferCreates);
 
 	const auto id = m_slot_buffers.insert(
 	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin,
@@ -770,6 +781,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	if (copies.empty()) {
 		return nullptr;
 	}
+	PerfStats::Span span(PerfStats::SpanId::BufferUpload);
 	RecordUpload(t_upload_source, buffer.CpuAddress() + copies.front().dstOffset, total_size);
 
 	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
@@ -848,6 +860,7 @@ bool BufferCache::VerifyStreamReuse(const StreamCopy& copy) {
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
+	PerfStats::Span span(PerfStats::SpanId::BufferObtain);
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
@@ -1121,6 +1134,9 @@ void BufferCache::RunGarbageCollector() {
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
+	PerfStats::Set(PerfStats::GaugeId::GpuMemoryMb, m_total_used_memory >> 20u);
+	PerfStats::Set(PerfStats::GaugeId::BufferGcTriggerMb, m_trigger_gc_memory >> 20u);
+	PerfStats::Set(PerfStats::GaugeId::CachedBuffers, m_buffers.size());
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
@@ -1190,6 +1206,7 @@ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 		const auto start  = std::max(buffer.CpuAddress(), vaddr);
 		const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
 		if (start < finish) {
+			PerfStats::Add(PerfStats::CounterId::BdaBuffersVisited);
 			(void)SynchronizeBuffer(buffer, start, finish - start, false, false);
 		}
 	}
@@ -1267,8 +1284,12 @@ bool BufferCache::SynchronizeBdaRegion(uint64_t region, const RangeSet& mapped) 
 		return true;
 	}
 	const auto dirty = m_memory_tracker.SnapshotCpuDirty(*manager);
+	PerfStats::Add(PerfStats::CounterId::BdaRegionsSynced);
 	if (dirty.None()) {
 		return true;
+	}
+	if (PerfStats::Enabled()) {
+		PerfStats::Add(PerfStats::CounterId::BdaDirtyPages, dirty.Count());
 	}
 	bool consistent = true;
 	mapped.ForEachInRange(region_begin, TRACKER_REGION_SIZE, [&](uint64_t begin, uint64_t end) {
@@ -1304,6 +1325,7 @@ bool BufferCache::SynchronizeDirtyOwners(const RegionBits& dirty, uint64_t regio
 			}
 			const auto owner_begin = std::max(buffer->CpuAddress(), begin);
 			const auto owner_end   = std::min(buffer->CpuAddress() + buffer->Size(), end);
+			PerfStats::Add(PerfStats::CounterId::BdaBuffersVisited);
 			(void)SynchronizeBuffer(*buffer, owner_begin, owner_end - owner_begin, false, false);
 			synced_end = owner_end;
 			cursor     = owner_end;

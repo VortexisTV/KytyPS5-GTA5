@@ -254,6 +254,22 @@ static void ResetLoopWatchdogDispatchClock(RenderContext& context, vk::CommandBu
 	                          0, nullptr);
 }
 
+namespace {
+
+// Performance statistics: charges a whole dispatch, from its entry, to DispatchDma once its shader
+// is known to read memory through addresses.
+struct DmaDispatchTime {
+	uint64_t start = PerfStats::Enabled() ? PerfStats::Now() : 0;
+	bool     dma   = false;
+	~DmaDispatchTime() {
+		if (dma && PerfStats::Enabled()) {
+			PerfStats::Record(PerfStats::SpanId::DispatchDma, PerfStats::Now() - start);
+		}
+	}
+};
+
+} // namespace
+
 // Marks a dispatch for the GPU crash report with its user data and the constant buffers it reads.
 static void MarkDispatchCheckpoint(const GraphicContext& graphics, vk::CommandBuffer vk_buffer,
                                    GpuCheckpointKind kind, uint64_t submit_id,
@@ -290,6 +306,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode) {
 	PerfStats::Span dispatch_span(PerfStats::SpanId::Dispatch);
+	DmaDispatchTime dma_time;
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations(false);
 	auto& ctx    = buffer.GetRegisters();
@@ -346,10 +363,15 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderComputeInputInfo input_info {};
 	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
-	const auto compute_program = [&] {
-		DrainStats::SlowLookupTimer compile_timer(DrainStats::Kind::ShaderCompile);
-		return m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	PerfStats::Add(PerfStats::CounterId::DispatchesDirect);
+	PerfStats::Lap lap;
+	const auto     shaders_started = PerfStats::Enabled() ? PerfStats::Now() : uint64_t {0};
+	const auto     compute_program = [&] {
+        DrainStats::SlowLookupTimer compile_timer(DrainStats::Kind::ShaderCompile);
+        return m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
 	}();
+	lap.Mark(PerfStats::SpanId::DispatchShaders);
+	PerfStats::RecordIfSlow(PerfStats::SpanId::ShaderCompileSync, shaders_started);
 	if (!compute_program) {
 		// Temporary until RT is implemented.
 		return;
@@ -366,12 +388,15 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
+	dma_time.dma          = program.info.uses_dma;
 	if (TryConsumeComputeMetaClear(input_info, buffer)) {
+		PerfStats::Add(PerfStats::CounterId::DispatchesElided);
 		ResetBindings();
 		return;
 	}
 	if (TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
 	                                thread_group_z, mode)) {
+		PerfStats::Add(PerfStats::CounterId::DispatchesElided);
 		ResetBindings();
 		return;
 	}
@@ -462,10 +487,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	buffer.EndRendering();
-	auto& pipeline = [&]() -> PipelineCache::Pipeline& {
-		DrainStats::SlowLookupTimer create_timer(DrainStats::Kind::PipelineCreate);
-		return m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	lap.Skip();
+	const auto pipeline_started = PerfStats::Enabled() ? PerfStats::Now() : uint64_t {0};
+	auto&      pipeline         = [&]() -> PipelineCache::Pipeline& {
+        DrainStats::SlowLookupTimer create_timer(DrainStats::Kind::PipelineCreate);
+        return m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	}();
+	lap.Mark(PerfStats::SpanId::DispatchPipeline);
+	PerfStats::RecordIfSlow(PerfStats::SpanId::PipelineCreateSync, pipeline_started);
 	auto& bindings = m_compute_bindings;
 	bool has_storage_writes = HasShaderBufferWrites(input_info.stage);
 	has_storage_writes =
@@ -476,6 +505,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
 	                }) ||
 	    has_storage_writes;
+	if (has_storage_writes) {
+		PerfStats::Add(PerfStats::CounterId::DispatchesWriting);
+	}
 	// A shader the loop watchdog found slow runs in bands of workgroup rows, each its own
 	// submission, so no single submission nears the Windows GPU timeout (DispatchSplit). Each
 	// band binds its resources afresh: the stream-buffer space they use belongs to a submission.
@@ -514,6 +546,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			               input_info.stage.program->shader_hash);
 		}
 		RebindBuffers(bindings);
+		lap.Mark(PerfStats::SpanId::DispatchBindings);
 
 		vk_buffer                          = buffer.Handle();
 		PreparedBindings* descriptor_stage = &bindings;
@@ -550,6 +583,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			                       std::min(rows, thread_group_y - first_row), thread_group_z);
 			ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 		}
+		lap.Mark(PerfStats::SpanId::DispatchRecord);
 	}
 
 	if (const auto watched = FrameDumpWatchAddress(); watched != 0) {
@@ -591,11 +625,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	                  submit_id, {&program.shader_hash, 1});
 	m_context.GetBufferCache().OnCommandRecorded();
 	ResetBindings();
+	lap.Mark(PerfStats::SpanId::DispatchRecord);
 }
 
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
                                       uint64_t args_addr, uint32_t mode) {
 	PerfStats::Span dispatch_span(PerfStats::SpanId::Dispatch);
+	DmaDispatchTime dma_time;
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
 	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
 	m_context.GetCommandScheduler().PopPendingOperations(false);
@@ -608,11 +644,18 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 	ShaderComputeInputInfo input_info {};
-	const auto compute_program = [&] {
-		DrainStats::SlowLookupTimer compile_timer(DrainStats::Kind::ShaderCompile);
-		return m_context.GetPipelineCache().GetComputeProgram(
-		    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	// The group counts stay on the GPU: the host reads them from its copy of the arguments.
+	PerfStats::Add(PerfStats::CounterId::DispatchesIndirect);
+	PerfStats::Add(PerfStats::CounterId::IndirectDispatchesGpu);
+	PerfStats::Lap lap;
+	const auto     shaders_started = PerfStats::Enabled() ? PerfStats::Now() : uint64_t {0};
+	const auto     compute_program = [&] {
+        DrainStats::SlowLookupTimer compile_timer(DrainStats::Kind::ShaderCompile);
+        return m_context.GetPipelineCache().GetComputeProgram(
+            cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
 	}();
+	lap.Mark(PerfStats::SpanId::DispatchShaders);
+	PerfStats::RecordIfSlow(PerfStats::SpanId::ShaderCompileSync, shaders_started);
 	if (!compute_program) {
 		// Temporary until RT is implemented.
 		return;
@@ -622,14 +665,19 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 	buffer.EndRendering();
-	auto& pipeline = [&]() -> PipelineCache::Pipeline& {
-		DrainStats::SlowLookupTimer create_timer(DrainStats::Kind::PipelineCreate);
-		return m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	lap.Skip();
+	const auto pipeline_started = PerfStats::Enabled() ? PerfStats::Now() : uint64_t {0};
+	auto&      pipeline         = [&]() -> PipelineCache::Pipeline& {
+        DrainStats::SlowLookupTimer create_timer(DrainStats::Kind::PipelineCreate);
+        return m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	}();
+	lap.Mark(PerfStats::SpanId::DispatchPipeline);
+	PerfStats::RecordIfSlow(PerfStats::SpanId::PipelineCreateSync, pipeline_started);
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	FindBuffers(bindings);
 	const auto& program = *input_info.stage.program;
+	dma_time.dma        = program.info.uses_dma;
 	RecordWrittenBuffers(program, bindings, {0u, 0u, 0u});
 	if (program.info.uses_dma) {
 		PrepareDmaSources(bindings);
@@ -646,6 +694,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	RebindBuffers(bindings);
+	lap.Mark(PerfStats::SpanId::DispatchBindings);
 	PreparedBindings* descriptor_stage = &bindings;
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
@@ -656,6 +705,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		                                ShaderRecompiler::IR::ImageResourceClass::Storage;
 	    });
 	if (has_storage_writes) {
+		PerfStats::Add(PerfStats::CounterId::DispatchesWriting);
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	vk::MemoryBarrier barrier {};
@@ -683,6 +733,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                  submit_id, {&program.shader_hash, 1});
 	m_context.GetBufferCache().OnCommandRecorded();
 	ResetBindings();
+	lap.Mark(PerfStats::SpanId::DispatchRecord);
 }
 
 } // namespace Libs::Graphics

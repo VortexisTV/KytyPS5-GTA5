@@ -724,6 +724,9 @@ if(BUILD_TESTING)
 	add_test(NAME graphics_shadow_pipelines
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --shadow-pipeline-only)
 	set_tests_properties(graphics_shadow_pipelines PROPERTIES SKIP_RETURN_CODE 77)
+	# The performance statistics a draw and a dispatch record through the production paths.
+	add_test(NAME perf_stats_wiring
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --perf-stats-wiring-only)
 	add_test(NAME graphics_draw_offsets
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-offset-only)
 	add_test(NAME virtual_memory_allocation

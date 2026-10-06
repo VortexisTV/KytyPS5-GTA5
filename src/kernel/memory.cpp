@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -281,7 +282,7 @@ public:
 
 	bool Add(uint64_t start, uint64_t size, uint64_t offset, int protection, int memory_type,
 	         VirtualRangeType type, const char* name, bool disallow_merge = false) {
-		Common::LockGuard lock(m_mutex);
+		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapEdit);
 		BeginChange();
 
 		if (start == 0 || size == 0) {
@@ -312,7 +313,7 @@ public:
 	}
 
 	bool Remove(uint64_t start, uint64_t size) {
-		Common::LockGuard lock(m_mutex);
+		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapEdit);
 		BeginChange();
 
 		auto position = LowerBound(start);
@@ -324,14 +325,14 @@ public:
 	}
 
 	bool HasOverlap(uint64_t start, uint64_t size) {
-		Common::LockGuard lock(m_mutex);
+		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapQuery);
 
 		return FindOverlap(start, size) != nullptr;
 	}
 
 	bool QueryOverlap(uint64_t start, uint64_t size, Range* out) {
 		EXIT_IF(out == nullptr);
-		Common::LockGuard lock(m_mutex);
+		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapQuery);
 
 		const auto* overlap = FindOverlap(start, size);
 		if (overlap == nullptr) {
@@ -342,7 +343,7 @@ public:
 	}
 
 	bool ReleaseReserved(uint64_t start, uint64_t size) {
-		Common::LockGuard lock(m_mutex);
+		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapEdit);
 		BeginChange();
 
 		auto position = LowerBound(start);
@@ -356,7 +357,7 @@ public:
 	bool ReplaceSpan(uint64_t start, uint64_t size, VirtualRangeType expected_type,
 	                 uint64_t offset, int protection, int memory_type, VirtualRangeType type,
 	                 const char* name, bool disallow_merge = false) {
-		Common::LockGuard lock(m_mutex);
+		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapEdit);
 		BeginChange();
 
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
@@ -398,7 +399,7 @@ public:
 	}
 
 	void Rename(uint64_t start, uint64_t size, const char* name) {
-		Common::LockGuard lock(m_mutex);
+		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapEdit);
 		BeginChange();
 
 		auto position = LowerBound(start);
@@ -411,14 +412,14 @@ public:
 	}
 
 	void Protect(uint64_t start, uint64_t size, int protection) {
-		Common::LockGuard lock(m_mutex);
+		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapEdit);
 		BeginChange();
 
 		EditUnlocked(start, size, [protection](Range* r) { r->protection = protection; });
 	}
 
 	void SetMemoryType(uint64_t start, uint64_t size, int memory_type) {
-		Common::LockGuard lock(m_mutex);
+		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapEdit);
 		BeginChange();
 
 		EditUnlocked(start, size, [memory_type](Range* r) { r->memory_type = memory_type; });
@@ -427,7 +428,7 @@ public:
 	bool Query(uint64_t addr, int flags, Range* out) {
 		EXIT_IF(out == nullptr);
 
-		Common::LockGuard lock(m_mutex);
+		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapQuery);
 
 		auto next = std::upper_bound(
 		    m_ranges.begin(), m_ranges.end(), addr,
@@ -450,7 +451,7 @@ public:
 	bool QuerySpan(uint64_t start, uint64_t size, std::vector<Range>* out) {
 		EXIT_IF(out == nullptr);
 
-		Common::LockGuard lock(m_mutex);
+		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapQuery);
 		out->clear();
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
@@ -530,7 +531,17 @@ public:
 			return size;
 		}
 
-		Common::LockGuard lock(m_mutex);
+		// Range checks come from the emulated GPU thread (shader buffers and vertex ranges):
+		// time how long they wait while another operation holds the map.
+		if (!m_mutex.TryLock()) {
+			PerfStats::Span wait(PerfStats::SpanId::VirtualMapWait);
+			m_mutex.Lock();
+		}
+		struct Unlock {
+			Common::Mutex& mutex;
+			~Unlock() { mutex.Unlock(); }
+		} unlock {m_mutex};
+		PerfStats::Set(PerfStats::GaugeId::VirtualRanges, m_ranges.size());
 
 		auto vma = std::upper_bound(
 		    m_ranges.begin(), m_ranges.end(), virtual_addr,
@@ -563,7 +574,7 @@ public:
 	}
 
 	uint64_t CountPageTableEntries(bool gpu) {
-		Common::LockGuard lock(m_mutex);
+		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapQuery);
 
 		uint64_t used = 0;
 		for (const auto& r: m_ranges) {
@@ -813,6 +824,15 @@ private:
 	};
 
 	std::vector<Range>    m_ranges;
+	// Every operation other than a range check holds m_mutex through Hold, which, with PerfStats
+	// on, records how long the operation kept the lock.
+	struct Hold {
+		Hold(Common::Mutex& mutex, PerfStats::SpanId id): lock(mutex), span(id) {}
+
+		Common::LockGuard lock;
+		PerfStats::Span   span;
+	};
+
 	Common::Mutex         m_mutex;
 	std::atomic<uint64_t> m_generation {NextGenerationBase()};
 	// Per thread: committed ranges ClampRangeSize found recently, by 2 MiB address bucket.

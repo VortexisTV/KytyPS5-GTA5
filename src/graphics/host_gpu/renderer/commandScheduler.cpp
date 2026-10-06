@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/gpuCrashDiagnostics.h"
@@ -198,6 +199,7 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 
 void CommandScheduler::FlushAndWait() {
 	DrainStats::WaitTimer timer(DrainStats::Kind::FullDrain);
+	PerfStats::Add(PerfStats::CounterId::SubmitsWaited);
 	const auto            tick = Submit();
 	m_master.Wait(tick);
 	BeginNext();
@@ -208,6 +210,7 @@ void CommandScheduler::Finish() {
 	{
 		DrainStats::WaitTimer timer(DrainStats::Kind::FullDrain);
 		if (!m_command.IsInvalid()) {
+			PerfStats::Add(PerfStats::CounterId::SubmitsWaited);
 			Submit();
 		}
 		m_master.Wait(CurrentTick() - 1);
@@ -224,6 +227,7 @@ void CommandScheduler::Wait(uint64_t tick) {
 		// A stream-buffer wrap can wait while a draw is being prepared through a reference to
 		// Current(). The wrapper stays stable while its pooled Vulkan buffer is retired. Deferred
 		// resources are released only at the next GPU operation boundary.
+		PerfStats::Add(PerfStats::CounterId::SubmitsWaited);
 		const auto submitted_tick = Submit();
 		EXIT_IF(submitted_tick != tick);
 		m_master.Wait(tick);
@@ -615,6 +619,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 }
 
 void CommandScheduler::QueueSubmit(SubmitJob& job) {
+	PerfStats::Span span(PerfStats::SpanId::QueueSubmit);
 	auto&      graphics     = m_graphics;
 	const auto reason       = static_cast<DrainStats::Reason>(job.reason);
 	const bool stats        = DrainStats::Enabled();

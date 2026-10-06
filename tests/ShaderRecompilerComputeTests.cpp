@@ -10139,6 +10139,7 @@ public:
         DispatchCase{{1, 1, 0}, 0x41u, 0},
         DispatchCase{{3, 1, 1}, 0x41u, 12, true},
         DispatchCase{{8, 1, 1}, 0x61u, 8},
+        DispatchCase{{6, 1, 1}, 0x61u, 6, true},
     };
 
     // Separate DWORD descriptors preserve two owners until the indirect argument
@@ -10256,6 +10257,15 @@ public:
           Require(name, "offset indirect packet",
                   CpOpDispatchIndirect(processor, 0xc0011600u, packet.data(), 0, 0) == 2,
                   "the offset indirect packet was not consumed");
+        }
+        if (test.transfer && (test.mode & 0x20u) != 0) {
+          // Thread counts are read on the CPU. One buffer owns these and the GPU
+          // wrote them, so reading its copy is the one submission. Reading guest
+          // memory first, stale and read-protected, faults and submits once more.
+          const auto submissions = scheduler.CurrentTick() - tick;
+          Require(name, "thread-count argument readback", submissions == 1,
+                  "reading GPU-written thread counts took " +
+                      std::to_string(submissions) + " submissions; expected one");
         }
         if (test.mode == 0x41u) {
           Require(name, "asynchronous indirect dispatch", scheduler.CurrentTick() == tick,
@@ -39803,6 +39813,59 @@ int main(int argc, char **argv) {
     CheckDepthAttachmentWrites();
     CheckDepthFeedbackAspects();
     CheckDynamicRenderingState();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--perf-stats-wiring-only") == 0) {
+    // Performance statistics are recorded by the code they time, so replacing
+    // one of those files drops its timers without a compile error. A draw and
+    // a dispatch through the production paths must each leave theirs behind.
+    VulkanHarness vulkan;
+    PerfStats::Detail::g_enabled = true;
+    (void)PerfStats::CollectAndReset();
+    vulkan.CheckRasterization(false);
+    vulkan.CheckNativeIndirectDispatch();
+    const auto stats = PerfStats::CollectAndReset();
+    PerfStats::Detail::g_enabled = false;
+    using PerfStats::CounterId;
+    using PerfStats::SpanId;
+    constexpr const char *name = "PerfStatsWiring";
+    const auto timed = [&stats](std::initializer_list<SpanId> spans) {
+      return std::ranges::all_of(
+          spans, [&stats](SpanId id) { return stats.Get(id).count != 0; });
+    };
+    Require(name, "draw phases",
+            timed({SpanId::Draw, SpanId::DrawShaders, SpanId::DrawTargets,
+                   SpanId::DrawBindings, SpanId::DrawVertexIndex,
+                   SpanId::DrawPipeline, SpanId::DrawRecord}),
+            "a draw left one of its phases untimed");
+    Require(name, "dispatch phases",
+            timed({SpanId::Dispatch, SpanId::DispatchShaders,
+                   SpanId::DispatchPipeline, SpanId::DispatchBindings,
+                   SpanId::DispatchRecord}),
+            "a dispatch left one of its phases untimed");
+    Require(name, "dispatch counts",
+            stats.Get(CounterId::DispatchesDirect) != 0 &&
+                stats.Get(CounterId::DispatchesIndirect) != 0 &&
+                stats.Get(CounterId::DispatchesWriting) != 0,
+            "direct, indirect or writing dispatches were not counted");
+    Require(name, "bindings and caches",
+            timed({SpanId::BindResolve, SpanId::BindFindBuffers,
+                   SpanId::BindRebindBuffers, SpanId::BufferObtain,
+                   SpanId::ImageFind}) &&
+                stats.Get(CounterId::BufferCreates) != 0 &&
+                stats.Get(CounterId::ImageCreates) != 0,
+            "binding preparation or a cache lookup was not recorded");
+    Require(name, "submission", timed({SpanId::QueueSubmit}),
+            "queue submissions were not timed");
+    if (CommandRecordingDeferred()) {
+      Require(name, "recorded Vulkan calls",
+              timed({SpanId::RecordThreadBusy}) &&
+                  stats.Get(CounterId::Barriers) != 0 &&
+                  stats.Get(CounterId::RenderPasses) != 0 &&
+                  stats.Get(CounterId::DescriptorWrites) != 0,
+              "the record thread or its Vulkan calls were not counted");
+    }
+    std::printf("[host]    %-32s ok\n", name);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--polygon-mode-only") == 0) {

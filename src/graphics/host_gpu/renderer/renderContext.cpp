@@ -96,6 +96,10 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	PerfStats::Span span(PerfStats::SpanId::PageFault);
 	PerfStats::Add(access == PageFaultAccess::Write ? PerfStats::CounterId::WriteFaults
 	                                                : PerfStats::CounterId::ReadFaults);
+	if (gpu_thread) {
+		PerfStats::Add(access == PageFaultAccess::Write ? PerfStats::CounterId::GpuThreadWriteFaults
+		                                                : PerfStats::CounterId::GpuThreadReadFaults);
+	}
 	if (access == PageFaultAccess::Write) {
 		DrainStats::ReasonScope reason(gpu_thread ? DrainStats::Reason::GpuThreadWriteFault
 		                                          : DrainStats::Reason::GuestWriteFault);
@@ -225,10 +229,12 @@ void RenderContext::AdvanceBdaEpochForGpuWrite() noexcept {
 // (waits, conditions, predication), new page-table entries (buffer registration), GPU mappings,
 // kernel invalidations and the GPU thread's own writes.
 void RenderContext::PrepareBda() {
+	PerfStats::Span span(PerfStats::SpanId::BdaPrepare);
 	RecordUpload(UploadSource::BdaPass, 0, 0);
 	m_fault_process_pending = true;
 	const auto epoch        = m_bda_epoch.load(std::memory_order_acquire);
 	if (epoch == m_bda_synced_epoch && BdaEpochEnabled()) {
+		PerfStats::Add(PerfStats::CounterId::BdaPassesSkipped);
 		return;
 	}
 	// An epoch started during the synchronization below leaves the next call synchronizing.

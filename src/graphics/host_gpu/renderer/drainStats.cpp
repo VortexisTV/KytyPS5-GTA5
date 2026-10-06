@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/drainStats.h"
 
+#include "common/file.h"
 #include "common/logging/log.h"
 #include "kernel/pthread.h"
 
@@ -95,6 +96,25 @@ std::condition_variable_any g_reporter_wake;
 std::jthread                g_reporter;
 // Only an explicit Stop() prints the session total; static destruction may follow Log shutdown.
 std::atomic_bool            g_final_report {false};
+
+// The reports also go to this file beside the emulator, each under the time since statistics
+// started: a console scrolls them away, and the wait rows are what a profile is read for.
+constexpr const char*                 ReportFileName = "_DrainStats.txt";
+Common::File                          g_report_file;
+bool                                  g_report_file_open = false;
+std::chrono::steady_clock::time_point g_report_start;
+
+void WriteReportFile(const std::string& text) {
+	if (!g_report_file_open) {
+		return;
+	}
+	const auto header = fmt::format(
+	    "t={:.1f}s\n",
+	    std::chrono::duration<double>(std::chrono::steady_clock::now() - g_report_start).count());
+	g_report_file.Write(header.data(), static_cast<uint32_t>(header.size()));
+	g_report_file.Write(text.data(), static_cast<uint32_t>(text.size()));
+	g_report_file.Flush();
+}
 
 constexpr size_t Index(Kind kind, Reason reason, uint32_t op) {
 	return (static_cast<size_t>(kind) * ReasonCount + static_cast<size_t>(reason)) * OpCount +
@@ -465,6 +485,7 @@ void Report(const Snapshot& before, const Snapshot& after, double seconds, bool 
 		text += '\n';
 	}
 	Log::WriteToConsoleAndLog(text);
+	WriteReportFile(text);
 }
 
 void Run(std::stop_token stop, uint32_t interval_seconds) {
@@ -501,6 +522,8 @@ void Start(uint32_t interval_seconds) {
 	if (interval_seconds == 0 || g_reporter.joinable()) {
 		return;
 	}
+	g_report_start     = std::chrono::steady_clock::now();
+	g_report_file_open = g_report_file.Create(ReportFileName);
 	g_enabled.store(true, std::memory_order_relaxed);
 	g_reporter = std::jthread(Run, interval_seconds);
 }
@@ -510,6 +533,11 @@ void Stop() {
 		g_final_report.store(true, std::memory_order_release);
 		g_reporter.request_stop();
 		g_reporter.join();
+	}
+	if (g_report_file_open) {
+		g_report_file.Flush();
+		g_report_file.Close();
+		g_report_file_open = false;
 	}
 	g_enabled.store(false, std::memory_order_relaxed);
 }

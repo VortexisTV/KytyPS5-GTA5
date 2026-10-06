@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 
 #include <array>
@@ -751,6 +752,7 @@ VkResult VKAPI_PTR HookEndCommandBuffer(VkCommandBuffer buffer) {
 void VKAPI_PTR HookUpdateDescriptorSets(VkDevice device, uint32_t write_count,
                                         const VkWriteDescriptorSet* writes, uint32_t copy_count,
                                         const VkCopyDescriptorSet* copies) {
+	PerfStats::Add(PerfStats::CounterId::DescriptorWrites);
 	if (t_home != nullptr && t_home->buffer.load(std::memory_order_relaxed) != VK_NULL_HANDLE &&
 	    t_home->owner.load(std::memory_order_relaxed) == &t_owner_token) {
 		// While this thread's stream records: in order with the binds recorded around it.
@@ -781,6 +783,7 @@ void VKAPI_PTR HookCmdPipelineBarrier(VkCommandBuffer buffer, VkPipelineStageFla
                                       uint32_t memory_count, const VkMemoryBarrier* memory,
                                       uint32_t buffer_count, const VkBufferMemoryBarrier* buffers,
                                       uint32_t image_count, const VkImageMemoryBarrier* images) {
+	PerfStats::Add(PerfStats::CounterId::Barriers);
 	if (Routed(buffer)) {
 		Packet      packet(*t_stream, Bytes<VkMemoryBarrier>(memory_count) +
 		                                   Bytes<VkBufferMemoryBarrier>(buffer_count) +
@@ -800,6 +803,7 @@ void VKAPI_PTR HookCmdPipelineBarrier(VkCommandBuffer buffer, VkPipelineStageFla
 }
 
 void VKAPI_PTR HookCmdPipelineBarrier2(VkCommandBuffer buffer, const VkDependencyInfo* info) {
+	PerfStats::Add(PerfStats::CounterId::Barriers);
 	if (Routed(buffer)) {
 		RequireNoNext(info->pNext, "a dependency info");
 		Packet packet(*t_stream, Bytes<VkDependencyInfo>(1) +
@@ -851,6 +855,7 @@ void VKAPI_PTR HookCmdBindDescriptorSets(VkCommandBuffer buffer, VkPipelineBindP
 void VKAPI_PTR HookCmdPushDescriptorSetKHR(VkCommandBuffer buffer, VkPipelineBindPoint point,
                                            VkPipelineLayout layout, uint32_t set, uint32_t count,
                                            const VkWriteDescriptorSet* writes) {
+	PerfStats::Add(PerfStats::CounterId::DescriptorWrites);
 	if (Routed(buffer)) {
 		Packet      packet(*t_stream, WritesBytes(count, writes));
 		const auto* copies = CopyWrites(packet, count, writes);
@@ -902,6 +907,7 @@ void VKAPI_PTR HookCmdBindIndexBuffer(VkCommandBuffer buffer, VkBuffer index_buf
 }
 
 void VKAPI_PTR HookCmdBeginRendering(VkCommandBuffer buffer, const VkRenderingInfo* info) {
+	PerfStats::Add(PerfStats::CounterId::RenderPasses);
 	if (Routed(buffer)) {
 		RequireNoNext(info->pNext, "a rendering info");
 		Packet packet(*t_stream, Bytes<VkRenderingInfo>(1) +
@@ -1618,9 +1624,25 @@ void CommandStream::Consume(std::stop_token stop) {
 	auto&    impl     = *m_impl;
 	uint64_t position = impl.read.load(std::memory_order_relaxed);
 	t_consuming       = &impl;
+	// Performance statistics: this thread's time running recorded work, and its time without any
+	// (spinning or asleep), each recorded where the one turns into the other.
+	const bool stats  = PerfStats::Enabled();
+	bool       busy   = false;
+	uint64_t   since  = stats ? PerfStats::Now() : 0;
+	const auto turned = [&](bool now_busy) {
+		if (stats && busy != now_busy) {
+			const auto now = PerfStats::Now();
+			PerfStats::Record(busy ? PerfStats::SpanId::RecordThreadBusy
+			                       : PerfStats::SpanId::RecordThreadIdle,
+			                  now - since);
+			since = now;
+			busy  = now_busy;
+		}
+	};
 	for (;;) {
 		const auto available = impl.write.load(std::memory_order_acquire);
 		if (position == available) {
+			turned(false);
 			if (stop.stop_requested()) {
 				return;
 			}
@@ -1647,6 +1669,7 @@ void CommandStream::Consume(std::stop_token stop) {
 			impl.sleeping.store(false, std::memory_order_relaxed);
 			continue;
 		}
+		turned(true);
 		auto* start  = impl.ring.data() + position % Impl::RingBytes;
 		auto* header = reinterpret_cast<Impl::Header*>(start);
 		if (header->run == nullptr) {

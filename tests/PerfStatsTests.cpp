@@ -86,6 +86,8 @@ void TestCsvRowsMatchHeader() {
 	Check(Columns(header) == Columns(row), "CSV row and header column counts differ");
 	Check(header.find(",gpu_wait_predicate_ms,gpu_wait_predicate_n,") != std::string::npos,
 	      "the CSV header stops before the last span");
+	Check(header.find(",gpu_wait_indirect_args_ms,gpu_wait_indirect_args_n,") != std::string::npos,
+	      "the CSV header lacks the newest span");
 	Check(header.find(",draw_ms,draw_n,draw_max_ms,") != std::string::npos,
 	      "span columns are missing from the CSV header");
 	Check(header.find(",packets_skipped_predicated,bda_buffers_visited,") != std::string::npos,
@@ -164,6 +166,35 @@ void TestSummaryReportsPerFrameValues() {
 	snapshot.counters[static_cast<size_t>(CounterId::HotPagesHashed)]  = 80000;
 	snapshot.counters[static_cast<size_t>(CounterId::HotPagesChanged)] = 4000;
 	snapshot.counters[static_cast<size_t>(CounterId::HotPagesCooled)]  = 60000;
+
+	snapshot.spans[static_cast<size_t>(SpanId::CpProcess)]        = {2000, 8, 400};
+	snapshot.spans[static_cast<size_t>(SpanId::CpLookahead)]      = {40, 4, 20};
+	snapshot.spans[static_cast<size_t>(SpanId::Dispatch)]         = {800, 2400, 5};
+	snapshot.spans[static_cast<size_t>(SpanId::DispatchShaders)]  = {200, 2400, 1};
+	snapshot.spans[static_cast<size_t>(SpanId::DispatchPipeline)] = {40, 2400, 1};
+	snapshot.spans[static_cast<size_t>(SpanId::DispatchBindings)] = {320, 2400, 2};
+	snapshot.spans[static_cast<size_t>(SpanId::DispatchRecord)]   = {160, 2400, 1};
+	snapshot.spans[static_cast<size_t>(SpanId::DispatchDma)]      = {480, 1200, 5};
+	snapshot.spans[static_cast<size_t>(SpanId::RecordThreadBusy)] = {1200, 40, 100};
+	snapshot.spans[static_cast<size_t>(SpanId::RecordThreadIdle)] = {2800, 40, 100};
+	snapshot.spans[static_cast<size_t>(SpanId::QueueSubmit)]      = {80, 24, 10};
+	snapshot.spans[static_cast<size_t>(SpanId::ImageFind)]        = {120, 4000, 1};
+	snapshot.spans[static_cast<size_t>(SpanId::BufferObtain)]     = {160, 8000, 1};
+	snapshot.counters[static_cast<size_t>(CounterId::CpPackets)]          = 400000;
+	snapshot.counters[static_cast<size_t>(CounterId::DispatchesDirect)]   = 2000;
+	snapshot.counters[static_cast<size_t>(CounterId::DispatchesIndirect)] = 400;
+	snapshot.counters[static_cast<size_t>(CounterId::DispatchesWriting)]  = 1600;
+	snapshot.counters[static_cast<size_t>(CounterId::DispatchesElided)]   = 40;
+	snapshot.counters[static_cast<size_t>(CounterId::SubmitsWaited)]      = 8;
+	snapshot.counters[static_cast<size_t>(CounterId::Barriers)]           = 6000;
+	snapshot.counters[static_cast<size_t>(CounterId::RenderPasses)]       = 240;
+	snapshot.counters[static_cast<size_t>(CounterId::DescriptorWrites)]   = 3200;
+	snapshot.counters[static_cast<size_t>(CounterId::BdaRegionsSynced)]   = 60;
+	snapshot.counters[static_cast<size_t>(CounterId::BdaDirtyPages)]      = 2000;
+	snapshot.spans[static_cast<size_t>(SpanId::GpuWaitIndirectArgs)]          = {100, 12, 20};
+	snapshot.counters[static_cast<size_t>(CounterId::DispatchesThreadSized)] = 16;
+	snapshot.counters[static_cast<size_t>(CounterId::GpuThreadReadFaults)]   = 8;
+	snapshot.counters[static_cast<size_t>(CounterId::GpuThreadWriteFaults)]  = 20;
 	const auto summary = PerfStats::FormatSummary(snapshot, 1000);
 	Check(summary.find("4 frames in 1.00s (4.0 fps)") != std::string::npos,
 	      "the summary does not report the frame rate");
@@ -207,6 +238,50 @@ void TestSummaryReportsPerFrameValues() {
 	                   "longest push gap 45.0 ms | waiting for device room 10.0 ms") !=
 	          std::string::npos,
 	      "the summary does not report audio pacing");
+	Check(summary.find("command processors 500.0 ms in 2.0 slices (100000 packets): draws 250.0 "
+	                   "ms, dispatches 200.0 ms, look-ahead 10.0 ms (1.0 walks), other packets "
+	                   "40.0 ms | record thread busy 300.0 ms, idle 700.0 ms") !=
+	          std::string::npos,
+	      "the summary does not report the command processors");
+	Check(summary.find("dispatches: 500 direct, 100 indirect (400 writing, 10 elided as clears) "
+	                   "200.0 ms: shaders 50.0 ms, pipeline 10.0 ms, bindings 80.0 ms, record "
+	                   "40.0 ms, other 20.0 ms | 300 through addresses 120.0 ms") !=
+	          std::string::npos,
+	      "the summary does not break down dispatches");
+	Check(summary.find("Vulkan: 1500 barriers, 60 render passes, 800 descriptor writes, 6.0 "
+	                   "submits (2.0 waited for) | 1000 image lookups 30.0 ms, 2000 buffer "
+	                   "lookups 40.0 ms | BDA looked at 15.0 regions, 500 dirty pages") !=
+	          std::string::npos,
+	      "the summary does not report Vulkan calls and cache lookups");
+	Check(summary.find("GPU thread round trips: 10.0 waits 100.0 ms: 2.0 after its own read "
+	                   "faults 40.0 ms, 3.0 for indirect dispatch arguments 25.0 ms (4.0 "
+	                   "dispatches sized in threads), other 0.0 ms | GPU thread faults: 2.0 read, "
+	                   "5.0 write") != std::string::npos,
+	      "the summary does not attribute the GPU thread's waits");
+}
+
+void TestLapChargesEachPhase() {
+	PerfStats::Detail::g_enabled = false;
+	{
+		PerfStats::Lap lap;
+		lap.Mark(SpanId::DrawTargets);
+	}
+	Check(PerfStats::CollectAndReset().Get(SpanId::DrawTargets).count == 0,
+	      "a disabled lap was recorded");
+	PerfStats::Detail::g_enabled = true;
+	{
+		PerfStats::Lap lap;
+		lap.Mark(SpanId::DrawTargets);
+		lap.Skip();
+		lap.Mark(SpanId::DrawPipeline);
+		lap.Mark(SpanId::DrawPipeline);
+	}
+	const auto snapshot = PerfStats::CollectAndReset();
+	Check(snapshot.Get(SpanId::DrawTargets).count == 1 &&
+	          snapshot.Get(SpanId::DrawPipeline).count == 2 &&
+	          snapshot.Get(SpanId::DrawRecord).count == 0,
+	      "a lap did not charge each mark to its span");
+	PerfStats::Detail::g_enabled = false;
 }
 
 } // namespace
@@ -216,6 +291,7 @@ int main() {
 	TestIntervalsAccumulateAndReset();
 	TestCsvRowsMatchHeader();
 	TestSummaryReportsPerFrameValues();
+	TestLapChargesEachPhase();
 	std::printf("PerfStatsTests: ok\n");
 	return 0;
 }

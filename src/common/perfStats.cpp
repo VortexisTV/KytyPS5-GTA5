@@ -51,6 +51,12 @@ constexpr std::array<std::string_view, SpanCount> SpanNames = {
     "garbage_collect",       "shader_compile_sync",  "shader_compile_async",
     "pipeline_create_sync",  "pipeline_create_async", "pipeline_cache_save",
     "audio_push_gap",        "audio_queue_wait",
+    "cp_process",            "cp_lookahead",
+    "dispatch_shaders",      "dispatch_pipeline",    "dispatch_bindings",
+    "dispatch_record",       "dispatch_dma",
+    "record_thread_busy",    "record_thread_idle",
+    "image_find",            "buffer_obtain",
+    "gpu_wait_indirect_args",
 };
 
 constexpr std::array<std::string_view, CounterCount> CounterNames = {
@@ -75,6 +81,12 @@ constexpr std::array<std::string_view, CounterCount> CounterNames = {
     "srt_interpreted",      "shader_input_repeats",
     "audio_pushes_sync",    "audio_pushes_async",     "audio_pushes_not_ready",
     "audio_underruns",
+    "cp_packets",
+    "dispatches_direct",    "dispatches_indirect",    "dispatches_writing",
+    "dispatches_elided",    "submits_waited",
+    "barriers",             "render_passes",          "descriptor_writes",
+    "bda_regions_synced",   "bda_dirty_pages",
+    "dispatches_thread_sized", "gpu_thread_read_faults", "gpu_thread_write_faults",
 };
 
 constexpr std::array<std::string_view, GaugeCount> GaugeNames = {
@@ -426,6 +438,55 @@ std::string FormatSummary(const Snapshot& snapshot, uint64_t ticks_per_second) {
 	               ms(SpanId::BufferDownload), per_frame(CounterId::ShadersCompiled),
 	               ms(SpanId::ShaderCompileSync), per_frame(CounterId::PipelinesCreated),
 	               ms(SpanId::PipelineCreateSync));
+	const auto cp_other = std::max(0.0, ms(SpanId::CpProcess) - ms(SpanId::Draw) -
+	                                        ms(SpanId::Dispatch) - ms(SpanId::CpLookahead));
+	fmt::format_to(it,
+	               "[perf] per frame: command processors {:.1f} ms in {:.1f} slices ({:.0f} "
+	               "packets): draws {:.1f} ms, dispatches {:.1f} ms, look-ahead {:.1f} ms ({:.1f} "
+	               "walks), other packets {:.1f} ms | record thread busy {:.1f} ms, idle {:.1f} "
+	               "ms\n",
+	               ms(SpanId::CpProcess), count(SpanId::CpProcess), per_frame(CounterId::CpPackets),
+	               ms(SpanId::Draw), ms(SpanId::Dispatch), ms(SpanId::CpLookahead),
+	               count(SpanId::CpLookahead), cp_other, ms(SpanId::RecordThreadBusy),
+	               ms(SpanId::RecordThreadIdle));
+	const auto dispatch_other =
+	    std::max(0.0, ms(SpanId::Dispatch) - ms(SpanId::DispatchShaders) -
+	                      ms(SpanId::DispatchPipeline) - ms(SpanId::DispatchBindings) -
+	                      ms(SpanId::DispatchRecord));
+	fmt::format_to(it,
+	               "[perf] per frame: dispatches: {:.0f} direct, {:.0f} indirect ({:.0f} writing, "
+	               "{:.0f} elided as clears) {:.1f} ms: shaders {:.1f} ms, pipeline {:.1f} ms, "
+	               "bindings {:.1f} ms, record {:.1f} ms, other {:.1f} ms | {:.0f} through "
+	               "addresses {:.1f} ms\n",
+	               per_frame(CounterId::DispatchesDirect), per_frame(CounterId::DispatchesIndirect),
+	               per_frame(CounterId::DispatchesWriting), per_frame(CounterId::DispatchesElided),
+	               ms(SpanId::Dispatch), ms(SpanId::DispatchShaders), ms(SpanId::DispatchPipeline),
+	               ms(SpanId::DispatchBindings), ms(SpanId::DispatchRecord), dispatch_other,
+	               count(SpanId::DispatchDma), ms(SpanId::DispatchDma));
+	fmt::format_to(it,
+	               "[perf] per frame: Vulkan: {:.0f} barriers, {:.0f} render passes, {:.0f} "
+	               "descriptor writes, {:.1f} submits ({:.1f} waited for) | {:.0f} image lookups "
+	               "{:.1f} ms, {:.0f} buffer lookups {:.1f} ms | BDA looked at {:.1f} regions, "
+	               "{:.0f} dirty pages\n",
+	               per_frame(CounterId::Barriers), per_frame(CounterId::RenderPasses),
+	               per_frame(CounterId::DescriptorWrites), count(SpanId::QueueSubmit),
+	               per_frame(CounterId::SubmitsWaited), count(SpanId::ImageFind),
+	               ms(SpanId::ImageFind), count(SpanId::BufferObtain), ms(SpanId::BufferObtain),
+	               per_frame(CounterId::BdaRegionsSynced), per_frame(CounterId::BdaDirtyPages));
+	const auto waits_other =
+	    std::max(0.0, ms(SpanId::GpuWait) - ms(SpanId::GpuWaitReadback) -
+	                      ms(SpanId::GpuWaitFaults) - ms(SpanId::GpuWaitStream) -
+	                      ms(SpanId::GpuWaitPredicate) - ms(SpanId::GpuWaitIndirectArgs));
+	fmt::format_to(it,
+	               "[perf] per frame: GPU thread round trips: {:.1f} waits {:.1f} ms: {:.1f} after "
+	               "its own read faults {:.1f} ms, {:.1f} for indirect dispatch arguments {:.1f} "
+	               "ms ({:.1f} dispatches sized in threads), other {:.1f} ms | GPU thread faults: "
+	               "{:.1f} read, {:.1f} write\n",
+	               count(SpanId::GpuWait), ms(SpanId::GpuWait), count(SpanId::GpuWaitReadback),
+	               ms(SpanId::GpuWaitReadback), count(SpanId::GpuWaitIndirectArgs),
+	               ms(SpanId::GpuWaitIndirectArgs), per_frame(CounterId::DispatchesThreadSized),
+	               waits_other, per_frame(CounterId::GpuThreadReadFaults),
+	               per_frame(CounterId::GpuThreadWriteFaults));
 	return out;
 }
 

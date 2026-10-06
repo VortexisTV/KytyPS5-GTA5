@@ -71,6 +71,20 @@ enum class SpanId : uint8_t {
 	PipelineCacheSave,
 	AudioPushGap,       // time between accepted pushes on one AudioOut2 context
 	AudioQueueWait,     // blocking audio output waiting for room in the host device queue
+	CpProcess,          // part of GpuThreadBusy: a command processor's packet loop over one
+	                    // submission slice, with its draws, dispatches and look-ahead walks
+	CpLookahead,        // part of CpProcess: pipeline look-ahead walks
+	DispatchShaders,    // part of Dispatch: compute program lookup, with materialization
+	DispatchPipeline,   // part of Dispatch: compute pipeline lookup or creation
+	DispatchBindings,   // part of Dispatch: bindings, buffers, DMA sources, BDA and image views
+	DispatchRecord,     // part of Dispatch: descriptor commit, barriers and dispatch recording
+	DispatchDma,        // the dispatches of shaders that read memory through addresses, whole;
+	                    // GTA V's BVH traversal and refit are among them
+	RecordThreadBusy,   // deferred recording: the submit thread running recorded Vulkan calls
+	RecordThreadIdle,   // deferred recording: the submit thread spinning or asleep without work
+	ImageFind,          // texture cache image lookups, with the refresh of what they find
+	BufferObtain,       // buffer cache lookups for a binding, with creation and synchronization
+	GpuWaitIndirectArgs, // part of GpuWait: reading back the thread counts of an indirect dispatch
 	Count
 };
 
@@ -130,6 +144,20 @@ enum class CounterId : uint8_t {
 	AudioPushesAsync,
 	AudioPushesNotReady, // asynchronous pushes refused because the queue was full
 	AudioUnderruns,      // host device queue found empty after playback started
+	CpPackets,           // PM4 packets the command processors handled or skipped
+	DispatchesDirect,
+	DispatchesIndirect,
+	DispatchesWriting,   // dispatches that store to buffers or images (a hazard barrier each)
+	DispatchesElided,    // dispatches replaced by a metadata or image clear
+	SubmitsWaited,       // submissions the GPU thread then waited for (full drains)
+	Barriers,            // vkCmdPipelineBarrier and vkCmdPipelineBarrier2 calls
+	RenderPasses,        // vkCmdBeginRendering calls
+	DescriptorWrites,    // vkUpdateDescriptorSets and vkCmdPushDescriptorSetKHR calls
+	BdaRegionsSynced,    // tracker regions a selective BDA pass looked at
+	BdaDirtyPages,       // CPU-dirty pages those regions held
+	DispatchesThreadSized, // indirect dispatches sized in threads, whose arguments the CPU reads
+	GpuThreadReadFaults,   // of ReadFaults, those the emulated GPU thread took itself
+	GpuThreadWriteFaults,  // of WriteFaults, those the emulated GPU thread took itself
 	Count
 };
 
@@ -185,6 +213,17 @@ inline void Record(SpanId id, uint64_t ticks) noexcept {
 	}
 }
 
+// Records the time since `start` (a Now() value) once it reaches a millisecond: for a lookup that
+// is usually a cache hit and takes that long only when it compiled something.
+inline void RecordIfSlow(SpanId id, uint64_t start) noexcept {
+	if (Enabled()) {
+		const auto ticks = Now() - start;
+		if (ticks * 1000 >= TicksPerSecond()) {
+			Detail::RecordSpan(id, ticks);
+		}
+	}
+}
+
 // Records the time from construction to Stop() or destruction, whichever comes first. A false
 // condition makes the span inert.
 class Span final {
@@ -206,6 +245,31 @@ private:
 	SpanId   m_id;
 	bool     m_active;
 	uint64_t m_start;
+};
+
+// Charges the time since construction, or since the previous Mark or Skip, to a span: for a
+// function whose phases follow one another without scopes of their own.
+class Lap final {
+public:
+	Lap() noexcept: m_active(Enabled()), m_last(m_active ? Now() : 0) {}
+
+	void Mark(SpanId id) noexcept {
+		if (m_active) {
+			const auto now = Now();
+			Detail::RecordSpan(id, now - m_last);
+			m_last = now;
+		}
+	}
+	// Leaves the time since the last mark out of every span.
+	void Skip() noexcept {
+		if (m_active) {
+			m_last = Now();
+		}
+	}
+
+private:
+	bool     m_active;
+	uint64_t m_last;
 };
 
 struct SpanTotal {

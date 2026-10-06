@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -1572,6 +1573,8 @@ void TextureCache::InitializeImage(ImageId id) {
 	};
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
+		PerfStats::Add(PerfStats::CounterId::ImageUploads);
+		PerfStats::Add(PerfStats::CounterId::ImageUploadBytes, image.info.data.size);
 		RecordImageUpload(image.info.data.address, image.info.data.size, image.info.extent.width,
 		                  image.info.extent.height, static_cast<uint32_t>(image.info.guest_format),
 		                  static_cast<uint32_t>(image.info.tile_mode), image.IsBufferModified());
@@ -2042,6 +2045,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, uint64_t* unique_generation) {
+	PerfStats::Span span(PerfStats::SpanId::ImageFind);
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid()) {
 		EXIT("TextureCache: image lookup requires a valid command buffer\n");

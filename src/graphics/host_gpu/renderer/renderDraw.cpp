@@ -5,6 +5,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -1379,11 +1380,18 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
 	                  (color_output_mask != 0 ||
 	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
-	RefreshShaders(buffer, draw, color_output_mask, state);
+	{
+		PerfStats::Span shaders_span(PerfStats::SpanId::DrawShaders);
+		const auto      started = PerfStats::Enabled() ? PerfStats::Now() : uint64_t {0};
+		RefreshShaders(buffer, draw, color_output_mask, state);
+		PerfStats::RecordIfSlow(PerfStats::SpanId::ShaderCompileSync, started);
+	}
 	if (state.programs.pending) {
 		// Asynchronous pipelines: a shader is still translating; skip the draw until it is ready.
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedShader);
 		return false;
 	}
+	PerfStats::Span targets_span(PerfStats::SpanId::DrawTargets);
 	if (DebugSkipShader(state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0,
 	                    DebugShaderKind::Pixel, draw.index_count > 6 || draw.indirect_args != 0) ||
 	    DebugSkipShader(state.vertex_info[0].stage.program->shader_hash, DebugShaderKind::Vertex))
@@ -1441,6 +1449,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
 		                   draw.index_count, 0);
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedState);
 		return false;
 	}
 
@@ -1820,6 +1829,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
                                          const DrawIndexBufferSource& index_source,
 	                                     bool primitive_restart_enable) {
 	auto& ucfg = buffer.GetUserConfig();
+	PerfStats::Lap lap;
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
 	const bool draw_logged = DrawLog::Hash() != 0 && state.ps_active &&
@@ -1900,6 +1910,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	g_draw_phases.Mark(DrawPhaseTimer::StageBindings);
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
 	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
+	lap.Mark(PerfStats::SpanId::DrawBindings);
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
@@ -1908,10 +1919,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
 	g_draw_phases.Mark(DrawPhaseTimer::GraphicsBindings);
+	lap.Mark(PerfStats::SpanId::DrawVertexIndex);
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering = AcquireRenderTargets(buffer, state.color_info, state.color_count,
 	                                            state.depth_info, feedback_aspects, stages);
 	g_draw_phases.Mark(DrawPhaseTimer::RenderTargets);
+	lap.Mark(PerfStats::SpanId::DrawTargets);
 	if (ImageUsersEnabled()) [[unlikely]] {
 		NoteImageUsers(m_context.GetTextureCache(), stages,
 		               std::span<const RenderColorInfo> {state.color_info, state.color_count},
@@ -1930,14 +1943,19 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	may_defer = may_defer && !(state.ps_active && StoresData(state.ps_input_info.stage));
 	// Target acquisition resolves the actual overlapping read/write aspects for this draw.
-	auto* const found_pipeline = [&]() -> PipelineCache::Pipeline* {
+	lap.Skip();
+	const auto  pipeline_started = PerfStats::Enabled() ? PerfStats::Now() : uint64_t {0};
+	auto* const found_pipeline   = [&]() -> PipelineCache::Pipeline* {
 		DrainStats::SlowLookupTimer create_timer(DrainStats::Kind::PipelineCreate);
 		return m_context.GetPipelineCache().GetGraphicsPipeline(
 		    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 		    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
 		    state.programs, feedback_aspects, may_defer);
 	}();
+	lap.Mark(PerfStats::SpanId::DrawPipeline);
+	PerfStats::RecordIfSlow(PerfStats::SpanId::PipelineCreateSync, pipeline_started);
 	if (found_pipeline == nullptr) {
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedPipeline);
 		return;
 	}
 	auto& pipeline = *found_pipeline;
@@ -2266,6 +2284,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	m_context.GetBufferCache().OnCommandRecorded();
 	g_draw_phases.Mark(DrawPhaseTimer::Record);
+	lap.Mark(PerfStats::SpanId::DrawRecord);
 	LogDrawPhase(draw.Name(), "DrawComplete");
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x700u);
@@ -2307,6 +2326,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
 	g_draw_phases.Begin();
+	PerfStats::Span draw_span(PerfStats::SpanId::Draw);
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -2324,7 +2344,11 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	Common::LockGuard lock(m_context.GetMutex());
 	if (args.index_count == 0 || args.instance_count == 0) {
 		g_pm4_ops.outcome = Pm4OpTimer::Empty;
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedEmpty);
 		return;
+	}
+	if (args.indirect_args != 0) {
+		PerfStats::Add(PerfStats::CounterId::DrawsIndirect);
 	}
 
 	// A color metadata operation, depth copy or resolve instead of a draw.
@@ -2341,6 +2365,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
 		g_pm4_ops.outcome = Pm4OpTimer::NoShader;
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedVertexShader);
 		return;
 	}
 
@@ -2437,6 +2462,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
 	g_draw_phases.Begin(true);
+	PerfStats::Span draw_span(PerfStats::SpanId::Draw);
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -2454,6 +2480,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	Common::LockGuard lock(m_context.GetMutex());
 	if (args.vertex_count == 0 || args.instance_count == 0) {
 		g_pm4_ops.outcome = Pm4OpTimer::Empty;
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedEmpty);
 		return;
 	}
 
@@ -2471,6 +2498,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
 		g_pm4_ops.outcome = Pm4OpTimer::NoShader;
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedVertexShader);
 		return;
 	}
 

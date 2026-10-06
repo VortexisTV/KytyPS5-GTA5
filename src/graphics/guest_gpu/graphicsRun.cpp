@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -152,6 +153,13 @@ private:
 	Common::Mutex& m_mutex;
 };
 
+// Performance statistics: the time the GPU thread has spent in guest flip waits.
+static std::atomic<uint64_t> g_flip_wait_ticks = 0;
+
+static uint64_t FlipWaitTicks() {
+	return g_flip_wait_ticks.load(std::memory_order_relaxed);
+}
+
 static bool GraphicsRunDebugDumpEnabled() {
 	return Config::GraphicsDebugDumpEnabled() &&
 	       Config::GetPrintfDirection() != Config::LogDirection::Silent;
@@ -216,6 +224,7 @@ void GuestGpu::ProcessCommands() {
 		}
 		// Commands run between packets on behalf of other threads.
 		DrainStats::Pm4OpScope op(DrainStats::NoPm4Op);
+		PerfStats::Span        span(PerfStats::SpanId::GpuThreadCommands);
 		command();
 	}
 }
@@ -231,6 +240,7 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 		operation();
 		done.release();
 	});
+	PerfStats::Span wait(PerfStats::SpanId::GameWaitGpuCommand);
 	done.acquire();
 }
 
@@ -278,6 +288,17 @@ void GuestGpu::SubmitFlipPreparation(uint64_t request_id) {
 void GuestGpu::Done() {
 	GpuMutexLock lock(m_submission_mutex);
 	if (!IsGpuThread()) {
+		// Part of what the game waits for here is its own flip wait, display pacing it would not
+		// have waited for on hardware. Separating the two says how much of the stall command
+		// translation accounts for.
+		const auto      flip_before = FlipWaitTicks();
+		PerfStats::Span wait(PerfStats::SpanId::GameWaitGpuIdle);
+		struct FlipShare {
+			uint64_t before;
+			~FlipShare() {
+				PerfStats::Record(PerfStats::SpanId::GameWaitGpuFlip, FlipWaitTicks() - before);
+			}
+		} flip_share {flip_before};
 		const auto frames_ahead = Config::GetGpuFramesAhead();
 		if (frames_ahead == 0) {
 			WaitForIdle();
@@ -653,9 +674,11 @@ void GuestGpu::ThreadRun(void* data) {
 		{
 			Common::LockGuard                    lock(gpu->m_queue_mutex);
 			std::optional<DrainStats::WaitTimer> idle;
+			std::optional<PerfStats::Span>       idle_span;
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				if (!idle) {
 					idle.emplace(DrainStats::Kind::GpuThreadIdle);
+					idle_span.emplace(PerfStats::SpanId::GpuThreadIdle);
 				}
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
@@ -682,6 +705,7 @@ void GuestGpu::ThreadRun(void* data) {
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
 					DrainStats::WaitTimer poll(DrainStats::Kind::BlockedPoll);
+					PerfStats::Span       blocked(PerfStats::SpanId::GpuThreadBlocked);
 					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
@@ -708,7 +732,11 @@ void GuestGpu::ThreadRun(void* data) {
 
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
-			command();
+			{
+				PerfStats::Span busy(PerfStats::SpanId::GpuThreadBusy);
+				PerfStats::Span commands(PerfStats::SpanId::GpuThreadCommands);
+				command();
+			}
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			gpu->m_processing = false;
@@ -719,7 +747,10 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		EXIT_IF(!has_submission);
-		const bool complete = gpu->Process(submission);
+		const bool complete = [&] {
+			PerfStats::Span busy(PerfStats::SpanId::GpuThreadBusy);
+			return gpu->Process(submission);
+		}();
 		if (debug_queues) {
 			auto& stats = queue_stats[submission.queue_id];
 			if (complete) {
@@ -884,6 +915,7 @@ bool GuestGpu::Process(Submission& submission) {
 Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
                                            std::span<const uint32_t> commands) {
 	KYTY_PROFILER_BLOCK("CommandProcessor::Process");
+	PerfStats::Span process_span(PerfStats::SpanId::CpProcess);
 	EXIT_IF(g_current_execution != nullptr);
 	EXIT_IF(commands.size() > UINT32_MAX);
 	if (execution.m_buffer_stack.empty() && !commands.empty()) {
@@ -976,6 +1008,11 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	// KYTY_DEBUG_DRAW_PHASES: the time in each handler and between them (see Pm4OpTimer).
 	static const bool timed       = DrawPhaseTimer::Hash() != 0;
 	uint64_t          handler_end = 0;
+	// Performance statistics: packets handled or skipped, added once when the loop is left.
+	struct PacketCount {
+		uint64_t packets = 0;
+		~PacketCount() { PerfStats::Add(PerfStats::CounterId::CpPackets, packets); }
+	} packet_count;
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
 			g_gpu_state->ProcessCommands();
@@ -1032,10 +1069,13 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			}
 			cursor.offset_dw += packet_dw;
 			execution.m_made_progress = true;
+			packet_count.packets++;
+			PerfStats::Add(PerfStats::CounterId::PacketsSkippedPredicated);
 			continue;
 		}
 
 		auto handler = g_cp_op_func[opcode];
+		packet_count.packets++;
 		DrainStats::SetPm4Op(DrainStats::Pm4Op(opcode, KYTY_PM4_R(packet_header)));
 		DrainStats::t_predicated = (packet_header & 1u) != 0;
 
@@ -1119,6 +1159,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 				// and their dispatches are among the largest compiles.
 				RunPipelineLookahead(execution);
 			}
+			PerfStats::Add(PerfStats::CounterId::PipelinesCreated,
+			               pipelines.GraphicsPipelinesCreated() +
+			                   pipelines.ComputePipelinesCreated() - pipelines_before);
 		}
 	}
 }
@@ -1126,6 +1169,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 void CommandProcessor::RunPipelineLookahead(const Pm4Execution& execution) {
 	KYTY_PROFILER_FUNCTION();
 	DrainStats::WaitTimer walk_timer(DrainStats::Kind::Lookahead);
+	PerfStats::Span       walk_span(PerfStats::SpanId::CpLookahead);
 	// With asynchronous pipelines the walk translates shaders on worker threads and does not wait
 	// for them: the draws pick the work up later. Otherwise it translates them itself, so it can
 	// queue each draw's pipeline parts right away. (Translating in parallel first and queuing the
@@ -1350,6 +1394,7 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 
 void CommandProcessor::SynchronizePredicate(uint64_t address, uint64_t size) {
 	DrainStats::ReasonScope reason(DrainStats::Reason::Predicate);
+	const GpuWaitScope      wait_scope(PerfStats::SpanId::GpuWaitPredicate);
 	if (!GuestRange {address, size}.Valid()) {
 		// Host-only command buffers are also used by the PM4 test harness. Unknown ownership
 		// cannot justify removing the legacy synchronization.
@@ -1683,21 +1728,31 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
 	if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
-		// Thread counts size the dispatch here on the CPU. A shader that computed them and stored
-		// them through DMA left them only in the GPU's copy of the page, so an unchanged cached
-		// copy is read instead of guest memory.
+		// Thread counts size the dispatch here on the CPU. Where one cached buffer holds them and
+		// the CPU has not written them since, the GPU's copy is the one to use: a shader may have
+		// stored them, through a bound buffer or through DMA, and left guest memory stale. That
+		// copy is read first and guest memory only without it. Reading guest memory first faults
+		// on every argument page a shader wrote, downloads the page's whole dirty range and waits
+		// for the GPU, and the GPU's copy is then read, and waited for, all the same.
+		PerfStats::Add(PerfStats::CounterId::DispatchesThreadSized);
+		auto&                       buffers = m_renderer.GetBufferCache();
+		const auto*                 guest   = reinterpret_cast<const void*>(args_addr);
 		vk::DispatchIndirectCommand args {};
-		std::memcpy(&args, reinterpret_cast<const void*>(args_addr), sizeof(args));
-		vk::DispatchIndirectCommand gpu_args {};
-		if (m_renderer.GetBufferCache().ReadGpuCopy(args_addr, &gpu_args, sizeof(gpu_args))) {
-			static uint32_t differed = 0;
-			if (std::memcmp(&args, &gpu_args, sizeof(args)) != 0 && differed++ < 16) {
+		if (!buffers.ReadGpuCopy(args_addr, &args, sizeof(args))) {
+			std::memcpy(&args, guest, sizeof(args));
+		} else if (static uint32_t differed = 0;
+		           differed < 16 && !buffers.IsRegionGpuModified(args_addr, sizeof(args))) {
+			// A store through DMA, which the tracker does not see, leaves guest memory readable
+			// and different from the GPU's copy.
+			vk::DispatchIndirectCommand guest_args {};
+			std::memcpy(&guest_args, guest, sizeof(guest_args));
+			if (std::memcmp(&guest_args, &args, sizeof(args)) != 0) {
+				differed++;
 				Log::WriteToConsoleAndLog(fmt::format(
 				    "Indirect dispatch sized in threads at 0x{:010x}: guest memory holds {}x{}x{}, "
 				    "the GPU stored {}x{}x{}; using the GPU's\n",
-				    args_addr, args.x, args.y, args.z, gpu_args.x, gpu_args.y, gpu_args.z));
+				    args_addr, guest_args.x, guest_args.y, guest_args.z, args.x, args.y, args.z));
 			}
-			args = gpu_args;
 		}
 		DispatchDirect(args.x, args.y, args.z, mode);
 		return;
@@ -1716,8 +1771,14 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
 	BufferFlush();
 
+	const auto      started = PerfStats::Enabled() ? PerfStats::Now() : uint64_t {0};
+	PerfStats::Span wait(PerfStats::SpanId::FlipWait);
 	m_renderer.GetVideoOut().WaitFlipDone(static_cast<int>(video_out_handle),
 	                                      static_cast<int>(display_buffer_index));
+	wait.Stop();
+	if (PerfStats::Enabled()) {
+		g_flip_wait_ticks.fetch_add(PerfStats::Now() - started, std::memory_order_relaxed);
+	}
 }
 
 template <typename T>

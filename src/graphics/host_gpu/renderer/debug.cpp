@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -901,6 +902,13 @@ bool UploadStatsEnabled() noexcept {
 }
 
 void RecordUpload(UploadSource source, uint64_t address, uint64_t bytes) noexcept {
+	if (source == UploadSource::Buffer || source == UploadSource::Bda) {
+		PerfStats::Add(PerfStats::CounterId::BufferUploads);
+		PerfStats::Add(PerfStats::CounterId::BufferUploadBytes, bytes);
+	} else if (source == UploadSource::Stream) {
+		PerfStats::Add(PerfStats::CounterId::StreamUploads);
+		PerfStats::Add(PerfStats::CounterId::StreamUploadBytes, bytes);
+	}
 	if (!UploadStatsEnabled()) {
 		return;
 	}
