@@ -69,11 +69,30 @@ bool UsesGds(const Program& program) {
 
 } // namespace
 
+bool UsesFlattenedSrt(const Program& program) {
+	return std::ranges::any_of(program.blocks, [](const Block* block) {
+		return std::ranges::any_of(*block, [](const Inst& inst) {
+			return inst.GetOpcode() == ValueOpcode::ReadConst;
+		});
+	}) || std::ranges::any_of(program.info.images, [](const ImageResource& image) {
+		return image.indirect_search_iterations != 0u;
+	});
+}
+
 void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 	if (!program.shader_info_complete || program.binding_layout_complete) {
 		EXIT("shader binding layout failed: %s", !program.shader_info_complete
 		                                             ? "shader info is not ready"
 		                                             : "binding layout already allocated");
+	}
+	// Dispatch thread counts occupy the first push-data dwords, ahead of shader data.
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() == ValueOpcode::DispatchThreadCount) {
+				push_data_start_dword =
+				    std::max(push_data_start_dword, PushData::DispatchThreadDwordCount);
+			}
+		}
 	}
 	BindingLayout next;
 	next.user_data_registers = CollectUserData(program);
@@ -130,17 +149,15 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 		AddBinding(next, DescriptorBindingKind::BdaPagetable);
 		AddBinding(next, DescriptorBindingKind::FaultBuffer);
 	}
-	const bool uses_flattened_runtime =
-	    !program.srt_reads.empty() ||
-	    std::ranges::any_of(program.info.images, [](const ImageResource& image) {
-		    return image.indirect_search_iterations != 0u;
-	    });
-	if (uses_flattened_runtime) {
+	if (UsesFlattenedSrt(program)) {
 		AddBinding(next, DescriptorBindingKind::FlattenedSrt);
 	}
 
 	if (next.ShaderDataDwords() != 0 && !next.UsesPushData()) {
 		AddBinding(next, DescriptorBindingKind::ShaderData);
+	}
+	if (UsesLoopWatchdog(program)) {
+		AddBinding(next, DescriptorBindingKind::LoopWatchdog);
 	}
 
 	program.bindings                = std::move(next);
@@ -154,6 +171,90 @@ const DescriptorBinding* FindBinding(const BindingLayout& layout, DescriptorBind
 		}
 	}
 	return nullptr;
+}
+
+const BlockInfo* LoopLatchHeader(const Program& program, size_t index, bool& conditional,
+                                 bool& back_edge_on_true) {
+	if (program.dispatcher_fallback || index >= program.block_info.size()) {
+		return nullptr;
+	}
+	const auto& latch = program.block_info[index];
+	const auto& term  = latch.terminator;
+	// A latch that heads a loop keeps its OpLoopMerge in the block the back edge targets, so the
+	// watchdog cannot split it.
+	if (term.loop_header) {
+		return nullptr;
+	}
+	conditional = term.kind == CFG::TerminatorKind::ConditionalBranch;
+	if (conditional ? latch.condition.IsEmpty() || term.true_block == term.false_block
+	                : term.kind != CFG::TerminatorKind::Branch) {
+		return nullptr;
+	}
+	for (const bool on_true: {true, false}) {
+		if (!on_true && !conditional) {
+			break;
+		}
+		const auto target = on_true ? term.true_block : term.false_block;
+		const auto header = std::ranges::find(program.block_info, target, &BlockInfo::id);
+		if (header != program.block_info.end() && header->terminator.loop_header &&
+		    header->terminator.continue_block == latch.id) {
+			back_edge_on_true = on_true;
+			return &*header;
+		}
+	}
+	return nullptr;
+}
+
+const BlockInfo* ConditionalLatchHeader(const Program& program, size_t index,
+                                        bool& back_edge_on_true) {
+	bool       conditional = false;
+	const auto header      = LoopLatchHeader(program, index, conditional, back_edge_on_true);
+	return conditional ? header : nullptr;
+}
+
+const BlockInfo* DispatcherBackEdgeTarget(const Program& program, size_t index) {
+	if (!program.dispatcher_fallback || index >= program.block_info.size()) {
+		return nullptr;
+	}
+	const auto&      block  = program.block_info[index];
+	const auto&      term   = block.terminator;
+	const BlockInfo* result = nullptr;
+	const auto       visit  = [&](uint32_t target) {
+		const auto found = std::ranges::find(program.block_info, target, &BlockInfo::id);
+		if (found != program.block_info.end() && found->start_pc <= block.start_pc &&
+		    (result == nullptr || found->start_pc < result->start_pc)) {
+			result = &*found;
+		}
+	};
+	switch (term.kind) {
+		case CFG::TerminatorKind::Branch: visit(term.true_block); break;
+		case CFG::TerminatorKind::ConditionalBranch:
+			visit(term.true_block);
+			visit(term.false_block);
+			break;
+		case CFG::TerminatorKind::IndirectBranch:
+			for (const auto target: term.indirect_targets) {
+				visit(target);
+			}
+			break;
+		default: break;
+	}
+	return result;
+}
+
+bool UsesLoopWatchdog(const Program& program) {
+	if (!program.loop_watchdog) {
+		return false;
+	}
+	for (size_t index = 0; index < program.block_info.size(); index++) {
+		bool conditional = false;
+		bool on_true     = false;
+		if (LoopLatchHeader(program, index, conditional, on_true) != nullptr ||
+		    DispatcherBackEdgeTarget(program, index) != nullptr) {
+			return true;
+		}
+	}
+	return false;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

@@ -345,7 +345,19 @@ static int write_save_file(const std::filesystem::path& path, const void* data, 
 }
 
 static int read_save_blocks(const std::filesystem::path& directory, uint64_t* blocks) {
-	Common::File file(directory / "sce_sys" / "blocks.bin", Common::File::Mode::Read);
+	const auto      path = directory / "sce_sys" / "blocks.bin";
+	std::error_code error;
+	const bool      exists = std::filesystem::exists(path, error);
+	if (error) {
+		return SAVE_DATA_ERROR_INTERNAL;
+	}
+	// A save copied in from elsewhere has no allocation record. Reporting the largest allocation
+	// keeps the game from treating it as broken or full.
+	if (!exists) {
+		*blocks = SAVE_DATA_BLOCKS_MAX;
+		return OK;
+	}
+	Common::File file(path, Common::File::Mode::Read);
 	if (file.IsInvalid() || file.Size() != sizeof(*blocks)) {
 		return SAVE_DATA_ERROR_BROKEN;
 	}
@@ -359,18 +371,18 @@ static int read_save_blocks(const std::filesystem::path& directory, uint64_t* bl
 	return OK;
 }
 
-// Older builds stored param.bin as a compact record: "KSDP", version 1, user_param, mtime, then
-// title, sub_title and detail as length-prefixed strings. Even with every string at its limit
-// that record is shorter than SaveDataParam, so the file size tells the two layouts apart.
-static bool parse_legacy_save_param(const uint8_t* bytes, size_t size, SaveDataParam* param) {
-	*param      = {};
-	size_t pos  = 0;
-	auto   take = [&](void* out, size_t count) {
-		if (size - pos < count) {
+// Older builds wrote sce_sys/param.bin as "KSDP", u32 version (1), u32 user_param, i64 mtime,
+// then title, sub_title and detail, each a u32 length followed by that many bytes.
+static constexpr uint64_t LEGACY_SAVE_PARAM_MAX_SIZE = 4096;
+
+static bool parse_legacy_save_param(const std::vector<uint8_t>& bytes, SaveDataParam* param) {
+	size_t     offset = 0;
+	const auto take   = [&](void* out, size_t size) {
+		if (size > bytes.size() - offset) {
 			return false;
 		}
-		std::memcpy(out, bytes + pos, count);
-		pos += count;
+		std::memcpy(out, bytes.data() + offset, size);
+		offset += size;
 		return true;
 	};
 	char     magic[4] {};
@@ -384,11 +396,13 @@ static bool parse_legacy_save_param(const uint8_t* bytes, size_t size, SaveDataP
 	for (uint32_t type = 1; type <= 3; type++) {
 		const auto field  = param_text_field(*param, type);
 		uint32_t   length = 0;
-		if (!take(&length, sizeof(length)) || length >= field.size || !take(field.data, length)) {
+		if (!take(&length, sizeof(length)) || length > bytes.size() - offset) {
 			return false;
 		}
+		std::memcpy(field.data, bytes.data() + offset, std::min<size_t>(length, field.size - 1));
+		offset += length;
 	}
-	return pos == size;
+	return offset == bytes.size();
 }
 
 static int read_save_param(const std::filesystem::path& path, SaveDataParam* param) {
@@ -404,25 +418,31 @@ static int read_save_param(const std::filesystem::path& path, SaveDataParam* par
 	if (file.IsInvalid()) {
 		return SAVE_DATA_ERROR_INTERNAL;
 	}
-	const uint64_t size = file.Size();
-	if (size > sizeof(*param)) {
-		return SAVE_DATA_ERROR_BROKEN;
-	}
-	uint8_t  bytes[sizeof(*param)];
-	uint32_t read = 0;
-	file.Read(bytes, static_cast<uint32_t>(size), &read);
-	if (read != size) {
-		return SAVE_DATA_ERROR_BROKEN;
-	}
+	const auto size = file.Size();
 	if (size == sizeof(*param)) {
-		std::memcpy(param, bytes, sizeof(*param));
-		return OK;
+		uint32_t read = 0;
+		file.Read(param, sizeof(*param), &read);
+		return read == sizeof(*param) ? OK : SAVE_DATA_ERROR_BROKEN;
 	}
-	return parse_legacy_save_param(bytes, read, param) ? OK : SAVE_DATA_ERROR_BROKEN;
+	if (size > LEGACY_SAVE_PARAM_MAX_SIZE) {
+		return SAVE_DATA_ERROR_BROKEN;
+	}
+	std::vector<uint8_t> bytes(static_cast<size_t>(size));
+	uint32_t             read = 0;
+	file.Read(bytes.data(), static_cast<uint32_t>(bytes.size()), &read);
+	SaveDataParam legacy {};
+	if (read != bytes.size() || !parse_legacy_save_param(bytes, &legacy)) {
+		return SAVE_DATA_ERROR_BROKEN;
+	}
+	*param = legacy;
+	return OK;
 }
 
+// A save's parameters sit beside its files, and only once the game sets them. GTA V sets them
+// each time it writes its profile, but a story slot copied in from elsewhere may have none, so a
+// save never needs one to be found or mounted.
 static std::filesystem::path save_param_path(const std::filesystem::path& directory) {
-	return directory / "sce_sys" / "param.bin";
+	return directory / "sce_param.bin";
 }
 
 static int64_t newest_save_time(const std::filesystem::path& directory) {
@@ -447,13 +467,15 @@ static int64_t newest_save_time(const std::filesystem::path& directory) {
 	return mtime;
 }
 
+// A save without parameters reports empty text, still dated by its files.
 static int load_save_param(const std::filesystem::path& directory, SaveDataParam* param) {
 	*param = {};
 	const int status = read_save_param(save_param_path(directory), param);
-	if (status == OK) {
-		param->mtime = newest_save_time(directory);
+	if (status != OK && status != SAVE_DATA_ERROR_NOT_FOUND) {
+		return status;
 	}
-	return status;
+	param->mtime = newest_save_time(directory);
+	return OK;
 }
 
 static int save_memory(const std::filesystem::path& directory, const SaveDataMemory& memory) {
@@ -636,9 +658,10 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 
 	if (Common::File::IsDirectoryExisting(root)) {
 		for (const auto& entry: Common::File::GetDirEntries(root)) {
+			// GTA V checks whether a story slot exists by searching for its exact name, so a slot
+			// that goes unlisted boots the game into the Prologue.
 			if (!entry.is_file && entry.name != "." && entry.name != ".." &&
-			    !entry.name.starts_with("sce_") && valid_path_component(entry.name) &&
-			    Common::File::IsFileExisting(save_param_path(root / entry.name))) {
+			    !entry.name.starts_with("sce_") && valid_path_component(entry.name)) {
 				if (cond->dir_name == nullptr || cond->dir_name->data[0] == '\0' ||
 				    dir_name_match(Common::ToLower(entry.name).c_str(),
 				                   Common::ToLower(std::string(cond->dir_name->data)).c_str())) {
@@ -757,13 +780,6 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 		if (status != OK) {
 			std::filesystem::remove_all(mount_dir, error);
 			return status;
-		}
-		const SaveDataParam initial {};
-		const int param_status = write_save_file(save_param_path(mount_dir), &initial,
-		                                         sizeof(initial));
-		if (param_status != OK) {
-			std::filesystem::remove_all(mount_dir, error);
-			return param_status;
 		}
 		created = true;
 	}
@@ -1272,7 +1288,7 @@ int KYTY_SYSV_ABI SaveDataSetParam(const SaveDataMountPoint* mount_point, uint32
 	SaveDataParam param {};
 	const auto path = save_param_path(g_mount_slots.Directory(static_cast<size_t>(slot)));
 	const int status = read_save_param(path, &param);
-	if (status != OK) {
+	if (status != OK && status != SAVE_DATA_ERROR_NOT_FOUND) {
 		return status;
 	}
 	if (param_type == 4) {

@@ -67,7 +67,39 @@ struct MemoryInfo {
 	bool                    image_r128                                            = false;
 	bool                    idxen                                                 = false;
 	bool                    offen                                                 = false;
+	bool                    coherent                                              = false;
 	bool                    planning_only                                         = false;
+
+	// Formatted loads decode the descriptor's format at run time.
+	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
+		return !typed && data_bits == 32u &&
+		       (opcode == ValueOpcode::LoadBufferU32 || opcode == ValueOpcode::LoadBufferU32x2 ||
+		        opcode == ValueOpcode::LoadBufferU32x3 || opcode == ValueOpcode::LoadBufferU32x4);
+	}
+
+	[[nodiscard]] bool SupportsIndirectBufferStore(ValueOpcode opcode) const {
+		return !formatted && !typed && data_bits == 32u &&
+		       (opcode == ValueOpcode::StoreBufferU32 || opcode == ValueOpcode::StoreBufferU32x2 ||
+		        opcode == ValueOpcode::StoreBufferU32x3 || opcode == ValueOpcode::StoreBufferU32x4);
+	}
+
+	// The 32-bit buffer atomics with a native SPIR-V equivalent.
+	[[nodiscard]] bool SupportsIndirectBufferAtomic(ValueOpcode opcode) const {
+		switch (opcode) {
+			case ValueOpcode::BufferAtomicSwap32:
+			case ValueOpcode::BufferAtomicCmpSwap32:
+			case ValueOpcode::BufferAtomicIAdd32:
+			case ValueOpcode::BufferAtomicISub32:
+			case ValueOpcode::BufferAtomicSMin32:
+			case ValueOpcode::BufferAtomicUMin32:
+			case ValueOpcode::BufferAtomicSMax32:
+			case ValueOpcode::BufferAtomicUMax32:
+			case ValueOpcode::BufferAtomicAnd32:
+			case ValueOpcode::BufferAtomicOr32:
+			case ValueOpcode::BufferAtomicXor32: return !formatted && !typed && data_bits == 32u;
+			default: return false;
+		}
+	}
 
 	bool operator==(const MemoryInfo& other) const = default;
 };
@@ -96,8 +128,10 @@ struct BufferResource {
 	Prospero::BufferFormat descriptor_format  = Prospero::BufferFormat::kInvalid;
 	uint32_t               descriptor_swizzle = DstSel(4, 5, 6, 7);
 	uint32_t               image_alias        = NoImageAlias;
-	bool                   read               = false;
-	bool                   written            = false;
+	bool                   read               = false; // Loads or atomics.
+	bool                   written            = false; // Stores or atomics.
+	bool                   stored             = false; // Plain (non-atomic) stores.
+	bool                   loaded             = false; // Plain (non-atomic) loads.
 	bool                   atomic             = false;
 	bool                   formatted          = false;
 	bool                   scalar             = false;
@@ -140,6 +174,7 @@ struct SamplerResource {
 	uint32_t first_use_pc          = 0;
 	bool     force_point_filtering = false;
 	bool     depth_compare         = false;
+	bool     integer_border        = false;
 
 	bool operator==(const SamplerResource& other) const = default;
 };
@@ -279,15 +314,87 @@ enum class DescriptorBindingKind : uint32_t {
 	FaultBuffer,
 	FlattenedSrt,
 	ShaderData,
+	LoopWatchdog,
 	Count,
 };
 
 static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 44u);
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 50u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 51u);
+
+// A structured guest loop is cut short once an invocation has evaluated IterationLimit loop back
+// edges, far more than any loop a game expects to finish. A dispatcher-fallback program counts the
+// runs of its blocks that can branch backwards instead, and a cut invocation there ends. Iterations that wait on memory or
+// contended atomics can take tens of microseconds, though, so on a device with a shader clock an
+// invocation is also cut once the watchdog buffer's TickBudget device clock ticks have passed
+// since its first abort check. Each cut counts in the watchdog buffer, and the first records its
+// shader and loop header. Each cut also counts in its shader's slot, which records that shader and
+// loop header too. Every AbortCheckInterval back edges an invocation reads its shader's slot count
+// and the clock, and leaves its loops once its shader has been cut, so a dispatch whose every
+// thread runs away still ends in time while other shaders' long loops run on. The host clears the
+// counts each frame.
+struct LoopWatchdog {
+	static constexpr uint32_t IterationLimit     = 1u << 20;
+	static constexpr uint32_t AbortCheckInterval = 1u << 8;
+	// 1.3 s on AMD's 100 MHz device clock, inside the 2 s Windows GPU timeout.
+	static constexpr uint32_t DefaultTickBudget = 1u << 27;
+	// NVIDIA's device clock counts nanoseconds, where DefaultTickBudget is only 134 ms. That cut
+	// GTA V's ray traversals, which were not looping: with millions of rays sharing the GPU, the
+	// slowest took over 134 ms after about 25,000 iterations. This is 805 ms.
+	static constexpr uint32_t NvidiaTickBudget = 3u << 28;
+	[[nodiscard]] static constexpr uint32_t TickBudgetFor(uint32_t vendor_id) {
+		return vendor_id == 0x10deu ? NvidiaTickBudget : DefaultTickBudget;
+	}
+	static constexpr uint32_t TripCount      = 0;
+	static constexpr uint32_t Claimed        = 1;
+	static constexpr uint32_t HashLow        = 2;
+	static constexpr uint32_t HashHigh       = 3;
+	static constexpr uint32_t LoopPc         = 4;
+	static constexpr uint32_t TickBudget     = 5;
+	// Of the cuts, how many the time budget made before the iteration limit, and the most back
+	// edges a cut invocation had taken: a slow loop that would have ended shows as time cuts at
+	// counts far below IterationLimit.
+	static constexpr uint32_t TimeCuts       = 6;
+	static constexpr uint32_t CutIterations  = 7;
+	// Device clock ticks one compute dispatch may run, from the first abort check any of its
+	// invocations makes; 0 turns the limit off. TickBudget bounds each invocation from its own
+	// start, which does not bound a dispatch whose waves each end in time but start one after
+	// another: GTA V's 4K ray dispatch ran past the 2 s Windows GPU timeout that way.
+	static constexpr uint32_t DispatchTickBudget = 8;
+	// 1.07 s on NVIDIA's nanosecond clock and 1.3 s on AMD's 100 MHz one.
+	static constexpr uint32_t NvidiaDispatchTickBudget  = 1u << 30;
+	static constexpr uint32_t DefaultDispatchTickBudget = 1u << 27;
+	[[nodiscard]] static constexpr uint32_t DispatchTickBudgetFor(uint32_t vendor_id) {
+		return vendor_id == 0x10deu ? NvidiaDispatchTickBudget : DefaultDispatchTickBudget;
+	}
+	// Per-shader slots: shaders whose hashes share a slot also share its count.
+	static constexpr uint32_t SlotBase       = 16;
+	static constexpr uint32_t SlotCount      = 64;
+	static constexpr uint32_t SlotHashLow    = 0;
+	static constexpr uint32_t SlotHashHigh   = 1;
+	static constexpr uint32_t SlotLoopPc     = 2;
+	static constexpr uint32_t SlotTrips      = 3;
+	// The device clock at the dispatch's first abort check, never 0; 0 until then. The renderer
+	// clears it before each dispatch of a compute shader with watched loops.
+	static constexpr uint32_t SlotStart      = 4;
+	// How many of the slot's cuts were for time, not the iteration limit.
+	static constexpr uint32_t SlotTimeCuts   = 5;
+	static constexpr uint32_t SlotDwords     = 8;
+	static constexpr uint32_t DwordCount     = SlotBase + SlotCount * SlotDwords;
+
+	[[nodiscard]] static constexpr uint32_t Slot(uint64_t hash) {
+		return SlotBase +
+		       static_cast<uint32_t>((hash ^ (hash >> 21u) ^ (hash >> 42u)) & (SlotCount - 1u)) *
+		           SlotDwords;
+	}
+};
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
-	static constexpr uint32_t MeshDrawDwordCount = 6;
+	// Mesh draws reserve seven dwords: index_count, vertex offset, first
+	// instance, index element size, index address, and the slice base group.
+	static constexpr uint32_t        MeshDrawDwordCount = 7;
+	// A compute dispatch sized in threads passes its thread counts per axis ahead of shader data.
+	static constexpr uint32_t        DispatchThreadDwordCount = 3;
 	static constexpr uint32_t NoStart    = UINT32_MAX;
 	std::array<uint32_t, DwordCount> dwords {};
 
@@ -301,6 +408,12 @@ struct PushData {
 
 static_assert(sizeof(PushData) == 128);
 constexpr uint32_t NativePushConstantSize = sizeof(PushData);
+
+// Pixel shaders use descriptor set 1 and every other stage set 0, so a graphics pipeline's
+// vertex-side and pixel descriptor layouts are independent of each other.
+[[nodiscard]] constexpr uint32_t NativeDescriptorSet(ShaderType stage) {
+	return stage == ShaderType::Pixel ? 1u : 0u;
+}
 
 [[nodiscard]] constexpr uint32_t NativeBinding(ShaderType stage, DescriptorBindingKind kind) {
 	const uint32_t group = stage == ShaderType::Pixel                    ? 1u
@@ -428,8 +541,16 @@ struct BindingLayout {
 	bool operator==(const BindingLayout& other) const = default;
 };
 
+// The user-data registers holding the low and high dwords of a DMA address base.
+struct DmaAddressBase {
+	uint32_t low  = 0;
+	uint32_t high = 0;
+
+	bool operator==(const DmaAddressBase& other) const = default;
+};
+
 struct ShaderInfo {
-	static constexpr uint32_t MaxBuffers      = 32;
+	static constexpr uint32_t MaxBuffers      = 64;
 	static constexpr uint32_t MaxImages       = 64;
 	static constexpr uint32_t MaxSamplers     = 32;
 	static constexpr uint32_t MaxSampledPairs = 64;
@@ -445,9 +566,20 @@ struct ShaderInfo {
 	int32_t                          instance_offset_sgpr = -1;
 	bool                             has_bitwise_xor    = false;
 	bool                             uses_dma           = false;
-	// Low user-data registers R whose dwords R and R + 1 form the base of a DMA address. The renderer
-	// caches those guest pages before the shader runs, so its first reads see guest memory.
-	std::vector<uint32_t> dma_address_registers;
+	// Stores and atomics through buffer descriptors the GPU selects at run time, and FLAT or GLOBAL
+	// stores. They reach guest memory through the BDA page table, outside the written buffers
+	// listed in `buffers`.
+	bool                             indirect_buffer_writes = false;
+	// User-data registers whose dwords form the low and high halves of a DMA address base, usually
+	// R and R + 1, though GTA V's BVH shaders pair s6 with s1. The renderer caches those guest pages
+	// before the shader runs, so its first reads see guest memory.
+	std::vector<DmaAddressBase> dma_address_bases;
+	// Those of them a DMA store or atomic writes through. A store to a page the buffer cache lacks
+	// is lost for good, not retried a frame later like a read, so far more is cached past them.
+	std::vector<DmaAddressBase> dma_write_address_bases;
+	// Buffers in `buffers` holding tables of buffer descriptors the shader picks at run time and
+	// stores through. The renderer caches the ranges those descriptors name before the shader runs.
+	std::vector<uint32_t> dma_store_descriptor_tables;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };
@@ -516,6 +648,119 @@ struct UniformFillPlan {
 	std::array<Value, 4> values;
 };
 
+// One ResourcePlan value with identities, invariant phis, extract sources and immediates resolved.
+// Operands are node indices. Evaluation matches SrtWalker, including its failure cases.
+struct ResourceNode {
+	enum class Op : uint8_t {
+		Fail, // Unsupported instruction or immediate type.
+		Const,
+		UserData,   // aux: user-data index relative to ResourcePlan::user_data_base.
+		ShaderBase,
+		Forward,    // Phi invariant, bit cast, or extract of a two-word composite.
+		ReadConst,  // args[0]: SRT slot value; aux: slot.
+		ReadFirstLane, // args[0]: value; args[1]: EXEC mask node or NoNode.
+		RawAddress, // args: low, high, offset; imm: signed immediate offset.
+		RawBuffer,  // args: low, high, offset, records, word3 (NoNode for a malformed handle).
+		ExtractU64, // aux: component.
+		AddCarry,   // args: IAddCarry32 operands; aux: component (sum or carry).
+		ConstructU64,
+		IAdd32,
+		IAdd64,
+		ISub32,
+		ISub64,
+		IMul32,
+		IMul64,
+		UMin32,
+		ConvertF32U32,
+		ConvertU32F32,
+		FPMul32,
+		FPTrunc32,
+		FPIsNan32,
+		FPOrdLessThanEqual32,
+		FPOrdGreaterThanEqual32,
+		BitwiseAnd32,
+		BitwiseAnd64,
+		BitwiseOr32,
+		BitwiseXor32,
+		BitwiseNot32,
+		ShiftLeftLogical32,
+		ShiftLeftLogical64,
+		ShiftRightLogical32,
+		ShiftRightLogical64,
+		ShiftRightArithmetic32,
+		ShiftRightArithmetic64,
+		BitFieldUExtract,
+		BitFieldSExtract,
+		BitFieldInsert,
+		Select,
+		IEqual32,
+		INotEqual32,
+		ULessThan32,
+		UGreaterThan32,
+		SGreaterThanEqual32,
+		LogicalAnd,
+		LogicalOr,
+		LogicalXor,
+		LogicalNot,
+	};
+	static constexpr uint32_t NoNode   = UINT32_MAX;
+	static constexpr uint8_t  CleanSlot = 1u;
+
+	Op                      op    = Op::Fail;
+	uint8_t                 flags = 0;
+	uint32_t                aux   = 0;
+	std::array<uint32_t, 5> args {NoNode, NoNode, NoNode, NoNode, NoNode};
+	uint64_t                imm   = 0;
+};
+
+// Index-based form of a ResourcePlan, built once on the GPU thread before its first refresh.
+struct CompiledResourcePlan {
+	// Ordinary slots whose RawAddress nodes differ only in their immediate offset, at
+	// consecutive dwords: a refresh reads the run with one call per 64-byte block.
+	struct FlatRun {
+		uint32_t first  = 0; // Into run_entries; the first entry reads dword 0.
+		uint32_t count  = 0; // Entries.
+		uint32_t dwords = 0;
+	};
+	struct FlatRunEntry {
+		uint32_t slot        = 0; // srt_reads index.
+		uint32_t dword       = 0; // Within the run.
+		uint32_t flat_offset = 0; // srt_reads[slot].flat_offset.
+	};
+	static constexpr uint32_t MaxRunDwords = 64;
+
+	std::vector<ResourceNode>            nodes;
+	std::vector<uint32_t>                slots;       // Node per srt_reads entry.
+	std::vector<uint8_t>                 clean_slots; // Copy of ResourcePlan::clean_flat_slots.
+	std::vector<FlatRun>                 flat_runs;
+	std::vector<FlatRunEntry>            run_entries;
+	std::vector<uint8_t>                 in_run; // Per srt_reads entry; empty without runs.
+	std::vector<std::array<uint32_t, 8>> descriptors; // Nodes per descriptor source dword.
+	// Per descriptor source dword: the flat SRT offset when the dword is exactly a slot that the
+	// ordinary walker reads (so its value is already in the refreshed flat buffer), else NoNode.
+	std::vector<std::array<uint32_t, 8>> descriptor_slots;
+	std::vector<uint32_t>                key_counts;     // Indirect images, per descriptor source.
+	std::vector<uint32_t>                selector_masks; // Indirect images, per descriptor source.
+	std::vector<uint32_t>                conditions;     // Per control_flow block.
+	// Per control_flow block: the condition reads only flat SRT slots (besides user data, the
+	// shader base and pure operations). Every refresh reads those slots directly anyway, so the
+	// condition uses the direct values instead of strict reads.
+	std::vector<uint8_t>                 direct_conditions;
+	// Sources not guarded by any control_flow block start active; empty if a block is invalid.
+	std::vector<uint8_t>                 initial_active;
+	// Per control_flow block: no block reachable from its successors guards a source, so its
+	// condition and successors cannot change the active sources.
+	std::vector<uint8_t>                 inert_successors;
+	std::array<uint32_t, 4>              fill {ResourceNode::NoNode, ResourceNode::NoNode,
+	                                           ResourceNode::NoNode, ResourceNode::NoNode};
+	// Buffer, image and sampler descriptors are a pure function of these inputs and the active
+	// sources when the plan is memoizable (see MaterializationMemo).
+	bool                  memoizable = false;
+	bool                  memo_shader_base = false;
+	std::vector<uint32_t> memo_user_data; // User-data indices relative to user_data_base.
+	std::vector<uint32_t> memo_slots;     // Flat SRT slots.
+};
+
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
 struct ResourcePlan {
@@ -550,25 +795,61 @@ struct ResourcePlan {
 	std::vector<SrtRead>                srt_reads;
 	std::vector<uint8_t>                clean_flat_slots;
 	bool                                requires_specialization_memory = false;
-	bool                                has_address_writes = false;
+	bool                                capture_specialization_reads = false;
+	// The first access a compute shader makes through a descriptor selected at run time other than
+	// a buffer load, store or atomic, the kinds with a BDA path; empty when there is none. Its
+	// dispatches are skipped for now.
+	std::string                         unsupported_indirect_access;
+	// The first image a compute shader reads through a descriptor it picks per lane, such as a
+	// ray-tracing hit's material texture; empty when there is none. Such images read as a mid-grey,
+	// opaque stand-in until their tables are bound.
+	std::string                         image_stand_in;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
-	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
-	mutable std::deque<EvaluationContext> evaluation_contexts;
+	// Reference walker instruction indices (GPU thread only; see Inst::EvaluationIndex).
 	mutable uint32_t                       evaluation_value_count = 0;
-	mutable uint32_t                       evaluation_depth       = 0;
-	mutable std::vector<uint8_t>            active_sources;
-	mutable std::vector<uint8_t>            visited_blocks;
-	mutable std::vector<uint32_t>           pending_blocks;
-	mutable std::vector<uint32_t>           material_keys;
-	mutable std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
-	// Built on the first refresh; dropped if it ever disagrees with the interpreter.
-	mutable std::shared_ptr<const CompiledSrt> compiled_srt;
-	mutable bool                               compiled_srt_attempted = false;
-	mutable uint32_t                           compiled_srt_checks    = 0;
+	mutable std::unique_ptr<CompiledResourcePlan> compiled;
+	// SrtEvaluator::FindActiveSources replay. A walk evaluates conditions in an order fixed by the
+	// outcomes so far, so the walks seen form a tree: a node names the block whose condition comes
+	// next and the node each outcome leads to; a leaf holds the sources that walk found active.
+	struct ActiveTraceStep {
+		uint32_t block   = 0;
+		uint8_t  outcome = 0; // 0 false, 1 true, 2 not evaluable (every successor followed).
+	};
+	struct ActiveTreeNode {
+		static constexpr uint32_t None = UINT32_MAX;
+		// A node with a block is a branch, one with sources a leaf, one with neither not filled in.
+		uint32_t                block   = None;
+		std::array<uint32_t, 3> next    = {None, None, None};
+		uint32_t                sources = None; // Offset in active_tree_sources.
+	};
+	// Evaluation scratch: nested clean/EXEC memos, activity, material keys and the learned walk
+	// tree. Each thread that refreshes plans uses its own slot (see ResourceScratchSlot).
+	struct Scratch {
+		std::deque<EvaluationContext>                 evaluation_contexts;
+		uint32_t                                      evaluation_depth = 0;
+		std::vector<uint8_t>                          active_sources;
+		std::vector<uint8_t>                          visited_blocks;
+		std::vector<uint32_t>                         pending_blocks;
+		std::vector<uint32_t>                         material_keys;
+		std::vector<std::pair<uint64_t, uint64_t>>    specialization_reads;
+		std::vector<ActiveTraceStep>                  active_trace;
+		std::vector<ActiveTreeNode>                   active_tree;
+		std::vector<uint8_t>                          active_tree_sources;
+	};
+	static constexpr uint32_t ScratchSlots = 2;
+	mutable std::array<Scratch, ScratchSlots> scratch;
+	[[nodiscard]] Scratch& ThreadScratch() const;
 };
+
+// The calling thread's ResourcePlan::Scratch slot: 0 for the GPU thread (and tests), others for
+// threads that refresh plans ahead of it. A slot must be used by one thread at a time.
+inline thread_local uint32_t t_resource_scratch_slot = 0;
+inline ResourcePlan::Scratch& ResourcePlan::ThreadScratch() const {
+	return scratch[t_resource_scratch_slot];
+}
 
 struct Program: ResourcePlan {
 	Program() = default;
@@ -585,13 +866,19 @@ struct Program: ResourcePlan {
 	uint32_t                      wave_size      = 64;
 	uint32_t                      scratch_dwords = 0;
 	bool                          dispatcher_fallback = false;
-	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
+	// Whether the guest loops get the loop watchdog (see LoopWatchdog).
+	bool                          loop_watchdog       = true;
+	// Whether the loop watchdog may read the device clock (VK_KHR_shader_clock).
+	bool                          loop_watchdog_clock = false;
+	CFG::FailureKind             cfg_failure_kind    = CFG::FailureKind::None;
 	std::string                   fallback_reason;
 	std::vector<BlockInfo>        block_info;
+	struct ScalarWrite { uint32_t pc; ScalarReg reg; };
+	std::vector<ScalarWrite>      scalar_writes;
 	// Typed memory and export instructions reference shader-local metadata by dense index.
 	// Decoder-only details (such as NSA register numbers) have already become IR operands.
 	std::vector<ExportInfo>       export_info;
-	std::vector<Value>            dynamic_reads;
+	bool                          has_address_writes = false;
 	bool                          shader_info_complete = false;
 	BindingLayout                 bindings;
 	bool                          binding_layout_complete = false;

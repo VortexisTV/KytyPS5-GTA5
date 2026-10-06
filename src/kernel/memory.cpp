@@ -2,11 +2,11 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
-#include "common/perfStats.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -84,8 +84,7 @@ static Graphics::RenderContext& GetGpuResources() {
 }
 
 static bool IsGpuAddressRange(uint64_t vaddr, uint64_t size) {
-	constexpr uint64_t GPU_ADDRESS_LIMIT = 1ull << 40u;
-	return vaddr != 0 && size != 0 && vaddr < GPU_ADDRESS_LIMIT && size < GPU_ADDRESS_LIMIT - vaddr;
+	return Graphics::GuestRange {vaddr, size}.Valid();
 }
 
 static void MapGpuRange(uint64_t vaddr, uint64_t size) {
@@ -175,6 +174,12 @@ static bool VirtualRangesOverlap(uint64_t left_start, uint64_t left_size, uint64
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static uint32_t g_test_backing_store_unmaps_before_failure = UINT32_MAX;
 #endif
+
+// GuestBackingStore::TryReadCached; KYTY_DEBUG_AB=backing turns it off in every other window.
+static bool BackingReadCacheEnabled() noexcept {
+	static const bool ab = Graphics::AbSelected("backing");
+	return !(ab && Graphics::AbFeatureOff());
+}
 
 // A fixed map over a live mapping, or a partial unmap of a host view, tears the host mapping down
 // and rebuilds it. Guest threads that touch the range meanwhile fault on the host although the
@@ -276,7 +281,8 @@ public:
 
 	bool Add(uint64_t start, uint64_t size, uint64_t offset, int protection, int memory_type,
 	         VirtualRangeType type, const char* name, bool disallow_merge = false) {
-		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapEdit);
+		Common::LockGuard lock(m_mutex);
+		BeginChange();
 
 		if (start == 0 || size == 0) {
 			return false;
@@ -306,7 +312,8 @@ public:
 	}
 
 	bool Remove(uint64_t start, uint64_t size) {
-		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapEdit);
+		Common::LockGuard lock(m_mutex);
+		BeginChange();
 
 		auto position = LowerBound(start);
 		if (position != m_ranges.end() && position->start == start && position->size == size) {
@@ -317,14 +324,14 @@ public:
 	}
 
 	bool HasOverlap(uint64_t start, uint64_t size) {
-		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapQuery);
+		Common::LockGuard lock(m_mutex);
 
 		return FindOverlap(start, size) != nullptr;
 	}
 
 	bool QueryOverlap(uint64_t start, uint64_t size, Range* out) {
 		EXIT_IF(out == nullptr);
-		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapQuery);
+		Common::LockGuard lock(m_mutex);
 
 		const auto* overlap = FindOverlap(start, size);
 		if (overlap == nullptr) {
@@ -335,7 +342,8 @@ public:
 	}
 
 	bool ReleaseReserved(uint64_t start, uint64_t size) {
-		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapEdit);
+		Common::LockGuard lock(m_mutex);
+		BeginChange();
 
 		auto position = LowerBound(start);
 		if (position != m_ranges.end() && position->start == start && position->size == size &&
@@ -348,7 +356,8 @@ public:
 	bool ReplaceSpan(uint64_t start, uint64_t size, VirtualRangeType expected_type,
 	                 uint64_t offset, int protection, int memory_type, VirtualRangeType type,
 	                 const char* name, bool disallow_merge = false) {
-		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapEdit);
+		Common::LockGuard lock(m_mutex);
+		BeginChange();
 
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
@@ -389,7 +398,8 @@ public:
 	}
 
 	void Rename(uint64_t start, uint64_t size, const char* name) {
-		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapEdit);
+		Common::LockGuard lock(m_mutex);
+		BeginChange();
 
 		auto position = LowerBound(start);
 		if (position != m_ranges.end() && position->start == start && position->size == size) {
@@ -401,13 +411,15 @@ public:
 	}
 
 	void Protect(uint64_t start, uint64_t size, int protection) {
-		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapEdit);
+		Common::LockGuard lock(m_mutex);
+		BeginChange();
 
 		EditUnlocked(start, size, [protection](Range* r) { r->protection = protection; });
 	}
 
 	void SetMemoryType(uint64_t start, uint64_t size, int memory_type) {
-		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapEdit);
+		Common::LockGuard lock(m_mutex);
+		BeginChange();
 
 		EditUnlocked(start, size, [memory_type](Range* r) { r->memory_type = memory_type; });
 	}
@@ -415,7 +427,7 @@ public:
 	bool Query(uint64_t addr, int flags, Range* out) {
 		EXIT_IF(out == nullptr);
 
-		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapQuery);
+		Common::LockGuard lock(m_mutex);
 
 		auto next = std::upper_bound(
 		    m_ranges.begin(), m_ranges.end(), addr,
@@ -438,7 +450,7 @@ public:
 	bool QuerySpan(uint64_t start, uint64_t size, std::vector<Range>* out) {
 		EXIT_IF(out == nullptr);
 
-		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapQuery);
+		Common::LockGuard lock(m_mutex);
 		out->clear();
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
@@ -505,21 +517,20 @@ public:
 	}
 
 	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
-		// Range checks come from the emulated GPU thread (shader buffers and vertex ranges): time
-		// how long they wait while another operation holds the map.
-		if (!m_mutex.TryLock()) {
-			PerfStats::Span wait(PerfStats::SpanId::VirtualMapWait);
-			m_mutex.Lock();
-		}
-		struct Unlock {
-			Common::Mutex& mutex;
-			~Unlock() { mutex.Unlock(); }
-		} unlock {m_mutex};
-		PerfStats::Set(PerfStats::GaugeId::VirtualRanges, m_ranges.size());
-
 		if (virtual_addr == 0 || size == 0 || size > UINT64_MAX - virtual_addr) {
 			return 0;
 		}
+
+		// The GPU thread clamps every buffer a draw binds. A range inside a committed range found
+		// earlier is returned whole without the lock while no range has changed since.
+		auto& cached = t_committed[(virtual_addr >> 21u) % t_committed.size()];
+		if (cached.generation == m_generation.load(std::memory_order_acquire) &&
+		    virtual_addr >= cached.start && virtual_addr < cached.end &&
+		    size <= cached.end - virtual_addr) {
+			return size;
+		}
+
+		Common::LockGuard lock(m_mutex);
 
 		auto vma = std::upper_bound(
 		    m_ranges.begin(), m_ranges.end(), virtual_addr,
@@ -534,6 +545,7 @@ public:
 		    !IsCommittedRangeType(vma->type)) {
 			return 0;
 		}
+		cached = {m_generation.load(std::memory_order_relaxed), vma->start, vma_end};
 
 		uint64_t clamped_size = std::min(size, vma_end - virtual_addr);
 		uint64_t expected     = virtual_addr + clamped_size;
@@ -551,7 +563,7 @@ public:
 	}
 
 	uint64_t CountPageTableEntries(bool gpu) {
-		Hold lock(m_mutex, PerfStats::SpanId::VirtualMapQuery);
+		Common::LockGuard lock(m_mutex);
 
 		uint64_t used = 0;
 		for (const auto& r: m_ranges) {
@@ -784,18 +796,30 @@ private:
 		return nullptr;
 	}
 
-	// Every operation other than a range check holds m_mutex through Hold, which, with PerfStats
-	// on, records how long the operation kept the lock.
-	struct Hold {
-		Hold(Common::Mutex& mutex, PerfStats::SpanId id): lock(mutex), span(id) {}
+	// Caller holds m_mutex and is about to change m_ranges: cached committed ranges no longer
+	// apply (see ClampRangeSize).
+	void BeginChange() { m_generation.fetch_add(1, std::memory_order_release); }
 
-		Common::LockGuard lock;
-		PerfStats::Span   span;
+	// Each instance counts from its own base, so no thread's cache matches another instance.
+	static uint64_t NextGenerationBase() {
+		static std::atomic<uint64_t> next {0};
+		return (next.fetch_add(1, std::memory_order_relaxed) + 1) << 40u;
+	}
+
+	struct CommittedRange {
+		uint64_t generation = 0;
+		uint64_t start      = 0;
+		uint64_t end        = 0;
 	};
 
-	std::vector<Range> m_ranges;
-	Common::Mutex      m_mutex;
+	std::vector<Range>    m_ranges;
+	Common::Mutex         m_mutex;
+	std::atomic<uint64_t> m_generation {NextGenerationBase()};
+	// Per thread: committed ranges ClampRangeSize found recently, by 2 MiB address bucket.
+	static thread_local std::array<CommittedRange, 16> t_committed;
 };
+
+thread_local std::array<VirtualRanges::CommittedRange, 16> VirtualRanges::t_committed {};
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static uint32_t g_test_physical_memory_unmaps_before_failure = UINT32_MAX;
@@ -804,6 +828,9 @@ static bool     g_test_fail_next_fixed_reserve_range_add     = false;
 
 class PhysicalMemory {
 public:
+	enum class AllocationKind { Direct, Pooled, Automatic };
+	using PhysicalRanges = std::vector<std::pair<uint64_t, uint64_t>>;
+
 	struct AllocatedBlock {
 		uint64_t            start_addr;
 		uint64_t            size;
@@ -815,7 +842,7 @@ public:
 		VirtualMemory::Mode mode;
 		GpuAccessMode       gpu_mode;
 		int                 memory_type;
-		bool                pool_expansion;
+		AllocationKind      kind;
 		char                name[KERNEL_MAXIMUM_NAME_LENGTH];
 	};
 
@@ -834,7 +861,10 @@ public:
 	}
 
 	bool Alloc(uint64_t search_start, uint64_t search_end, size_t len, size_t alignment,
-	           uint64_t* phys_addr_out, int memory_type, bool pool_expansion = false);
+	           uint64_t* phys_addr_out, int memory_type,
+	           AllocationKind kind = AllocationKind::Direct);
+	bool ReserveAutomatic(uint64_t size, PhysicalRanges* ranges);
+	void RestoreAutomatic(const PhysicalRanges& ranges);
 	bool Available(uint64_t search_start, uint64_t search_end, size_t alignment,
 	               uint64_t* phys_addr_out, uint64_t* size_out);
 	bool Release(uint64_t start, size_t len, uint64_t* vaddr, uint64_t* size,
@@ -848,6 +878,9 @@ public:
 	bool Find(uint64_t phys_addr, bool next, PhysicalMemory::AllocatedBlock* out);
 	bool CanMapDirect(uint64_t phys_addr, size_t len);
 	bool ReleasePoolExpansion(uint64_t phys_addr, size_t len);
+	// Returns the parts of a newly allocated range whose backing was used before. Fresh
+	// backing reads as zero, so only these parts need clearing; the claim removes them.
+	std::vector<std::pair<uint64_t, uint64_t>> ClaimStaleRanges(uint64_t start, uint64_t len);
 	bool GetAllocatedSpan(uint64_t phys_addr, size_t len, std::vector<AllocatedBlock>* blocks);
 	std::vector<AllocatedBlock> FindMappings(uint64_t phys_addr, size_t len);
 	void ProtectMapping(uint64_t vaddr, uint64_t size, int prot, VirtualMemory::Mode mode,
@@ -862,12 +895,18 @@ public:
 	[[nodiscard]] const std::vector<AllocatedBlock>& GetMappings() const { return m_mappings; }
 
 private:
-	void ConsumeFreeRange(std::map<uint64_t, uint64_t>::iterator range, uint64_t start,
-	                      uint64_t size);
-	void AddFreeRange(uint64_t start, uint64_t size);
+	static void RemoveFreeRange(std::map<uint64_t, uint64_t>& ranges, uint64_t start,
+	                            uint64_t size);
+	static void AddFreeRange(std::map<uint64_t, uint64_t>& ranges, uint64_t start, uint64_t size);
+	void        ReclaimAutomatic(uint64_t start, uint64_t size);
+	// Returns an allocated range to the free list and marks its backing stale.
+	void        ReturnFreeRange(uint64_t start, uint64_t size);
 
 	std::map<uint64_t, AllocatedBlock> m_physical;
 	std::map<uint64_t, uint64_t>       m_free;
+	// Free-list ranges that were handed out before and may hold a previous owner's bytes.
+	std::map<uint64_t, uint64_t>       m_stale;
+	std::map<uint64_t, uint64_t>       m_automatic_free;
 	std::vector<AllocatedBlock>        m_mappings;
 	Common::Mutex                      m_mutex;
 };
@@ -1096,6 +1135,54 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+void ReadGuestOnGpuThread(uint64_t vaddr, void* data, uint64_t size) {
+	// A page holding GPU-written bytes is protected as a whole. Clean bytes on it come from the
+	// backing, so reading a game table that merely shares the page does not wait for a readback.
+	// The lock-free page hint keeps the common case a plain copy: a stale "clean" faults and
+	// reads back as before, and a stale "dirty" takes the checked backing read.
+	if (size != 0 && g_gpu_resources != nullptr && Graphics::GuestGpu::IsGpuThread()) {
+		const auto& buffers = GetGpuResources().GetBufferCache();
+		if ((buffers.IsPageGpuDirtyHint(vaddr) || buffers.IsPageGpuDirtyHint(vaddr + size - 1)) &&
+		    IsGpuAddressRange(vaddr, size) && TryReadGpuCleanBacking(vaddr, data, size)) {
+			return;
+		}
+	}
+	if (size == sizeof(uint32_t)) {
+		// Most reads are single SRT dwords; a fixed-size copy avoids a memmove call.
+		std::memcpy(data, reinterpret_cast<const void*>(vaddr), sizeof(uint32_t));
+		return;
+	}
+	std::memcpy(data, reinterpret_cast<const void*>(vaddr), size);
+}
+
+bool TryReadGuestPlainOnGpuThread(uint64_t vaddr, void* data, uint64_t size) {
+	if (size != 0 && g_gpu_resources != nullptr && Graphics::GuestGpu::IsGpuThread()) {
+		const auto& buffers = GetGpuResources().GetBufferCache();
+		if (buffers.IsPageGpuDirtyHint(vaddr) || buffers.IsPageGpuDirtyHint(vaddr + size - 1)) {
+			return false;
+		}
+	}
+	std::memcpy(data, reinterpret_cast<const void*>(vaddr), size);
+	return true;
+}
+
+bool TryReadGpuBackingWithReadback(uint64_t vaddr, void* data, uint64_t size) {
+	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
+		if (!Graphics::GuestGpu::IsGpuThread() ||
+		    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
+			return false;
+		}
+		auto& buffers = GetGpuResources().GetBufferCache();
+		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
+			buffers.ReadMemory(vaddr, size);
+			if (buffers.HasGpuDirtyBytes(vaddr, size)) {
+				return false;
+			}
+		}
+	}
+	return TryReadBacking(vaddr, data, size);
+}
+
 uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size) {
 	return g_virtual_ranges != nullptr ? g_virtual_ranges->ClampRangeSize(vaddr, size) : 0;
 }
@@ -1308,7 +1395,7 @@ void SetFlexibleMemorySize(uint64_t size) {
 }
 
 bool PhysicalMemory::Alloc(uint64_t search_start, uint64_t search_end, size_t len, size_t alignment,
-                           uint64_t* phys_addr_out, int memory_type, bool pool_expansion) {
+                           uint64_t* phys_addr_out, int memory_type, AllocationKind kind) {
 	if (phys_addr_out == nullptr) {
 		return false;
 	}
@@ -1343,10 +1430,13 @@ bool PhysicalMemory::Alloc(uint64_t search_start, uint64_t search_end, size_t le
 		b.prot           = 0;
 		b.mode           = VirtualMemory::Mode::NoAccess;
 		b.memory_type    = memory_type;
-		b.pool_expansion = pool_expansion;
+		b.kind           = kind;
 
-		ConsumeFreeRange(range, free_pos, len);
+		RemoveFreeRange(m_free, free_pos, len);
 		EXIT_IF(!m_physical.emplace(b.start_addr, b).second);
+		if (kind == AllocationKind::Automatic) {
+			AddFreeRange(m_automatic_free, free_pos, len);
+		}
 
 		*phys_addr_out = free_pos;
 		return true;
@@ -1395,35 +1485,136 @@ bool PhysicalMemory::Available(uint64_t search_start, uint64_t search_end, size_
 	return true;
 }
 
-void PhysicalMemory::ConsumeFreeRange(std::map<uint64_t, uint64_t>::iterator range, uint64_t start,
-                                      uint64_t size) {
-	const auto range_start = range->first;
-	const auto range_end   = range->first + range->second;
-	m_free.erase(range);
-	if (range_start < start) {
-		m_free.emplace(range_start, start - range_start);
+void PhysicalMemory::RemoveFreeRange(std::map<uint64_t, uint64_t>& ranges, uint64_t start,
+                                     uint64_t size) {
+	const auto end   = start + size;
+	auto       range = ranges.upper_bound(start);
+	if (range != ranges.begin()) {
+		--range;
 	}
-	if (start + size < range_end) {
-		m_free.emplace(start + size, range_end - start - size);
+	while (range != ranges.end() && range->first < end) {
+		const auto range_start = range->first;
+		const auto range_end   = range_start + range->second;
+		if (range_end <= start) {
+			++range;
+			continue;
+		}
+		range = ranges.erase(range);
+		if (range_start < start) {
+			ranges.emplace(range_start, start - range_start);
+		}
+		if (end < range_end) {
+			ranges.emplace(end, range_end - end);
+		}
 	}
 }
 
-void PhysicalMemory::AddFreeRange(uint64_t start, uint64_t size) {
+void PhysicalMemory::AddFreeRange(std::map<uint64_t, uint64_t>& ranges, uint64_t start,
+                                  uint64_t size) {
 	auto end  = start + size;
-	auto next = m_free.lower_bound(start);
-	if (next != m_free.begin()) {
+	auto next = ranges.lower_bound(start);
+	if (next != ranges.begin()) {
 		auto previous = std::prev(next);
 		if (previous->first + previous->second >= start) {
 			start = previous->first;
 			end   = std::max(end, previous->first + previous->second);
-			next  = m_free.erase(previous);
+			next  = ranges.erase(previous);
 		}
 	}
-	while (next != m_free.end() && next->first <= end) {
+	while (next != ranges.end() && next->first <= end) {
 		end  = std::max(end, next->first + next->second);
-		next = m_free.erase(next);
+		next = ranges.erase(next);
 	}
-	m_free.emplace(start, end - start);
+	ranges.emplace(start, end - start);
+}
+
+void PhysicalMemory::ReturnFreeRange(uint64_t start, uint64_t size) {
+	AddFreeRange(m_free, start, size);
+	// Every range returned to the free list was allocated before; unmap keeps its bytes.
+	AddFreeRange(m_stale, start, size);
+}
+
+std::vector<std::pair<uint64_t, uint64_t>> PhysicalMemory::ClaimStaleRanges(uint64_t start,
+                                                                            uint64_t len) {
+	Common::LockGuard lock(m_mutex);
+
+	std::vector<std::pair<uint64_t, uint64_t>> claimed;
+	const auto                                 end  = start + len;
+	auto                                       next = m_stale.upper_bound(start);
+	if (next != m_stale.begin()) {
+		--next;
+	}
+	while (next != m_stale.end() && next->first < end) {
+		const auto range_start = next->first;
+		const auto range_end   = next->first + next->second;
+		if (range_end <= start) {
+			++next;
+			continue;
+		}
+		const auto claim_start = std::max(range_start, start);
+		const auto claim_end   = std::min(range_end, end);
+		claimed.emplace_back(claim_start, claim_end - claim_start);
+		next = m_stale.erase(next);
+		if (range_start < claim_start) {
+			m_stale.emplace(range_start, claim_start - range_start);
+		}
+		if (claim_end < range_end) {
+			next = m_stale.emplace(claim_end, range_end - claim_end).first;
+		}
+	}
+	return claimed;
+}
+
+bool PhysicalMemory::ReserveAutomatic(uint64_t size, PhysicalRanges* ranges) {
+	Common::LockGuard lock(m_mutex);
+	for (const auto& [start, available]: m_automatic_free) {
+		const auto length = std::min(size, available);
+		ranges->emplace_back(start, length);
+		size -= length;
+		if (size == 0) {
+			for (const auto& [offset, length]: *ranges) {
+				RemoveFreeRange(m_automatic_free, offset, length);
+			}
+			return true;
+		}
+	}
+	ranges->clear();
+	return false;
+}
+
+void PhysicalMemory::RestoreAutomatic(const PhysicalRanges& ranges) {
+	Common::LockGuard lock(m_mutex);
+	for (const auto& [start, size]: ranges) {
+		AddFreeRange(m_automatic_free, start, size);
+	}
+}
+
+void PhysicalMemory::ReclaimAutomatic(uint64_t start, uint64_t size) {
+	const auto end   = start + size;
+	auto       owner = m_physical.upper_bound(start);
+	if (owner != m_physical.begin()) {
+		--owner;
+	}
+	bool automatic = false;
+	for (; owner != m_physical.end() && owner->first < end; ++owner) {
+		const auto& block = owner->second;
+		if (block.kind != AllocationKind::Automatic || block.start_addr + block.size <= start) {
+			continue;
+		}
+		const auto first = std::max(start, block.start_addr);
+		const auto last  = std::min(end, block.start_addr + block.size);
+		AddFreeRange(m_automatic_free, first, last - first);
+		automatic = true;
+	}
+	if (automatic) {
+		for (const auto& mapping: m_mappings) {
+			const auto first = std::max(start, mapping.start_addr);
+			const auto last  = std::min(end, mapping.start_addr + mapping.size);
+			if (first < last) {
+				RemoveFreeRange(m_automatic_free, first, last - first);
+			}
+		}
+	}
 }
 
 bool PhysicalMemory::Release(uint64_t start, size_t len, uint64_t* vaddr, uint64_t* size,
@@ -1440,9 +1631,13 @@ bool PhysicalMemory::Release(uint64_t start, size_t len, uint64_t* vaddr, uint64
 	}
 	auto  it = std::prev(next);
 	auto& b  = it->second;
-	if (b.pool_expansion || start < b.start_addr || start >= b.start_addr + b.size ||
-	    len > b.start_addr + b.size - start) {
+	if (b.kind == AllocationKind::Pooled || start < b.start_addr ||
+	    start >= b.start_addr + b.size || len > b.start_addr + b.size - start) {
 		return false;
+	}
+
+	if (b.kind == AllocationKind::Automatic) {
+		RemoveFreeRange(m_automatic_free, start, len);
 	}
 
 	if (start == b.start_addr && len == b.size) {
@@ -1451,7 +1646,7 @@ bool PhysicalMemory::Release(uint64_t start, size_t len, uint64_t* vaddr, uint64
 		*gpu_mode = b.gpu_mode;
 
 		m_physical.erase(it);
-		AddFreeRange(start, len);
+		ReturnFreeRange(start, len);
 		return true;
 	}
 	if (start > b.start_addr && start + len < b.start_addr + b.size) {
@@ -1476,7 +1671,7 @@ bool PhysicalMemory::Release(uint64_t start, size_t len, uint64_t* vaddr, uint64
 		}
 
 		m_physical.emplace(right.start_addr, right);
-		AddFreeRange(start, len);
+		ReturnFreeRange(start, len);
 		return true;
 	}
 	if (start == b.start_addr && len < b.size) {
@@ -1493,7 +1688,7 @@ bool PhysicalMemory::Release(uint64_t start, size_t len, uint64_t* vaddr, uint64
 			remaining.map_size -= len;
 		}
 		m_physical.emplace(remaining.start_addr, remaining);
-		AddFreeRange(start, len);
+		ReturnFreeRange(start, len);
 		return true;
 	}
 	if (start > b.start_addr && start + len == b.start_addr + b.size) {
@@ -1505,7 +1700,7 @@ bool PhysicalMemory::Release(uint64_t start, size_t len, uint64_t* vaddr, uint64
 		if (b.map_vaddr != 0) {
 			b.map_size = b.size;
 		}
-		AddFreeRange(start, len);
+		ReturnFreeRange(start, len);
 		return true;
 	}
 
@@ -1526,6 +1721,7 @@ bool PhysicalMemory::Map(uint64_t vaddr, uint64_t phys_addr, size_t len, int pro
 		return false;
 	}
 	auto first = std::prev(next);
+	bool has_automatic = false;
 	while (current < phys_addr + len) {
 		auto block = m_physical.upper_bound(current);
 		if (block == m_physical.begin()) {
@@ -1533,10 +1729,11 @@ bool PhysicalMemory::Map(uint64_t vaddr, uint64_t phys_addr, size_t len, int pro
 		}
 		--block;
 		const auto block_end = block->second.start_addr + block->second.size;
-		if (block->second.pool_expansion || current < block->second.start_addr ||
+		if (block->second.kind == AllocationKind::Pooled || current < block->second.start_addr ||
 		    current >= block_end) {
 			return false;
 		}
+		has_automatic |= block->second.kind == AllocationKind::Automatic;
 		current = std::min<uint64_t>(phys_addr + len, block_end);
 		if (current < phys_addr + len) {
 			const auto following = std::next(block);
@@ -1557,6 +1754,9 @@ bool PhysicalMemory::Map(uint64_t vaddr, uint64_t phys_addr, size_t len, int pro
 	mapping.mode           = mode;
 	mapping.gpu_mode       = gpu_mode;
 	m_mappings.push_back(mapping);
+	if (has_automatic) {
+		RemoveFreeRange(m_automatic_free, phys_addr, len);
+	}
 
 	return true;
 }
@@ -1577,7 +1777,7 @@ bool PhysicalMemory::CanMapDirect(uint64_t phys_addr, size_t len) {
 		}
 		--block;
 		const auto block_end = block->second.start_addr + block->second.size;
-		if (block->second.pool_expansion || current < block->second.start_addr ||
+		if (block->second.kind == AllocationKind::Pooled || current < block->second.start_addr ||
 		    current >= block_end) {
 			return false;
 		}
@@ -1595,11 +1795,12 @@ bool PhysicalMemory::CanMapDirect(uint64_t phys_addr, size_t len) {
 bool PhysicalMemory::ReleasePoolExpansion(uint64_t phys_addr, size_t len) {
 	Common::LockGuard lock(m_mutex);
 	const auto        it = m_physical.find(phys_addr);
-	if (it == m_physical.end() || !it->second.pool_expansion || it->second.size != len) {
+	if (it == m_physical.end() || it->second.kind != AllocationKind::Pooled ||
+	    it->second.size != len) {
 		return false;
 	}
 	m_physical.erase(it);
-	AddFreeRange(phys_addr, len);
+	ReturnFreeRange(phys_addr, len);
 	return true;
 }
 
@@ -1622,7 +1823,7 @@ bool PhysicalMemory::GetAllocatedSpan(uint64_t phys_addr, size_t len,
 		}
 		--block;
 		const auto block_end = block->second.start_addr + block->second.size;
-		if (block->second.pool_expansion || current < block->second.start_addr ||
+		if (block->second.kind == AllocationKind::Pooled || current < block->second.start_addr ||
 		    current >= block_end) {
 			blocks->clear();
 			return false;
@@ -1678,49 +1879,39 @@ bool PhysicalMemory::Unmap(uint64_t vaddr, uint64_t size, GpuAccessMode* gpu_mod
 		}
 	};
 
-	size_t index = 0;
-	for (auto& b: m_mappings) {
-		if (b.map_vaddr == vaddr && b.map_size == size) {
-			*gpu_mode             = b.gpu_mode;
-			const auto host_vaddr = b.host_vaddr;
-			const auto host_size  = b.host_size;
-
+	for (size_t index = 0; index < m_mappings.size(); ++index) {
+		auto& b = m_mappings[index];
+		if (vaddr < b.map_vaddr || vaddr >= b.map_vaddr + b.map_size ||
+		    size > b.map_vaddr + b.map_size - vaddr) {
+			continue;
+		}
+		*gpu_mode             = b.gpu_mode;
+		const auto phys_addr  = b.start_addr + vaddr - b.map_vaddr;
+		const auto host_vaddr = b.host_vaddr;
+		const auto host_size  = b.host_size;
+		if (vaddr == b.map_vaddr && size == b.map_size) {
 			m_mappings.erase(m_mappings.begin() + static_cast<std::ptrdiff_t>(index));
 			set_host_release_if_last(host_vaddr, host_size);
-
-			return true;
-		}
-		if (vaddr > b.map_vaddr && vaddr + size < b.map_vaddr + b.map_size) {
-			*gpu_mode = b.gpu_mode;
-
+		} else if (vaddr > b.map_vaddr && vaddr + size < b.map_vaddr + b.map_size) {
 			AllocatedBlock right = b;
 			right.start_addr += (vaddr + size) - b.map_vaddr;
 			right.size      = b.map_vaddr + b.map_size - (vaddr + size);
 			right.map_size  = right.size;
 			right.map_vaddr = vaddr + size;
-
 			b.size     = vaddr - b.map_vaddr;
 			b.map_size = b.size;
 			m_mappings.push_back(right);
-			return true;
-		}
-		if (vaddr == b.map_vaddr && size < b.map_size) {
-			*gpu_mode = b.gpu_mode;
-
+		} else if (vaddr == b.map_vaddr) {
 			b.start_addr += size;
 			b.size -= size;
 			b.map_vaddr += size;
 			b.map_size -= size;
-			return true;
-		}
-		if (vaddr > b.map_vaddr && vaddr + size == b.map_vaddr + b.map_size) {
-			*gpu_mode = b.gpu_mode;
-
+		} else {
 			b.size     = vaddr - b.map_vaddr;
 			b.map_size = b.size;
-			return true;
 		}
-		index++;
+		ReclaimAutomatic(phys_addr, size);
+		return true;
 	}
 
 	return false;
@@ -2950,10 +3141,19 @@ int KYTY_SYSV_ABI KernelDirectMemoryQuery(int64_t offset, int flags, void* info,
 	return OK;
 }
 
-int KYTY_SYSV_ABI KernelAllocateDirectMemory(int64_t search_start, int64_t search_end, size_t len,
-                                             size_t alignment, int memory_type,
-                                             int64_t* phys_addr_out) {
-	PRINT_NAME();
+// Clears only the parts of a new direct allocation that held a previous owner's bytes.
+// Fresh backing already reads as zero; clearing it would commit every page up front.
+static bool ZeroStaleDirectBacking(uint64_t phys_addr, uint64_t len) {
+	for (const auto& [start, size]: g_physical_memory->ClaimStaleRanges(phys_addr, len)) {
+		if (!g_guest_address_space->ZeroBacking(start, size)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t len, size_t alignment,
+                         int memory_type, int64_t* phys_addr_out, bool automatic) {
 
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
@@ -2972,7 +3172,24 @@ int KYTY_SYSV_ABI KernelAllocateDirectMemory(int64_t search_start, int64_t searc
 	}
 
 	uint64_t addr = 0;
-	if (!g_physical_memory->Alloc(search_start, search_end, len, alignment, &addr, memory_type)) {
+	const auto kind = automatic ? PhysicalMemory::AllocationKind::Automatic
+	                            : PhysicalMemory::AllocationKind::Direct;
+	if (!g_physical_memory->Alloc(search_start, search_end, len, alignment, &addr, memory_type,
+	                              kind)) {
+		LOGF_COLOR(Log::Color::Red, "\t[Fail]\n");
+		return KERNEL_ERROR_EAGAIN;
+	}
+
+	// Hardware hands out zeroed pages for a new allocation. Unmap deliberately keeps the
+	// backing contents so that remapping the same range still sees them, so a range taken
+	// from the free list would otherwise expose the previous owner's bytes. Clear it here,
+	// at allocation, which leaves the unmap/remap contents contract untouched.
+	if (!ZeroStaleDirectBacking(addr, len)) {
+		uint64_t     released_vaddr    = 0;
+		uint64_t     released_map_size = 0;
+		GpuAccessMode released_gpu_mode = GpuAccessMode::NoAccess;
+		(void)g_physical_memory->Release(addr, len, &released_vaddr, &released_map_size,
+		                                 &released_gpu_mode);
 		LOGF_COLOR(Log::Color::Red, "\t[Fail]\n");
 		return KERNEL_ERROR_EAGAIN;
 	}
@@ -2982,6 +3199,14 @@ int KYTY_SYSV_ABI KernelAllocateDirectMemory(int64_t search_start, int64_t searc
 	LOGF_COLOR(Log::Color::Green, "\tphys_addr    = %016" PRIx64 "\n\t[Ok]\n", addr);
 
 	return OK;
+}
+
+int KYTY_SYSV_ABI KernelAllocateDirectMemory(int64_t search_start, int64_t search_end, size_t len,
+                                             size_t alignment, int memory_type,
+                                             int64_t* phys_addr_out) {
+	PRINT_NAME();
+	return AllocateDirectMemory(search_start, search_end, len, alignment, memory_type,
+	                            phys_addr_out);
 }
 
 int KYTY_SYSV_ABI KernelAllocateMainDirectMemory(size_t len, size_t alignment, int memory_type,
@@ -3361,6 +3586,36 @@ int KYTY_SYSV_ABI KernelMapDirectMemory2(void** addr, size_t len, int type, int 
 	}
 
 	return ret;
+}
+
+int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot) {
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	constexpr uint64_t                    page_size = 0x4000;
+	if (size == 0 || (vaddr & (page_size - 1)) != 0 || (size & (page_size - 1)) != 0 ||
+	    vaddr < kExtendedMemoryBase || vaddr >= kExtendedMemoryBase + kExtendedMemorySize ||
+	    size > kExtendedMemoryBase + kExtendedMemorySize - vaddr) {
+		return KERNEL_ERROR_EINVAL;
+	}
+
+	PhysicalMemory::PhysicalRanges ranges;
+	if (!g_physical_memory->ReserveAutomatic(size, &ranges)) {
+		return KERNEL_ERROR_EAGAIN;
+	}
+	uint64_t mapped = 0;
+	for (const auto& [offset, length]: ranges) {
+		void*     address = reinterpret_cast<void*>(vaddr + mapped);
+		const int result  = KernelMapDirectMemory2(&address, length, type, prot, 0x10,
+		                                           static_cast<int64_t>(offset), page_size);
+		if (result != OK) {
+			if (mapped != 0) {
+				EXIT_IF(KernelMunmap(vaddr, mapped) != OK);
+			}
+			g_physical_memory->RestoreAutomatic(ranges);
+			return result;
+		}
+		mapped += length;
+	}
+	return OK;
 }
 
 int KYTY_SYSV_ABI KernelMapNamedDirectMemory(void** addr, size_t len, int prot, int flags,
@@ -4174,7 +4429,15 @@ int KYTY_SYSV_ABI KernelMemoryPoolExpand(int64_t search_start, int64_t search_en
 	uint64_t   phys_addr           = 0;
 	if (!g_physical_memory->Alloc(static_cast<uint64_t>(search_start),
 	                              static_cast<uint64_t>(search_end), len, effective_alignment,
-	                              &phys_addr, 0, true)) {
+	                              &phys_addr, 0, PhysicalMemory::AllocationKind::Pooled)) {
+		return KERNEL_ERROR_ENOMEM;
+	}
+
+	// Same reasoning as KernelAllocateDirectMemory: an expansion can reuse a range whose
+	// backing still holds the previous owner's bytes, and the pool hands that memory out
+	// before anything writes it.
+	if (!ZeroStaleDirectBacking(phys_addr, len)) {
+		(void)g_physical_memory->ReleasePoolExpansion(phys_addr, len);
 		return KERNEL_ERROR_ENOMEM;
 	}
 

@@ -2,7 +2,9 @@
 #include <SDL3/SDL_main.h>
 
 #include "common/emulatorConfig.h"
+#include "common/archive.h"
 #include "common/file.h"
+#include "ArchiveTestFixture.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
@@ -17,18 +19,25 @@
 #include <array>
 
 #include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace Libs::LibKernelApr {
 void InitLibKernel_1_Apr(Loader::SymbolDatabase *symbols);
+}
+
+namespace Libs::LibNet {
+void InitNet_1_Net(Loader::SymbolDatabase *symbols);
 }
 
 namespace {
@@ -127,7 +136,7 @@ void CheckMountRoot(const std::filesystem::path &root) {
   FileSystem::Mount(root, "/app0");
   Check(FileSystem::GetRealFilename("/app0/rpf.cache") == root / "rpf.cache",
         "resolve mount descendant");
-  Check(FileSystem::GetRealFilename("/app01/rpf.cache") == "/app01/rpf.cache",
+  Check(FileSystem::GetRealFilename("/app01/rpf.cache").empty(),
         "mount prefix must end at a path component");
 
   for (const char *path : {"/app0", "/app0/"}) {
@@ -157,16 +166,169 @@ void CheckMountRoot(const std::filesystem::path &root) {
     }
   }
   FileSystem::Umount("/app0");
-  Check(FileSystem::GetRealFilename("/app0/rpf.cache") == "/app0/rpf.cache",
+  Check(FileSystem::GetRealFilename("/app0/rpf.cache").empty(),
         "unmount by guest path");
   for (const auto &folder : {root, root / ""}) {
     for (const auto &host : {root, root / ""}) {
       FileSystem::Mount(folder, "/app0");
       FileSystem::Umount(Common::PathToGenericString(host));
-      Check(FileSystem::GetRealFilename("/app0/rpf.cache") == "/app0/rpf.cache",
+      Check(FileSystem::GetRealFilename("/app0/rpf.cache").empty(),
             "unmount by host path with or without trailing separator");
     }
   }
+}
+
+void CheckUnmappedPaths(const std::filesystem::path &root) {
+  const auto host_file = root / "host-only.dat";
+  const auto host_path = Common::PathToGenericString(host_file);
+  Common::File fixture;
+  Check(fixture.Create(host_file), "create unmapped host file");
+  fixture.Close();
+
+  FileSystem::FileStat stat {};
+  Check(FileSystem::GetRealFilename(host_path).empty() &&
+            FileSystem::KernelOpen(host_path.c_str(), 0, 0) ==
+                Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            FileSystem::KernelStat(host_path.c_str(), &stat) ==
+                Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            FileSystem::KernelCheckReachability(host_path.c_str()) ==
+                Libs::LibKernel::KERNEL_ERROR_ENOENT,
+        "existing host files are absent from the guest namespace");
+  Check(FileSystem::KernelUnlink(host_path.c_str()) ==
+            Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            FileSystem::KernelRmdir(Common::PathToGenericString(root).c_str()) ==
+                Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            std::filesystem::exists(host_file),
+        "unmapped host files and directories cannot be removed");
+
+  const auto missing = Common::PathToGenericString(root / "unmapped-create");
+  Check(FileSystem::KernelOpen(missing.c_str(), 0x601, 0777) ==
+            Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            FileSystem::KernelMkdir(missing.c_str(), 0777) ==
+                Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            !std::filesystem::exists(root / "unmapped-create"),
+        "creation requires a mounted guest destination");
+
+  FileSystem::Mount(root, "/app0");
+  Check(FileSystem::KernelRename("/app0/host-only.dat", missing.c_str()) ==
+            Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            std::filesystem::exists(host_file) &&
+            !std::filesystem::exists(root / "unmapped-create"),
+        "rename to an unmapped destination preserves the source");
+  FileSystem::Umount("/app0");
+}
+
+void CheckArchiveMount(const std::filesystem::path &root) {
+  const auto archive = root / u8"game-日本語.zar";
+  std::vector<uint8_t> payload(2 * 64 * 1024 + 33);
+  for (size_t i = 0; i < payload.size(); ++i) {
+    payload[i] = static_cast<uint8_t>(i * 37 + 11);
+  }
+  Check(ArchiveTests::CreateArchive(archive, payload), "create mounted archive fixture");
+  const auto archive_root = Common::MakeArchivePath(archive);
+  const auto host_member = archive_root / "assets/subdir/data.bin";
+  constexpr char GuestMember[] = "/app0/assets/subdir/data.bin";
+  FileSystem::Mount(archive_root, "/app0");
+  Check(FileSystem::GetRealFilename(GuestMember) == host_member &&
+            FileSystem::GetRealFilename("/app01/eboot.bin").empty(),
+        "resolve archive mounts at path-component boundaries");
+  Check(FileSystem::KernelOpen("/app0/../outside.bin", 0, 0) ==
+            Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            FileSystem::KernelOpen("/app0/missing.bin", 0, 0) ==
+            Libs::LibKernel::KERNEL_ERROR_ENOENT,
+        "reject traversal outside an archive and missing members");
+
+  FileSystem::FileStat path_stat{}, descriptor_stat{};
+  Check(FileSystem::KernelStat(GuestMember, &path_stat) == OK &&
+            path_stat.st_size == payload.size() &&
+            path_stat.st_size == Common::File::Size(host_member) &&
+            FileSystem::KernelCheckReachability(GuestMember) == OK,
+        "archive path stat and reachability agree with Common::File");
+  const int fd = FileSystem::KernelOpen("/app0/ASSETS/subdir/DATA.BIN", 0, 0);
+  Check(fd >= 3 && FileSystem::KernelFstat(fd, &descriptor_stat) == OK &&
+            descriptor_stat.st_size == path_stat.st_size &&
+            descriptor_stat.st_mode == path_stat.st_mode,
+        "case-insensitive archive open and descriptor stat agree");
+  std::array<uint8_t, 97> bytes{};
+  constexpr int64_t Offset = 64 * 1024 - 19;
+  Check(FileSystem::KernelPread(fd, bytes.data(), bytes.size(), Offset) == bytes.size() &&
+            std::equal(bytes.begin(), bytes.end(), payload.begin() + Offset) &&
+            FileSystem::KernelLseek(fd, 0, 1) == 0,
+        "archive pread crosses a compression block without moving position");
+  Check(FileSystem::KernelLseek(fd, Offset, 0) == Offset &&
+            FileSystem::KernelRead(fd, bytes.data(), bytes.size()) == bytes.size() &&
+            std::equal(bytes.begin(), bytes.end(), payload.begin() + Offset) &&
+            FileSystem::KernelLseek(fd, 0, 1) == Offset + bytes.size(),
+        "archive seek and sequential read share descriptor position");
+  Check(FileSystem::KernelLseek(fd, -9, 2) == payload.size() - 9 &&
+            FileSystem::KernelRead(fd, bytes.data(), bytes.size()) == 9 &&
+            std::equal(bytes.begin(), bytes.begin() + 9, payload.end() - 9) &&
+            FileSystem::KernelRead(fd, bytes.data(), bytes.size()) == 0,
+        "archive reads stop at the member boundary");
+  Check(FileSystem::KernelWrite(fd, bytes.data(), 1) ==
+            Libs::LibKernel::KERNEL_ERROR_EBADF &&
+            FileSystem::KernelPwrite(fd, bytes.data(), 1, 0) ==
+            Libs::LibKernel::KERNEL_ERROR_EBADF &&
+            FileSystem::KernelFtruncate(fd, 0) ==
+            Libs::LibKernel::KERNEL_ERROR_EBADF,
+        "archive read-only descriptors reject write and truncate");
+
+  const auto unicode_guest = std::string("/app0/") + std::string(ArchiveTests::UnicodeFilename);
+  const int unicode = FileSystem::KernelOpen(unicode_guest.c_str(), 0, 0);
+  Check(unicode >= 3 && FileSystem::KernelRead(unicode, bytes.data(), bytes.size()) ==
+            ArchiveTests::Eboot.size() &&
+            std::memcmp(bytes.data(), ArchiveTests::Eboot.data(), ArchiveTests::Eboot.size()) == 0,
+        "open and read a Unicode archive member");
+  Check(FileSystem::KernelClose(unicode) == OK, "close Unicode archive member");
+
+  const int directory = FileSystem::KernelOpen("/app0/", 0x00020000, 0);
+  Check(directory >= 3, "open mounted archive directory");
+  std::array<char, 512> block{};
+  const auto expected_entries = Common::File::GetDirEntries(archive_root);
+  size_t entries_seen = 0;
+  for (;;) {
+    const int length = FileSystem::KernelGetdents(directory, block.data(), block.size());
+    Check(length >= 0 && length <= block.size(), "read archive directory records");
+    if (length == 0) {
+      break;
+    }
+    for (size_t offset = 0; offset < static_cast<size_t>(length);) {
+      uint16_t record_length = 0;
+      Check(length - offset >= 8, "archive directory record header fits");
+      std::memcpy(&record_length, block.data() + offset + 4, sizeof(record_length));
+      const auto name_length = static_cast<uint8_t>(block[offset + 7]);
+      Check(record_length >= 9 + name_length && record_length <= length - offset,
+            "archive directory record fits");
+      const std::string_view name(block.data() + offset + 8, name_length);
+      Check(std::any_of(expected_entries.begin(), expected_entries.end(), [&](const auto &entry) {
+        return entry.name == name && block[offset + 6] == (entry.is_file ? 8 : 4);
+      }), "guest directory entry matches Common::File name and type");
+      ++entries_seen;
+      offset += record_length;
+    }
+  }
+  Check(entries_seen == expected_entries.size(), "guest enumerates every archive directory entry");
+  Check(FileSystem::KernelClose(directory) == OK, "close archive directory");
+
+  for (const int flags : {1, 2, 0x0200, 0x0400}) {
+    Check(FileSystem::KernelOpen(GuestMember, flags, 0777) ==
+              Libs::LibKernel::KERNEL_ERROR_EROFS,
+          "archive rejects write, create and truncate open flags");
+  }
+  Check(FileSystem::KernelUnlink(GuestMember) == Libs::LibKernel::KERNEL_ERROR_EROFS &&
+            FileSystem::KernelMkdir("/app0/new-dir", 0777) == Libs::LibKernel::KERNEL_ERROR_EROFS &&
+            FileSystem::KernelRmdir("/app0/assets") == Libs::LibKernel::KERNEL_ERROR_EROFS &&
+            FileSystem::KernelRename(GuestMember, "/app0/renamed.bin") ==
+                Libs::LibKernel::KERNEL_ERROR_EROFS,
+        "archive mount rejects path mutations");
+  FileSystem::Umount("/app0");
+  Check(FileSystem::GetRealFilename(GuestMember).empty() &&
+            FileSystem::KernelOpen(GuestMember, 0, 0) == Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            FileSystem::KernelLseek(fd, 0, 0) == 0 &&
+            FileSystem::KernelRead(fd, bytes.data(), bytes.size()) == bytes.size() &&
+            std::equal(bytes.begin(), bytes.end(), payload.begin()),
+        "unmount hides archive paths while open descriptors retain the reader");
+  Check(FileSystem::KernelClose(fd) == OK, "close last archive descriptor");
 }
 
 void CheckUnicodePaths(const std::filesystem::path &root) {
@@ -407,6 +569,22 @@ void CheckAprPaths(const std::filesystem::path &root) {
 
 void CheckSocketWakeup() {
   namespace Net = Libs::Network::Net;
+  Loader::SymbolDatabase symbols;
+  Libs::LibNet::InitNet_1_Net(&symbols);
+  const auto *send_symbol = symbols.Find(
+      {"beRjXBn-z+o", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+  const auto *recv_symbol = symbols.Find(
+      {"9wO9XrMsNhc", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+  const auto *errno_symbol = symbols.Find(
+      {"HQOwnfMGipQ", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+  Check(send_symbol && recv_symbol && errno_symbol,
+        "Net send, receive and errno exports resolve with the guest ABI versions");
+  using Send = int (KYTY_SYSV_ABI *)(int, const void *, size_t, int);
+  using Recv = int (KYTY_SYSV_ABI *)(int, void *, size_t, int);
+  using Errno = int *(KYTY_SYSV_ABI *)();
+  const auto net_send = reinterpret_cast<Send>(send_symbol->vaddr);
+  const auto net_recv = reinterpret_cast<Recv>(recv_symbol->vaddr);
+  auto *net_errno = reinterpret_cast<Errno>(errno_symbol->vaddr)();
   // Guest sockaddr_in: length, family, network-order port/address, padding.
   std::array<uint8_t, 16> address {16, 2, 0, 0, 127, 0, 0, 1};
   const int listener = Net::Socket(2, 1, 0);
@@ -441,26 +619,61 @@ void CheckSocketWakeup() {
                     immediate.data()) == 0 && readable[reader / 64] == 0,
         "empty socket is not readable");
   const char payload[] = "wake";
-  Check(Net::Send(writer, payload, sizeof(payload), 0x20000) == sizeof(payload),
-        "send wake bytes with guest MSG_NOSIGNAL");
+  *net_errno = Libs::Posix::POSIX_EINVAL;
+  Check(net_send(writer, payload, sizeof(payload), 0) == sizeof(payload) &&
+            *net_errno == Libs::Posix::POSIX_EINVAL,
+        "Net send forwards bytes and preserves errno on success");
   readable[reader / 64] = bit;
   const std::array<int64_t, 2> deadline {1, 0};
   Check(Net::Select(reader + 1, readable.data(), nullptr, nullptr,
                     deadline.data()) == 1 && readable[reader / 64] == bit,
         "select reports the guest descriptor after wake");
   std::array<char, sizeof(payload)> received {};
-  Check(Net::Recv(reader, received.data(), received.size(), 0x42) == sizeof(payload) &&
+  Check(net_recv(reader, received.data(), received.size(), 0x42) == sizeof(payload) &&
+            std::memcmp(received.data(), payload, sizeof(payload)) == 0 &&
+            *net_errno == Libs::Posix::POSIX_EINVAL,
+        "Net receive forwards PEEK and WAITALL without consuming bytes");
+  received.fill(0);
+  Check(net_recv(reader, received.data(), received.size(), 0x40) == sizeof(payload) &&
             std::memcmp(received.data(), payload, sizeof(payload)) == 0,
-        "guest PEEK and WAITALL preserve the wake bytes");
-  Check(Net::Recv(reader, received.data(), received.size(), 0x40) == sizeof(payload),
-        "consume wake bytes with guest WAITALL");
+        "Net receive consumes the same bytes after peeking");
 #if !defined(_WIN32)
   Check(Net::Recv(reader, received.data(), received.size(), 0x80) == -1 &&
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
         "empty nonblocking receive translates guest errno");
+  Check(net_recv(reader, received.data(), received.size(), 0x80) ==
+            Libs::Network::NET_ERROR_EWOULDBLOCK &&
+            *net_errno == Libs::Posix::POSIX_EWOULDBLOCK,
+        "Net nonblocking receive translates POSIX failure and Net errno");
 #endif
-  Check(Net::SocketClose(reader) == 0 && Net::SocketClose(writer) == 0,
-        "close wake sockets");
+  Check(net_send(-1, payload, sizeof(payload), 0) == Libs::Network::NET_ERROR_EBADF &&
+            *net_errno == Libs::Posix::POSIX_EBADF,
+        "Net send translates an invalid socket instead of returning POSIX minus one");
+  Check(net_recv(reader, nullptr, received.size(), 0) == Libs::Network::NET_ERROR_EFAULT &&
+            *net_errno == Libs::Posix::POSIX_EFAULT,
+        "Net receive translates an invalid output buffer");
+  Check(net_send(writer, payload, sizeof(payload), 0x100000) ==
+            Libs::Network::NET_ERROR_EOPNOTSUPP &&
+            *net_errno == Libs::Posix::POSIX_EOPNOTSUPP,
+        "Net send preserves the backend's unsupported crypto flag error");
+#if defined(__linux__)
+  const int disconnected = Net::Socket(2, 1, 0);
+  Check(disconnected >= 0, "create unconnected socket for broken pipe check");
+  const auto previous_sigpipe = std::signal(SIGPIPE, SIG_DFL);
+  Check(previous_sigpipe != SIG_ERR, "set default SIGPIPE disposition for Net send");
+  const auto broken_send = net_send(disconnected, payload, sizeof(payload), 0);
+  std::signal(SIGPIPE, previous_sigpipe);
+  Check(broken_send == Libs::Network::NET_ERROR_EPIPE &&
+            *net_errno == Libs::Posix::POSIX_EPIPE,
+        "Net send reports a broken pipe without raising host SIGPIPE");
+  Check(Net::SocketClose(disconnected) == 0, "close unconnected socket");
+#endif
+  Check(Net::SocketClose(writer) == 0, "close wake writer");
+  *net_errno = Libs::Posix::POSIX_EINVAL;
+  Check(net_recv(reader, received.data(), received.size(), 0) == 0 &&
+            *net_errno == Libs::Posix::POSIX_EINVAL,
+        "Net receive returns EOF without replacing errno");
+  Check(Net::SocketClose(reader) == 0, "close wake reader");
   readable[reader / 64] = bit;
   Check(Net::Select(reader + 1, readable.data(), nullptr, nullptr,
                     immediate.data()) == -1 &&
@@ -469,9 +682,314 @@ void CheckSocketWakeup() {
         "closed descriptor fails without clearing input fd_set");
 }
 
+#if defined(_WIN32)
+namespace Net = Libs::Network::Net;
+
+void SetReceiveTimeout(int socket, int milliseconds) {
+  const std::array<int64_t, 2> timeout{milliseconds / 1000,
+                                       (milliseconds % 1000) * 1000};
+  Check(Net::Setsockopt(socket, 0xffff, 0x1006, timeout.data(),
+                        sizeof(timeout)) == 0,
+        "set guest timeval receive timeout");
+}
+
+void SetSocketNonblocking(int socket, bool enabled) {
+  const int value = enabled ? 1 : 0;
+  Check(Net::Setsockopt(socket, 0xffff, 0x1200, &value, sizeof(value)) == 0,
+        "set guest socket blocking mode");
+  int actual = -1;
+  uint32_t size = sizeof(actual);
+  Check(Net::Getsockopt(socket, 0xffff, 0x1200, &actual, &size) == 0 &&
+            actual == value,
+        "shared transport reports its blocking mode");
+}
+
+void WaitSocketReadable(int socket) {
+  std::array<uint64_t, 16> readable{};
+  readable[socket / 64] = uint64_t{1} << (socket % 64);
+  const std::array<int64_t, 2> timeout{2, 0};
+  Check(Net::Select(socket + 1, readable.data(), nullptr, nullptr,
+                    timeout.data()) == 1,
+        "loopback fixture becomes readable");
+}
+
+class LoopbackConnection {
+public:
+  explicit LoopbackConnection(bool nonblocking_listener = false) {
+    std::array<uint8_t, 16> address{16, 2, 0, 0, 127, 0, 0, 1};
+    const int listener = Net::Socket(2, 1, 0);
+    Check(listener >= 0 &&
+              Net::Bind(listener, address.data(), address.size()) == 0 &&
+              Net::Listen(listener, 1) == 0,
+          "create receive regression listener");
+    uint32_t size = address.size();
+    Check(Net::Getsockname(listener, address.data(), &size) == 0,
+          "get receive regression listener address");
+    writer = Net::Socket(2, 1, 0);
+    Check(writer >= 0 && Net::Connect(writer, address.data(), size) == 0,
+          "connect receive regression writer");
+    WaitSocketReadable(listener);
+    if (nonblocking_listener) {
+      SetSocketNonblocking(listener, true);
+    }
+    reader = Net::Accept(listener, nullptr, nullptr);
+    Check(reader >= 0 && Net::SocketClose(listener) == 0,
+          "accept receive regression connection");
+    const int enabled = 1;
+    Check(Net::Setsockopt(writer, 6, 1, &enabled, sizeof(enabled)) == 0,
+          "disable Nagle for gated chunk arrivals");
+    SetReceiveTimeout(reader, 2000);
+  }
+
+  ~LoopbackConnection() {
+    if (reader >= 0) {
+      Check(Net::SocketClose(reader) == 0, "close receive regression reader");
+    }
+    if (writer >= 0) {
+      Check(Net::SocketClose(writer) == 0, "close receive regression writer");
+    }
+  }
+
+  void Send(std::string_view bytes) const {
+    Check(Net::Send(writer, bytes.data(), bytes.size(), 0x20000) ==
+              bytes.size(),
+          "send receive regression bytes");
+  }
+
+  KYTY_CLASS_NO_COPY(LoopbackConnection);
+  int reader = -1;
+  int writer = -1;
+};
+
+void CheckWindowsReceiveFlags() {
+  using namespace std::chrono_literals;
+  constexpr std::string_view payload = "abcdef";
+
+  // The existing wake test covers a prefilled Recv. Exercise Recvfrom as well:
+  // Winsock does not fill the source address itself for a stream receive.
+  {
+    LoopbackConnection connection;
+    connection.Send(payload);
+    WaitSocketReadable(connection.reader);
+    std::array<char, 6> bytes{};
+    std::array<uint8_t, 16> peer{}, expected_peer{};
+    uint32_t peer_size = peer.size(), expected_size = expected_peer.size();
+    Check(Net::Getsockname(connection.writer, expected_peer.data(),
+                           &expected_size) == 0,
+          "get expected receive peer address");
+    Check(Net::Recvfrom(connection.reader, bytes.data(), bytes.size(), 0x42,
+                        peer.data(), &peer_size) == bytes.size() &&
+              std::string_view(bytes.data(), bytes.size()) == payload &&
+              peer == expected_peer,
+          "stream Recvfrom PEEK WAITALL preserves bytes and reports peer");
+    Check(Net::Recv(connection.reader, bytes.data(), bytes.size(), 0x40) ==
+                  bytes.size() &&
+              std::string_view(bytes.data(), bytes.size()) == payload,
+          "consume bytes after stream Recvfrom peek");
+    Check(Net::Recv(connection.reader, bytes.data(), 0, 0x42) == 0,
+          "zero-length stream PEEK WAITALL returns immediately");
+  }
+
+  for (const int flags : {0x40, 0x42}) {
+    LoopbackConnection connection;
+    connection.Send(payload.substr(0, 2));
+    WaitSocketReadable(connection.reader);
+    std::array<char, 6> bytes{};
+    std::promise<void> entered;
+    auto entry = entered.get_future();
+    auto receive = std::async(std::launch::async, [&] {
+      entered.set_value();
+      return Net::Recv(connection.reader, bytes.data(), bytes.size(), flags);
+    });
+    Check(entry.wait_for(2s) == std::future_status::ready,
+          "start chunked receive");
+    Check(receive.wait_for(50ms) == std::future_status::timeout,
+          "WAITALL remains pending with only the first queued chunk");
+    connection.Send(payload.substr(2, 2));
+    Check(receive.wait_for(50ms) == std::future_status::timeout,
+          "WAITALL remains pending with only two chunks");
+    connection.Send(payload.substr(4));
+    Check(receive.wait_for(2s) == std::future_status::ready &&
+              receive.get() == bytes.size() &&
+              std::string_view(bytes.data(), bytes.size()) == payload,
+          "WAITALL returns all three gated chunks in order");
+    if ((flags & 2) != 0) {
+      bytes.fill(0);
+      Check(Net::Recv(connection.reader, bytes.data(), bytes.size(), 0x40) ==
+                    bytes.size() &&
+                std::string_view(bytes.data(), bytes.size()) == payload,
+            "chunked PEEK leaves the complete stream queued");
+    }
+  }
+
+  {
+    LoopbackConnection connection(true);
+    std::array<char, 6> bytes{};
+    int inherited = 0;
+    uint32_t size = sizeof(inherited);
+    Check(Net::Getsockopt(connection.reader, 0xffff, 0x1200, &inherited,
+                          &size) == 0 &&
+              inherited == 1,
+          "accepted Windows socket inherits nonblocking mode");
+    for (const int flags : {0x40, 0x42, 0x80, 0xc2}) {
+      Check(
+          Net::Recv(connection.reader, bytes.data(), bytes.size(), flags) ==
+                  -1 &&
+              *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
+          "empty nonblocking receive ignores WAITALL and reports would-block");
+    }
+    connection.Send(payload.substr(0, 2));
+    WaitSocketReadable(connection.reader);
+    Check(Net::Recv(connection.reader, bytes.data(), bytes.size(), 0xc2) == 2 &&
+              std::string_view(bytes.data(), 2) == payload.substr(0, 2),
+          "nonblocking PEEK WAITALL returns the queued prefix");
+    Check(Net::Recv(connection.reader, bytes.data(), bytes.size(), 0x40) == 2 &&
+              std::string_view(bytes.data(), 2) == payload.substr(0, 2),
+          "nonblocking WAITALL consumes only the queued prefix");
+    SetSocketNonblocking(connection.reader, false);
+    Check(
+        Net::Recv(connection.reader, bytes.data(), bytes.size(), 0x80) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EOPNOTSUPP,
+        "blocking transport explicitly rejects unsupported per-call DONTWAIT");
+  }
+
+  for (const int flags : {0x40, 0x42}) {
+    LoopbackConnection connection;
+    SetReceiveTimeout(connection.reader, 80);
+    std::array<int64_t, 2> timeout{};
+    uint32_t size = sizeof(timeout);
+    Check(Net::Getsockopt(connection.reader, 0xffff, 0x1006, timeout.data(),
+                          &size) == 0 &&
+              timeout == std::array<int64_t, 2>{0, 80'000},
+          "receive timeout round-trips through the guest timeval ABI");
+    const std::array<int64_t, 2> invalid_timeout{0, 1'000'000};
+    Check(Net::Setsockopt(connection.reader, 0xffff, 0x1006,
+                          invalid_timeout.data(),
+                          sizeof(invalid_timeout)) == -1 &&
+              *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EINVAL,
+          "invalid timeval does not change the receive timeout");
+    std::array<char, 6> bytes{};
+    Check(Net::Recv(connection.reader, bytes.data(), bytes.size(), flags) ==
+                  -1 &&
+              *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
+          "empty WAITALL receive expires with would-block");
+    connection.Send(payload.substr(0, 2));
+    WaitSocketReadable(connection.reader);
+    *Libs::Posix::GetErrorAddr() = Libs::Posix::POSIX_EINVAL;
+    const auto start = std::chrono::steady_clock::now();
+    Check(Net::Recv(connection.reader, bytes.data(), bytes.size(), flags) ==
+                  2 &&
+              std::string_view(bytes.data(), 2) == payload.substr(0, 2) &&
+              *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EINVAL,
+          "WAITALL timeout returns the prefix without replacing guest errno");
+    Check(std::chrono::steady_clock::now() - start >= 70ms,
+          "partial WAITALL receive honors the configured deadline");
+    if ((flags & 2) != 0) {
+      Check(Net::Recv(connection.reader, bytes.data(), 2, 0) == 2 &&
+                std::string_view(bytes.data(), 2) == payload.substr(0, 2),
+            "timed-out PEEK leaves its prefix available to consume");
+    }
+    SetSocketNonblocking(connection.reader, true);
+    Check(Net::Recv(connection.reader, bytes.data(), bytes.size(), 0) == -1 &&
+              *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
+          "timeout path does not duplicate consumed bytes");
+  }
+
+  for (const int flags : {0x40, 0x42}) {
+    LoopbackConnection connection;
+    SetReceiveTimeout(connection.reader, 0);
+    connection.Send(payload.substr(0, 2));
+    Check(Net::Shutdown(connection.writer, 1) == 0,
+          "send FIN after a partial payload");
+    std::array<char, 6> bytes{};
+    auto receive = std::async(std::launch::async, [&] {
+      return Net::Recv(connection.reader, bytes.data(), bytes.size(), flags);
+    });
+    Check(receive.wait_for(2s) == std::future_status::ready &&
+              receive.get() == 2 &&
+              std::string_view(bytes.data(), 2) == payload.substr(0, 2),
+          "partial WAITALL completes on EOF without a receive timeout");
+    if ((flags & 2) != 0) {
+      Check(
+          Net::Recv(connection.reader, bytes.data(), bytes.size(), 0x42) == 2 &&
+              Net::Recv(connection.reader, bytes.data(), bytes.size(), 0x40) ==
+                  2,
+          "EOF PEEK preserves the prefix for another peek and consumption");
+    }
+    Check(Net::Recv(connection.reader, bytes.data(), bytes.size(), flags) == 0,
+          "drained stream reports EOF with WAITALL flags");
+  }
+
+  for (const int flags : {0x40, 0x42}) {
+    LoopbackConnection connection;
+    connection.Send(payload.substr(0, 2));
+    WaitSocketReadable(connection.reader);
+    std::array<char, 6> bytes{};
+    std::promise<void> entered;
+    auto entry = entered.get_future();
+    auto receive = std::async(std::launch::async, [&] {
+      *Libs::Posix::GetErrorAddr() = Libs::Posix::POSIX_EINVAL;
+      entered.set_value();
+      const auto result =
+          Net::Recv(connection.reader, bytes.data(), bytes.size(), flags);
+      return std::pair{result, *Libs::Posix::GetErrorAddr()};
+    });
+    Check(entry.wait_for(2s) == std::future_status::ready &&
+              receive.wait_for(50ms) == std::future_status::timeout,
+          "partial receive is waiting before peer reset");
+    // This Windows backend also accepts the native SO_LINGER representation.
+    const std::array<uint16_t, 2> abortive_linger{1, 0};
+    Check(Net::Setsockopt(connection.writer, 0xffff, 0x80,
+                          abortive_linger.data(),
+                          sizeof(abortive_linger)) == 0 &&
+              Net::SocketClose(connection.writer) == 0,
+          "reset peer after partial receive");
+    connection.writer = -1;
+    Check(receive.wait_for(2s) == std::future_status::ready,
+          "peer reset releases partial WAITALL");
+    const auto result = receive.get();
+    Check(result.first == 2 && result.second == Libs::Posix::POSIX_EINVAL &&
+              std::string_view(bytes.data(), 2) == payload.substr(0, 2),
+          "peer reset returns already received bytes without replacing errno");
+  }
+
+  {
+    std::array<char, 6> bytes{};
+    const int unconnected = Net::Socket(2, 1, 0);
+    Check(unconnected >= 0, "create unconnected receive fixture");
+    SetReceiveTimeout(unconnected, 100);
+    Check(Net::Recv(unconnected, bytes.data(), bytes.size(), 0x42) == -1 &&
+              *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_ENOTCONN,
+          "WAITALL preserves unconnected stream error");
+    Check(Net::SocketClose(unconnected) == 0,
+          "close unconnected receive fixture");
+    LoopbackConnection connection;
+    SetReceiveTimeout(connection.reader, 0);
+    std::promise<void> entered;
+    auto entry = entered.get_future();
+    auto receive = std::async(std::launch::async, [&] {
+      entered.set_value();
+      const auto result =
+          Net::Recv(connection.reader, bytes.data(), bytes.size(), 0x42);
+      return std::pair{result, *Libs::Posix::GetErrorAddr()};
+    });
+    Check(entry.wait_for(2s) == std::future_status::ready &&
+              receive.wait_for(50ms) == std::future_status::timeout,
+          "empty WAITALL is pending before local shutdown");
+    Check(Net::Shutdown(connection.reader, 0) == 0,
+          "shut down a pending receive");
+    Check(receive.wait_for(2s) == std::future_status::ready,
+          "local shutdown cancels WAITALL without a receive timeout");
+    const auto result = receive.get();
+    Check(result.first == -1 && result.second == Libs::Posix::POSIX_ESHUTDOWN,
+          "WAITALL preserves local receive-shutdown error");
+  }
+}
+#endif
+
 } // namespace
 
-int main() {
+int main(int, char**) {
   Common::InitializeThreads();
   Common::Subsystems subsystems;
   subsystems.Initialize<Config::Lifecycle>();
@@ -492,6 +1010,8 @@ int main() {
   TempDirectory temporary;
   FileSystem::Initialize();
   CheckMountRoot(temporary.Path());
+  CheckUnmappedPaths(temporary.Path());
+  CheckArchiveMount(temporary.Path());
   CheckUnicodePaths(temporary.Path());
   CheckUnicodeLogPath(temporary.Path());
   CheckDirectoryStream(temporary.Path());
@@ -502,6 +1022,9 @@ int main() {
   CheckSaveRename(temporary.Path(), "replacement-save");
   FileSystem::Shutdown();
   CheckSocketWakeup();
+#if defined(_WIN32)
+  CheckWindowsReceiveFlags();
+#endif
   graphics.reset();
   subsystems.Destroy();
 

@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <set>
 #include <mutex>
 #include <span>
 #include <thread>
@@ -40,9 +41,6 @@ public:
 	[[nodiscard]] int GetFrameNum() const;
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
-	// The PM4 packet the calling thread is executing, as (opcode << 8) | r, or NoPacket.
-	static constexpr uint32_t     NoPacket = ~uint32_t {0};
-	[[nodiscard]] static uint32_t CurrentPacket() noexcept;
 
 private:
 	static constexpr uint32_t ComputePipeCount     = 7;
@@ -55,6 +53,7 @@ private:
 
 	struct Submission {
 		SubmissionType            type     = SubmissionType::Graphics;
+		uint64_t                  sequence = 0; // Enqueue order, for frames-ahead waits.
 		uint32_t                  queue_id = 0;
 		std::span<const uint32_t> commands;
 		std::span<const uint32_t> constant_commands;
@@ -70,6 +69,8 @@ private:
 
 	void              Enqueue(Submission submission);
 	void              WaitForIdle();
+	// Waits until every submission enqueued before `sequence` has completed.
+	void              WaitForSubmissionsBefore(uint64_t sequence);
 	void              ProcessCommands();
 	bool              Process(Submission& submission);
 	static void       ThreadRun(void* data);
@@ -86,6 +87,11 @@ private:
 	std::atomic_uint32_t                           m_pending_commands {0};
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_submission_count  = 0;
+	// Sequence numbers of submissions not yet completed, and the next one to assign.
+	std::set<uint64_t>                             m_outstanding;
+	uint64_t                                       m_next_sequence     = 1;
+	// Next sequence at each recent suspend point (GuestGpu::Done), oldest first.
+	std::deque<uint64_t>                           m_done_marks;
 	bool                                           m_processing        = false;
 	bool                                           m_graphics_done     = true;
 	bool                                           m_accepting         = true;

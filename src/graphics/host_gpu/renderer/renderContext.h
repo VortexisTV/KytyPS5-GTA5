@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
 
+#include <array>
 #include <atomic>
 #include <memory>
 #include <optional>
@@ -28,6 +29,10 @@ class VideoOutDriver;
 namespace Libs::Graphics {
 
 class GuestGpu;
+
+// The game re-read the same large file several times in a row: a texture streamer asked to keep
+// more than it can fit (see RenderContext::ReportMipStats).
+void NoteStreamingThrash() noexcept;
 
 class RenderContext {
 public:
@@ -57,10 +62,30 @@ public:
 	// space. Zero when nothing is mapped there. Lets a caller bind what the guest actually mapped
 	// for GPU access rather than what a descriptor nominally claims.
 	[[nodiscard]] uint64_t MappedExtent(uint64_t vaddr, uint64_t max_size) const noexcept;
+	// Changes whenever the mapped ranges do. Read it before MappedExtent to remember an answer.
+	[[nodiscard]] uint64_t MappingEpoch() const noexcept {
+		return m_mapping_epoch.load(std::memory_order_acquire);
+	}
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
-	void               RunGarbageCollector();
+	// Starts a new epoch for PrepareBda (see there): the next draw that reads memory through
+	// addresses uploads every CPU write made so far.
+	void AdvanceBdaEpoch() noexcept { m_bda_epoch.fetch_add(1, std::memory_order_release); }
+	// The current epoch, or 0 while epochs are off (KYTY_DEBUG_BDA_EPOCH=0 and its A/B).
+	[[nodiscard]] uint64_t CurrentBdaEpoch() const noexcept;
+	// The GPU thread wrote guest memory itself: a page that is not write-protected takes the
+	// write without a fault, so the write starts an epoch.
+	void AdvanceBdaEpochForGpuWrite() noexcept;
+	// Counts a draw's sampled texture in its mip statistics counter (the descriptor's
+	// MIP_STATS_CNT_ID) for the next GET_LOD_STATS report (Thread_Gpu only).
+	void MarkMipStatsCounter(uint32_t id) noexcept {
+		m_mip_stats_counters[(id / 64u) & 3u] |= uint64_t {1} << (id % 64u);
+	}
+	// Writes a GET_LOD_STATS report of `size` bytes to `dst` (see there), then starts counting
+	// anew if `reset`.
+	void ReportMipStats(void* dst, uint32_t size, bool reset);
+	void RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
 	void DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -84,11 +109,24 @@ private:
 	TextureCache              m_texture_cache;
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
-	std::atomic_uint64_t      m_mapping_epoch {0};
-	std::optional<uint64_t>   m_bda_epoch; // synchronization epoch of the last complete BDA pass
+
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
+	// PrepareBda's current epoch and the epoch of its last synchronization (Thread_Gpu only).
+	std::atomic<uint64_t>     m_mapping_epoch {1};
+	std::atomic<uint64_t>     m_bda_epoch {1};
+	uint64_t                  m_bda_synced_epoch = 0;
+	// Mip statistics (Thread_Gpu only): the counters sampled since the last report, one bit each,
+	// the reports made, the last report in which each counter, and any, was sampled, and when the
+	// current relief from a streaming thrash ends (0: none) and the next may start (steady_clock
+	// ticks).
+	std::array<uint64_t, 4>   m_mip_stats_counters {};
+	uint64_t                  m_mip_stats_reports         = 0;
+	uint64_t                  m_mip_stats_last_marked_any = 0;
+	std::array<uint64_t, 256> m_mip_stats_last_marked {};
+	int64_t                   m_mip_stats_relief_end = 0;
+	int64_t                   m_mip_stats_rearm_time = 0;
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

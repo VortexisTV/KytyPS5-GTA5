@@ -14,22 +14,89 @@
 #include "gpu_tiler_shaders/gpu_tiler_standard64_3d_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_standard64_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_swap_bgra16_spv.h"
+#include "graphics/host_gpu/gpuCrashDiagnostics.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/gpuZones.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cinttypes>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <mutex>
+#include <vector>
 
 namespace Libs::Graphics {
 
+// Scratch buffers live through their scheduler tick. Creating and freeing one per upload made VMA
+// ask the driver for the memory budget (a kernel call) every few uploads: on Astro Bot's Sky
+// Garden, whose render targets written through buffers are re-uploaded several times a frame,
+// that was about 1% of the render thread. Buffers the GPU is done with wait here for reuse.
+struct TileManager::ScratchPool {
+	static constexpr uint64_t Granularity  = 64ull * 1024;
+	static constexpr uint64_t MaxIdleBytes = 256ull * 1024 * 1024;
+
+	explicit ScratchPool(VmaAllocator allocator): allocator(allocator) {}
+	~ScratchPool() {
+		for (const auto& scratch: idle) {
+			vmaDestroyBuffer(allocator, scratch.buffer, scratch.allocation);
+		}
+	}
+	KYTY_CLASS_NO_COPY(ScratchPool);
+
+	// The smallest idle buffer holding size bytes, unless it is more than twice as large.
+	bool Take(uint64_t size, Scratch& out) {
+		std::scoped_lock lock {mutex};
+		auto             best = idle.end();
+		for (auto it = idle.begin(); it != idle.end(); ++it) {
+			if (it->capacity >= size && it->capacity <= std::max(size * 2, Granularity) &&
+			    (best == idle.end() || it->capacity < best->capacity)) {
+				best = it;
+			}
+		}
+		if (best == idle.end()) {
+			return false;
+		}
+		out = *best;
+		idle_bytes -= best->capacity;
+		idle.erase(best);
+		return true;
+	}
+
+	// Past the limit, the buffers idle longest are freed.
+	void Return(const Scratch& scratch) {
+		std::vector<Scratch> evicted;
+		{
+			std::scoped_lock lock {mutex};
+			idle.push_back(scratch);
+			idle_bytes += scratch.capacity;
+			while (idle_bytes > MaxIdleBytes) {
+				evicted.push_back(idle.front());
+				idle_bytes -= idle.front().capacity;
+				idle.erase(idle.begin());
+			}
+		}
+		for (const auto& old: evicted) {
+			vmaDestroyBuffer(allocator, old.buffer, old.allocation);
+		}
+	}
+
+	VmaAllocator         allocator;
+	std::mutex           mutex;
+	std::vector<Scratch> idle;
+	uint64_t             idle_bytes = 0;
+};
+
 TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler,
                          StreamBuffer& stream_buffer)
-    : m_graphics(graphics), m_scheduler(scheduler), m_stream_buffer(stream_buffer) {
+    : m_graphics(graphics), m_scheduler(scheduler), m_stream_buffer(stream_buffer),
+      m_scratch_pool(std::make_shared<ScratchPool>(graphics.allocator)) {
 	static_assert(FamilyCount == 9);
 	static_assert(sizeof(Push) == 52);
 	std::array<vk::DescriptorSetLayoutBinding, 3> bindings {};
@@ -88,10 +155,21 @@ TileManager::~TileManager() {
 	}
 }
 
+// KYTY_DEBUG_AB=scratch creates and frees a buffer per use in every other window.
+static bool ScratchPoolEnabled() {
+	static const bool ab = AbSelected("scratch");
+	return !(ab && AbFeatureOff());
+}
+
 TileManager::Scratch TileManager::AllocateScratch(uint64_t size) {
 	EXIT_IF(size == 0);
+	Scratch scratch {};
+	if (ScratchPoolEnabled() && m_scratch_pool->Take(size, scratch)) {
+		scratch.size = size;
+		return scratch;
+	}
 	vk::BufferCreateInfo create {};
-	create.size  = size;
+	create.size  = Common::AlignUp(size, ScratchPool::Granularity);
 	create.usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc |
 	               vk::BufferUsageFlagBits::eTransferDst;
 
@@ -103,13 +181,17 @@ TileManager::Scratch TileManager::AllocateScratch(uint64_t size) {
 	RequireVulkanSuccess(static_cast<vk::Result>(vmaCreateBuffer(
 	                         m_graphics.allocator, &raw, &allocate, &buffer, &memory, nullptr)),
 	                     "allocate TileManager scratch buffer");
-	return {buffer, memory, size};
+	return {buffer, memory, size, create.size};
 }
 
-void TileManager::DeferDestroy(Scratch scratch) {
-	auto allocator = m_graphics.allocator;
-	m_scheduler.DeferOperation(
-	    [allocator, scratch] { vmaDestroyBuffer(allocator, scratch.buffer, scratch.allocation); });
+void TileManager::DeferRelease(Scratch scratch) {
+	if (!ScratchPoolEnabled()) {
+		auto allocator = m_graphics.allocator;
+		m_scheduler.DeferOperation(
+		    [allocator, scratch] { vmaDestroyBuffer(allocator, scratch.buffer, scratch.allocation); });
+		return;
+	}
+	m_scheduler.DeferOperation([pool = m_scratch_pool, scratch] { pool->Return(scratch); });
 }
 
 void TileManager::Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_capacity,
@@ -159,14 +241,22 @@ void TileManager::Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_ca
 		}
 		uint64_t linear_used = 0;
 		uint64_t bytes       = 0;
-		EXIT_NOT_IMPLEMENTED((info.depth > 1 && slice_bytes < minimum_slice) ||
-		                     !checked_multiply(info.depth - 1u, slice_bytes, bytes) ||
-		                     !checked_add(linear_used, bytes, linear_used) ||
-		                     !checked_multiply(info.height - 1u, pitch_bytes, bytes) ||
-		                     !checked_add(linear_used, bytes, linear_used) ||
-		                     !checked_multiply(info.width, info.bytes_per_element, bytes) ||
-		                     !checked_add(linear_used, bytes, linear_used) ||
-		                     linear_used > info.linear_size || slice_bytes > UINT32_MAX);
+		if ((info.depth > 1 && slice_bytes < minimum_slice) ||
+		    !checked_multiply(info.depth - 1u, slice_bytes, bytes) ||
+		    !checked_add(linear_used, bytes, linear_used) ||
+		    !checked_multiply(info.height - 1u, pitch_bytes, bytes) ||
+		    !checked_add(linear_used, bytes, linear_used) ||
+		    !checked_multiply(info.width, info.bytes_per_element, bytes) ||
+		    !checked_add(linear_used, bytes, linear_used) || linear_used > info.linear_size ||
+		    slice_bytes > UINT32_MAX) {
+			EXIT("TileManager: %s surface does not fit its linear range: family=%u "
+			     "bytes_per_element=%u extent=%ux%ux%u pitch=%u slice_bytes=0x%" PRIx64
+			     " linear_used=0x%" PRIx64 " linear_size=0x%" PRIx64 " tiled_size=0x%" PRIx64
+			     " surface_z=%u\n",
+			     tile ? "tiling" : "detiling", static_cast<uint32_t>(info.family),
+			     info.bytes_per_element, info.width, info.height, info.depth, info.pitch,
+			     slice_bytes, linear_used, info.linear_size, info.tiled_size, info.surface_z);
+		}
 
 		const uint64_t columns =
 		    (static_cast<uint64_t>(tiled_width) + block.block_width - 1u) / block.block_width;
@@ -296,6 +386,7 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 
 	m_scheduler.EndRendering();
 	auto                    command = m_scheduler.Current().Handle();
+	GpuZones::Mark(command, DrainStats::Zone::Tiler);
 	vk::BufferMemoryBarrier barriers[3] {};
 	barriers[0].srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eHostWrite;
 	barriers[0].dstAccessMask = vk::AccessFlagBits::eShaderRead;
@@ -349,6 +440,8 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
 		                             static_cast<uint32_t>(writes.size()), writes.data());
 		command.bindPipeline(vk::PipelineBindPoint::eCompute, GetPipeline(dispatch.pipeline_slot));
+		MarkGpuCheckpoint(m_graphics, command, GpuCheckpointKind::Tiler, 0, {},
+		                  dispatch.push.width, dispatch.push.height, dispatch.push.depth);
 		command.dispatch((dispatch.push.width + 7u) / 8u, (dispatch.push.height + 7u) / 8u,
 		                 dispatch.push.depth);
 	}
@@ -370,7 +463,7 @@ TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
 	std::vector<Dispatch> dispatches;
 	Prepare(false, tiled_capacity, linear_capacity, infos, source_base, 0, dispatches);
 	auto scratch = AllocateScratch(Common::AlignUp(linear_capacity, 4));
-	DeferDestroy(scratch);
+	DeferRelease(scratch);
 	Record(tiled, tiled_offset, tiled_capacity, scratch.buffer, 0, scratch.size, dispatches,
 	       true);
 	return {scratch.buffer, 0, linear_capacity};
@@ -404,7 +497,7 @@ void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> r
 	// StreamBuffer::Map is allowed to submit the current tick when it wraps.
 	Prepare(true, tiled_capacity, linear_capacity, infos, 0, target_base, dispatches);
 	auto linear = AllocateScratch(Common::AlignUp(linear_capacity, 4));
-	DeferDestroy(linear);
+	DeferRelease(linear);
 	image.Download(regions, linear.buffer, 0, linear.size);
 	Result source {linear.buffer, 0, linear.size};
 	if (transform == ColorTransform::SwapBgra16) {
@@ -416,7 +509,7 @@ void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> r
 
 TileManager::Result TileManager::GetScratchBuffer(uint64_t size) {
 	auto scratch = AllocateScratch(Common::AlignUp(size, 4));
-	DeferDestroy(scratch);
+	DeferRelease(scratch);
 	return {scratch.buffer, 0, scratch.size};
 }
 
@@ -510,6 +603,7 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 
 	m_scheduler.EndRendering();
 	auto                    command = m_scheduler.Current().Handle();
+	GpuZones::Mark(command, DrainStats::Zone::Tiler);
 	vk::BufferMemoryBarrier barriers[2] {};
 	barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -589,6 +683,8 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 			push.slice_bytes = static_cast<uint32_t>(layout.target_row_stride);
 			command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
 			                      sizeof(push), &push);
+			MarkGpuCheckpoint(m_graphics, command, GpuCheckpointKind::Tiler, 0, {}, layout.width,
+			                  rows, 1);
 			command.dispatch(static_cast<uint32_t>(groups_x), rows, 1);
 			row += rows;
 		}
@@ -646,6 +742,7 @@ void TileManager::SwapBgra16(Result input, Result output, uint32_t pixels) {
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eShaderWrite;
 	m_scheduler.EndRendering();
 	auto command = m_scheduler.Current().Handle();
+	GpuZones::Mark(command, DrainStats::Zone::Tiler);
 	command.pipelineBarrier(
 	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
 	    vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 2, barriers, 0, nullptr);
@@ -658,6 +755,8 @@ void TileManager::SwapBgra16(Result input, Result output, uint32_t pixels) {
 	push.width    = pixels;
 	command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
 	                      &push);
+	MarkGpuCheckpoint(m_graphics, command, GpuCheckpointKind::Tiler, 0, {},
+	                  static_cast<uint32_t>(pixels));
 	command.dispatch((pixels + 63u) / 64u, 1, 1);
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eTransferRead;
@@ -669,7 +768,7 @@ void TileManager::SwapBgra16(Result input, Result output, uint32_t pixels) {
 TileManager::Result TileManager::SwapBgra16(Result input) {
 	EXIT_NOT_IMPLEMENTED(input.size == 0 || input.size % 8u != 0 || input.size / 8u > UINT32_MAX);
 	auto output = AllocateScratch(input.size);
-	DeferDestroy(output);
+	DeferRelease(output);
 	Result result {output.buffer, 0, output.size};
 	SwapBgra16(input, result, static_cast<uint32_t>(input.size / 8u));
 	return result;

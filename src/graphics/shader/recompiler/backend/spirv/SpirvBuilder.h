@@ -56,6 +56,8 @@ public:
 	}
 
 	uint32_t DefineGlobalVariable(uint32_t pointer_type, spv::StorageClass storage_class);
+	uint32_t DefineGlobalVariable(uint32_t pointer_type, spv::StorageClass storage_class,
+	                              uint32_t initializer);
 	void DefineGlobalVariable(uint32_t id, uint32_t pointer_type, spv::StorageClass storage_class);
 
 	void AddMemoryModel(spv::AddressingModel addressing_model, spv::MemoryModel memory_model);

@@ -154,7 +154,12 @@ enum class Opcode {
 	V_CUBEMA_F32,
 	V_CNDMASK_B32,
 	V_DOT2C_F32_F16,
+	V_CVT_F64_I32,
+	V_CVT_F32_F64,
+	V_CVT_F64_F32,
+	V_CVT_F64_U32,
 	V_CVT_F32_I32,
+	V_FRACT_F64,
 	V_CVT_F32_U32,
 	V_CVT_U32_F32,
 	V_CVT_I32_F32,
@@ -173,6 +178,7 @@ enum class Opcode {
 	V_CVT_F32_UBYTE1,
 	V_CVT_F32_UBYTE2,
 	V_CVT_F32_UBYTE3,
+	V_RCP_F64,
 	V_RCP_F32,
 	V_RCP_IFLAG_F32,
 	V_FRACT_F32,
@@ -234,6 +240,8 @@ enum class Opcode {
 	V_MAD_I32_I24,
 	V_MAD_U32_U24,
 	V_MAD_U64_U32,
+	V_FMA_F64,
+	V_MUL_F64,
 	V_FMA_F32,
 	V_FMA_F16,
 	V_PACK_B32_F16,
@@ -354,6 +362,7 @@ enum class Opcode {
 	V_CMPX_GT_F32,
 	V_CMPX_LG_F32,
 	V_CMPX_GE_F32,
+	V_CMPX_O_F32,
 	V_CMPX_NGE_F32,
 	V_CMPX_NLG_F32,
 	V_CMPX_NGT_F32,
@@ -391,6 +400,7 @@ enum class Opcode {
 	V_CMPX_GT_F16,
 	V_CMPX_GE_F16,
 	V_CMPX_NGT_F16,
+	V_CMPX_NLE_F16,
 	V_CMPX_NEQ_F16,
 	V_CMPX_NLT_F16,
 	V_CMPX_LT_I32,
@@ -404,6 +414,8 @@ enum class Opcode {
 	V_CMP_LE_U16,
 	V_CMP_GT_U16,
 	V_CMPX_LT_U16,
+	V_CMPX_EQ_U16,
+	V_CMPX_LT_I16,
 	V_CMPX_GT_U16,
 	V_CMP_NE_U16,
 	V_CMP_GE_U16,
@@ -416,6 +428,7 @@ enum class Opcode {
 	V_CMP_GE_U32,
 	V_CMP_T_U32,
 	V_CMP_EQ_I64,
+	V_CMP_NE_I64,
 	V_CMP_LT_U64,
 	V_CMP_EQ_U64,
 	V_CMP_GT_U64,
@@ -439,6 +452,7 @@ enum class Opcode {
 	S_BUFFER_LOAD_DWORDX4,
 	S_BUFFER_LOAD_DWORDX8,
 	S_BUFFER_LOAD_DWORDX16,
+	S_MEMREALTIME,
 	BUFFER_LOAD_FORMAT_X,
 	BUFFER_LOAD_FORMAT_XY,
 	BUFFER_LOAD_FORMAT_XYZ,
@@ -517,6 +531,7 @@ enum class Opcode {
 	DS_AND_B32,
 	DS_AND_RTN_B32,
 	DS_OR_B32,
+	DS_OR_B64,
 	DS_OR_RTN_B32,
 	DS_XOR_B32,
 	DS_XOR_RTN_B32,
@@ -568,6 +583,8 @@ enum class Opcode {
 	IMAGE_ATOMIC_AND,
 	IMAGE_ATOMIC_OR,
 	IMAGE_ATOMIC_XOR,
+	IMAGE_ATOMIC_FMIN,
+	IMAGE_ATOMIC_FMAX,
 	IMAGE_SAMPLE,
 	IMAGE_GATHER4_L,
 	IMAGE_GATHER4_LZ,
@@ -577,6 +594,8 @@ enum class Opcode {
 	IMAGE_GATHER4_C_O,
 	IMAGE_GATHER4_C_LZ_O,
 	IMAGE_GATHER4H,
+	IMAGE_BVH_INTERSECT_RAY,
+	IMAGE_BVH64_INTERSECT_RAY,
 	V_INTERP_P1_F32,
 	V_INTERP_P2_F32,
 	V_INTERP_MOV_F32,
@@ -711,6 +730,7 @@ struct Instruction {
 	bool           formatted                                    = false;
 	bool           gds                                          = false;
 	bool           glc                                          = false;
+	bool           dlc                                          = false;
 	bool           slc                                          = false;
 	bool           idxen                                        = false;
 	bool           offen                                        = false;
@@ -729,6 +749,7 @@ struct Instruction {
 struct Program {
 	std::span<const uint32_t> code;
 	std::vector<Instruction>  instructions;
+	bool                     has_bvh = false;
 };
 
 // Code spans are trusted to contain complete instructions, valid branch targets, and 32-bit PCs.

@@ -19,13 +19,18 @@ void FrameDumpOnFlip(RenderContext& context, uint64_t surface_address);
 
 // Records a copy of the watched image, so it must not be called inside a render pass. `kind` and
 // the shader addresses only label the line; `details` is appended to it, for what was bound.
-void FrameDumpWatchOperation(RenderContext& context, uint64_t address, const char* kind,
+// Returns whether the operation was recorded: the watch stops after a cap on operations.
+bool FrameDumpWatchOperation(RenderContext& context, uint64_t address, const char* kind,
                              uint64_t first_shader, uint64_t second_shader,
                              const std::string& details = {});
 
 // The same for an image the operation read, so that an output already fed by a spoiled input can
 // be told apart from one an operation spoiled itself.
 void FrameDumpWatchInput(RenderContext& context, uint64_t address, const char* role);
+
+// Logs a line about the watched image without copying it, for work recorded where a copy cannot
+// be, such as a clear inside the texture cache.
+void FrameDumpWatchNote(uint64_t address, const std::string& text);
 
 // Writes a guest program beside the watch log, once per address, so it can be disassembled.
 void FrameDumpWatchShader(uint64_t address);

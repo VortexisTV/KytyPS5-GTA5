@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 
 #include <algorithm>
 #include <array>
@@ -78,16 +79,14 @@ void ValidateNativeProgram(const IR::Program& program) {
 		Expect(Kind::BdaPagetable);
 		Expect(Kind::FaultBuffer);
 	}
-	const bool uses_flattened_runtime =
-	    !program.srt_reads.empty() ||
-	     std::ranges::any_of(program.info.images, [](const IR::ImageResource& image) {
-		     return image.indirect_search_iterations != 0u;
-	     });
-	if (uses_flattened_runtime) {
+	if (IR::UsesFlattenedSrt(program)) {
 		Expect(Kind::FlattenedSrt);
 	}
 	if (program.bindings.ShaderDataDwords() != 0 && !program.bindings.UsesPushData()) {
 		Expect(Kind::ShaderData);
+	}
+	if (IR::UsesLoopWatchdog(program)) {
+		Expect(Kind::LoopWatchdog);
 	}
 
 	std::array<bool, KindCount> seen {};
@@ -135,7 +134,8 @@ void ValidateNativeProgram(const IR::Program& program) {
 	const auto indirect_buffer_handle = [&](const IR::Inst& handle) {
 		return program.info.uses_dma && handle.NumArgs() == 4u && !handle.Uses().empty() &&
 		       std::ranges::all_of(handle.Uses(), [&](const IR::Use& use) {
-			       if (IR::BufferAccessOf(use.user->GetOpcode()) != IR::BufferAccess::Read) {
+			       const auto access = IR::BufferAccessOf(use.user->GetOpcode());
+			       if (access == IR::BufferAccess::None) {
 				       return false;
 			       }
 			       const auto index = use.user->Flags<IR::MemoryFlags>().index;
@@ -198,6 +198,7 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 	SpirvRequirements requirements {};
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
+			requirements.float64 |= inst.GetType() == IR::Type::F64;
 			if (IR::BufferAccessOf(inst.GetOpcode()) == IR::BufferAccess::Atomic &&
 			    inst.GetType() == IR::Type::U64) {
 				requirements.buffer_int64_atomics = true;
@@ -213,8 +214,6 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 						Fail(program, "scratch operation has no per-thread storage");
 					}
 					requirements.function_scratch = true;
-				} else if (address_access == IR::AddressAccess::Write) {
-					Fail(program, "writable FLAT/GLOBAL addresses require GPU ownership tracking");
 				}
 			}
 			if (IR::BufferAccessOf(inst.GetOpcode()) != IR::BufferAccess::None) {
@@ -227,6 +226,12 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					requirements.subgroup_local_invocation_id = true;
 				}
 				if (memory.kind == IR::ResourceKind::Buffer) {
+					requirements.coherent_buffers |= memory.coherent;
+					// A polled two-dword load is read through the 64-bit view in one access.
+					if (memory.coherent && inst.GetType() == IR::Type::U32x2 &&
+					    IR::BufferAccessOf(inst.GetOpcode()) == IR::BufferAccess::Read) {
+						requirements.buffer_int64_atomics = true;
+					}
 					if (memory.resource >= program.info.buffers.size()) {
 						Fail(program, "buffer operation has invalid resource metadata");
 					}
@@ -247,6 +252,12 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				const auto kind = program.memory_info[index].kind;
 				if (kind != IR::ResourceKind::Lds && kind != IR::ResourceKind::Gds) {
 					Fail(program, "shared operation has invalid resource kind");
+				}
+				if (inst.GetOpcode() == IR::ValueOpcode::SharedAtomicOr64) {
+					if (kind != IR::ResourceKind::Lds || program.stage != ShaderType::Compute) {
+						Fail(program, "64-bit shared atomics require compute LDS");
+					}
+					requirements.shared_int64_atomics = true;
 				}
 				if (program.stage != ShaderType::Compute && program.stage != ShaderType::Mesh &&
 				    kind == IR::ResourceKind::Lds) {

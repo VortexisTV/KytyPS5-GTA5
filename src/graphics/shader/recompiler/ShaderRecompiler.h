@@ -18,6 +18,10 @@ struct CompileOptions {
 	uint64_t                    shader_hash     = 0;
 	bool                        dump_ir                    = true;
 	bool                        early_dump                 = false;
+	// Watch structured loops for runaway iteration (see IR::LoopWatchdog).
+	bool                        loop_watchdog              = true;
+	// Also time loops with the device clock; needs shaderDeviceClock enabled on the device.
+	bool                        loop_watchdog_clock        = false;
 	const char*                 dump_label                 = nullptr;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
@@ -28,6 +32,7 @@ struct TranslateResult {
 	IR::Program program;
 	std::string decoded_dump;
 	std::string cfg_dump;
+	bool        skip_dispatch = false;
 };
 
 struct CompileResult {
@@ -36,6 +41,14 @@ struct CompileResult {
 	std::string            ir_dump;
 	IR::Program            program;
 };
+
+// Plain word loads and stores of storage buffers leave their range check to the device: with
+// robustBufferAccess2, a load outside the bound range reads zero and a store there is dropped, as
+// the shader's comparison with the range would do. Set before any compile, only when the device
+// enables robustBufferAccess2 and nullDescriptor, checks storage buffer ranges in units of at most
+// four bytes, and the renderer rounds storage buffer ranges down to whole dwords.
+void SetHardwareStorageBufferBounds(bool enabled);
+[[nodiscard]] bool HardwareStorageBufferBounds();
 
 [[nodiscard]] TranslateResult TranslateProgram(std::span<const uint32_t> code,
                                                const CompileOptions& options);

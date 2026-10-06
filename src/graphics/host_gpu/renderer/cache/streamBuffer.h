@@ -38,7 +38,7 @@ inline constexpr vk::BufferUsageFlags AllFlags =
 class Buffer {
 public:
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size);
+	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size, bool host_cached = false);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 
@@ -46,6 +46,8 @@ public:
 	[[nodiscard]] uint64_t           Size() const noexcept { return m_size; }
 	[[nodiscard]] std::span<uint8_t> Mapped() const noexcept { return m_mapped; }
 	[[nodiscard]] bool               IsCoherent() const noexcept { return m_coherent; }
+	// The Vulkan memory property flags of the allocation.
+	[[nodiscard]] uint32_t           MemoryProperties() const noexcept;
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
 	[[nodiscard]] vk::DeviceAddress BufferDeviceAddress() const noexcept;
@@ -72,25 +74,8 @@ public:
 	bool   is_deleted   = false;
 	int    stream_score = 0;
 	size_t lru_id       = 0;
-	// Hot-readback tracking: once the CPU has read this buffer after a GPU write, every slice
-	// that writes it records a host-visible shadow copy so later CPU reads avoid a GPU drain.
-	bool     readback_hot        = false;
-	bool     shadow_pending      = false;
-	bool     shadow_valid        = false;
-	uint64_t last_gpu_write_tick = 0;
-	uint64_t shadow_tick         = 0;
-	uint64_t shadow_offset       = 0;
-	// GPU writes recorded since the last shadow; a CPU read overlapping one of them cannot use
-	// the shadow. Cleared when a new shadow is recorded.
-	struct HotWrite {
-		uint64_t address = 0;
-		uint64_t size    = 0;
-	};
-	std::vector<HotWrite> writes_since_shadow;
-	// Writes that may still submit at once so their shadow is in flight before the CPU reads.
-	// Granted when a read had to drain because the shadow was behind, refilled whenever a shadow
-	// serves a read, so a buffer written every draw but rarely read cannot flush every draw.
-	uint32_t eager_budget = 0;
+	// The GC tick the LRU entry last received (see Image::lru_tick).
+	mutable uint64_t lru_tick = 0;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }
@@ -116,7 +101,8 @@ private:
 class StreamBuffer final: public Buffer {
 public:
 	StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-	             uint64_t size);
+	             uint64_t size, vk::BufferUsageFlags extra_flags = {},
+	             bool host_cached = false);
 
 	[[nodiscard]] std::pair<uint8_t*, uint64_t> Map(uint64_t size, uint64_t alignment = 0,
 	                                                bool allow_wait = true);

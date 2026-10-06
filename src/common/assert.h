@@ -27,6 +27,11 @@ int  DbgNotImplementedHandler(char const* expr, char const* file, int line);
 void DbgExit(int status);
 #endif
 
+// Runs once, on the failing thread, after the first fatal error has been reported and before the
+// process stops, so a subsystem can save what explains the failure.
+using FatalHook = void (*)();
+void SetFatalHook(FatalHook hook);
+
 } // namespace Common
 
 #define EXIT_HALT() (Common::DbgExit(321), 1)
