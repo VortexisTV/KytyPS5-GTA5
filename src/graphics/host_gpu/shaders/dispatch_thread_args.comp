@@ -1,0 +1,45 @@
+#version 450
+
+// Converts the arguments of a guest indirect dispatch sized in threads into the workgroup counts
+// of a VkDispatchIndirectCommand, without a CPU readback: per axis, the threads rounded up to
+// whole workgroups. The dispatched shader reads the thread counts themselves from the guest
+// arguments and masks the lanes of its last, partial workgroups.
+
+layout(local_size_x = 1) in;
+
+// Guest dispatch arguments: thread counts x, y, z.
+layout(std430, binding = 0) readonly buffer Arguments {
+	uint arguments[];
+};
+
+// VkDispatchIndirectCommand: workgroup counts x, y, z.
+layout(std430, binding = 1) writeonly buffer Output {
+	uint outputs[];
+};
+
+layout(push_constant) uniform Params {
+	uint arguments_word;
+	uint output_word;
+	// Threads per workgroup, per axis.
+	uint group_threads_x;
+	uint group_threads_y;
+	uint group_threads_z;
+} params;
+
+uint Groups(uint threads, uint group_threads) {
+	// Not (threads + size - 1) / size, which wraps for counts near 2^32.
+	return threads == 0u ? 0u : (threads - 1u) / group_threads + 1u;
+}
+
+void main() {
+	uvec3 groups = uvec3(Groups(arguments[params.arguments_word + 0u], params.group_threads_x),
+	                     Groups(arguments[params.arguments_word + 1u], params.group_threads_y),
+	                     Groups(arguments[params.arguments_word + 2u], params.group_threads_z));
+	// A dispatch with no threads on one axis runs nothing.
+	if (any(equal(groups, uvec3(0u)))) {
+		groups = uvec3(0u);
+	}
+	outputs[params.output_word + 0u] = groups.x;
+	outputs[params.output_word + 1u] = groups.y;
+	outputs[params.output_word + 2u] = groups.z;
+}

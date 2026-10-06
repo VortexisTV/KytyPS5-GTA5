@@ -10140,6 +10140,8 @@ public:
         DispatchCase{{3, 1, 1}, 0x41u, 12, true},
         DispatchCase{{8, 1, 1}, 0x61u, 8},
         DispatchCase{{6, 1, 1}, 0x61u, 6, true},
+        DispatchCase{{0, 1, 1}, 0x61u, 0, true},
+        DispatchCase{{5, 1, 0}, 0x61u, 0, true},
     };
 
     // Separate DWORD descriptors preserve two owners until the indirect argument
@@ -10258,14 +10260,21 @@ public:
                   CpOpDispatchIndirect(processor, 0xc0011600u, packet.data(), 0, 0) == 2,
                   "the offset indirect packet was not consumed");
         }
-        if (test.transfer && (test.mode & 0x20u) != 0) {
-          // Thread counts are read on the CPU. One buffer owns these and the GPU
-          // wrote them, so reading its copy is the one submission. Reading guest
-          // memory first, stale and read-protected, faults and submits once more.
+        if ((test.mode & 0x20u) != 0) {
+          // Thread counts the GPU wrote stay on the GPU: a compute pass turns
+          // them into workgroup counts and the shader reads them in place, so
+          // the dispatch is recorded without a submission. KYTY_DEBUG_THREAD_ARGS=0
+          // reads them on the CPU instead: once, from the GPU's copy, where one
+          // buffer owns them.
+          const char *cpu = std::getenv("KYTY_DEBUG_THREAD_ARGS");
+          const bool on_gpu = cpu == nullptr || std::strcmp(cpu, "0") != 0;
           const auto submissions = scheduler.CurrentTick() - tick;
-          Require(name, "thread-count argument readback", submissions == 1,
-                  "reading GPU-written thread counts took " +
-                      std::to_string(submissions) + " submissions; expected one");
+          if (on_gpu || test.transfer) {
+            Require(name, "thread-count arguments", submissions == (on_gpu ? 0u : 1u),
+                    "a dispatch sized in GPU-written thread counts took " +
+                        std::to_string(submissions) + " submissions; expected " +
+                        (on_gpu ? "none" : "one"));
+          }
         }
         if (test.mode == 0x41u) {
           Require(name, "asynchronous indirect dispatch", scheduler.CurrentTick() == tick,
@@ -15144,11 +15153,17 @@ public:
       cmd.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
                         sizeof(push_data), push_data.dwords.data());
     }
+    Buffer thread_counts;
     if (test.compute_info.dispatch_thread_dimensions) {
-      // As the renderer does: thread counts follow the push data, ahead of the dispatch.
+      // As the renderer does: the first two push dwords hold the address of the
+      // record the shader loads its thread counts from.
+      const auto *counts = test.compute_info.dispatch_threads_num;
+      thread_counts = CreateStorageBuffer(
+          test.name, {counts[0], counts[1], counts[2]}, 3, true);
+      const u32 address[]{static_cast<u32>(thread_counts.device_address),
+                          static_cast<u32>(thread_counts.device_address >> 32u)};
       cmd.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
-                        sizeof(test.compute_info.dispatch_threads_num),
-                        test.compute_info.dispatch_threads_num);
+                        sizeof(address), address);
     }
     cmd.dispatch(test.dispatch_x, test.dispatch_y, test.dispatch_z);
 
@@ -15221,6 +15236,7 @@ public:
     }
     EndSubmitAndFree(test.name, "dispatch", cmd);
     m_last_fault_words.clear();
+    DestroyBuffer(&thread_counts);
     if (fault_readback.buffer != nullptr) {
       m_last_fault_words = ReadBuffer(test.name, fault_readback,
                                       test.expected_fault_words.size());

@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/gpuCrashDiagnostics.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/dispatchThreadArgs.h"
 #include "graphics/host_gpu/renderer/gpuZones.h"
 #include "graphics/host_gpu/renderer/frameDump.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
@@ -302,6 +303,169 @@ static void MarkDispatchCheckpoint(const GraphicContext& graphics, vk::CommandBu
 	                  arg2, &dispatch);
 }
 
+// Push-constant dwords 0 and 1 name the dispatch's thread counts for the shader.
+static void PushThreadCountsAddress(vk::CommandBuffer              vk_buffer,
+                                    const PipelineCache::Pipeline& pipeline,
+                                    vk::DeviceAddress              thread_counts) {
+	const uint32_t address[] {static_cast<uint32_t>(thread_counts),
+	                          static_cast<uint32_t>(thread_counts >> 32u)};
+	static_assert(std::size(address) <= ShaderRecompiler::IR::PushData::DispatchThreadDwordCount);
+	vk_buffer.pushConstants(pipeline.pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+	                        sizeof(address), address);
+}
+
+// Whether TryConsumeComputeMetaClear or TryConsumeComputeImageClear could take this dispatch.
+// Both need to know that it runs at all, and the second its size.
+static bool MayBecomeClear(const ShaderComputeInputInfo& input, TextureCache& cache) {
+	const auto& program   = *input.stage.program;
+	const auto& resources = *input.stage.resources;
+	if (resources.uniform_fill.kind != ShaderRecompiler::IR::UniformFillKind::None) {
+		return true;
+	}
+	for (uint32_t i = 0; i < program.info.buffers.size() && i < resources.buffers.size(); i++) {
+		if (cache.IsMeta(DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]).Base48())) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool RenderExecutor::DispatchThreads(uint64_t submit_id, CommandBuffer& buffer,
+                                     uint64_t args_addr, uint32_t mode) {
+	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
+	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) == 0);
+	// Performance statistics, recorded only once the dispatch is known to stay here.
+	struct Time {
+		uint64_t start = PerfStats::Enabled() ? PerfStats::Now() : 0;
+		bool     taken = false;
+		bool     dma   = false;
+		~Time() {
+			if (taken && PerfStats::Enabled()) {
+				const auto ticks = PerfStats::Now() - start;
+				PerfStats::Record(PerfStats::SpanId::Dispatch, ticks);
+				if (dma) {
+					PerfStats::Record(PerfStats::SpanId::DispatchDma, ticks);
+				}
+			}
+		}
+	} time;
+	Common::LockGuard lock(m_context.GetMutex());
+	const auto&       cs_regs = buffer.GetShaders().GetCs();
+	if (cs_regs.cs_regs.data_addr == 0) {
+		return false;
+	}
+	ShaderComputeInputInfo input_info {};
+	input_info.dispatch_thread_dimensions = true;
+	const auto compute_program            = [&] {
+        DrainStats::SlowLookupTimer compile_timer(DrainStats::Kind::ShaderCompile);
+        return m_context.GetPipelineCache().GetComputeProgram(
+            cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	}();
+	if (!compute_program) {
+		return false;
+	}
+	const auto& program = *input_info.stage.program;
+	// A clear needs to know on the CPU that the dispatch runs, and bands of rows its size.
+	if (MayBecomeClear(input_info, m_context.GetTextureCache()) ||
+	    DispatchSplit(program.shader_hash) > 1u) {
+		ResetBindings();
+		return false;
+	}
+	time.taken = true;
+	time.dma   = program.info.uses_dma;
+	PerfStats::Add(PerfStats::CounterId::DispatchesIndirect);
+	PerfStats::Add(PerfStats::CounterId::IndirectDispatchesGpu);
+	PerfStats::Record(PerfStats::SpanId::DispatchShaders, PerfStats::Now() - time.start);
+	PerfStats::RecordIfSlow(PerfStats::SpanId::ShaderCompileSync, time.start);
+	PerfStats::Lap lap;
+	m_context.GetCommandScheduler().PopPendingOperations(false);
+	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchIndirect), submit_id,
+	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
+	                    0, mode, cs_regs.cs_regs.data_addr);
+	if (DebugSkipShader(program.shader_hash, DebugShaderKind::Compute)) [[unlikely]] {
+		ResetBindings();
+		return true;
+	}
+	buffer.EndRendering();
+	lap.Skip();
+	const auto pipeline_started = PerfStats::Enabled() ? PerfStats::Now() : uint64_t {0};
+	auto&      pipeline         = [&]() -> PipelineCache::Pipeline& {
+        DrainStats::SlowLookupTimer create_timer(DrainStats::Kind::PipelineCreate);
+        return m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	}();
+	lap.Mark(PerfStats::SpanId::DispatchPipeline);
+	PerfStats::RecordIfSlow(PerfStats::SpanId::PipelineCreateSync, pipeline_started);
+	auto& bindings = m_compute_bindings;
+	PrepareBindings(input_info.stage, bindings);
+	FindBuffers(bindings);
+	RecordWrittenBuffers(program, bindings, {0u, 0u, 0u});
+	if (program.info.uses_dma) {
+		PrepareDmaSources(bindings);
+		m_context.PrepareBda();
+	}
+	RebindImages(bindings);
+	if (ImageUsersEnabled()) [[unlikely]] {
+		PreparedBindings* const compute_stages[] {&bindings};
+		NoteImageUsers(m_context.GetTextureCache(), compute_stages, {}, nullptr, 0,
+		               program.shader_hash);
+	}
+	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
+	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
+	    args_addr, DispatchThreadArgs::ArgumentsSize, false);
+	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
+	RebindBuffers(bindings);
+	// The GPU writes this slot with the workgroup counts; the CPU only reserves it, and before
+	// recording starts: the ring can wait and restart the scheduler.
+	auto&      records           = m_context.GetBufferCache().GetDrawRecordBuffer();
+	const auto [mapped, groups]  = records.Map(DispatchThreadArgs::OutputSize, 64);
+	EXIT_IF(mapped == nullptr);
+	records.Commit();
+	lap.Mark(PerfStats::SpanId::DispatchBindings);
+
+	const auto vk_buffer = buffer.Handle();
+	if (m_dispatch_thread_args == nullptr) {
+		m_dispatch_thread_args = std::make_unique<DispatchThreadArgs>(m_context.GetGraphics());
+	}
+	// Ahead of the dispatch's own bindings: the pass binds its pipeline and descriptors too.
+	m_dispatch_thread_args->Record(vk_buffer, *args_buffer, args_offset, records, groups,
+	                               {std::max(cs_regs.cs_regs.num_thread_x, 1u),
+	                                std::max(cs_regs.cs_regs.num_thread_y, 1u),
+	                                std::max(cs_regs.cs_regs.num_thread_z, 1u)});
+	PreparedBindings* descriptor_stage = &bindings;
+	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
+	               std::span {&descriptor_stage, 1u});
+	const bool has_storage_writes = HasShaderBufferWrites(input_info.stage) ||
+	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& image) {
+		    return image.written && image.resource_class ==
+		                                ShaderRecompiler::IR::ImageResourceClass::Storage;
+	    });
+	if (has_storage_writes) {
+		PerfStats::Add(PerfStats::CounterId::DispatchesWriting);
+		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	}
+	if (DebugFullBarriers()) [[unlikely]] {
+		m_context.GetCommandScheduler().EndRendering();
+		RecordFullBarrier(vk_buffer);
+	}
+	GpuZones::Mark(vk_buffer, DrainStats::Zone::GameDispatch, program.shader_hash);
+	ResetLoopWatchdogDispatchClock(m_context, vk_buffer, program);
+	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	// The shader masks lanes past the thread counts, which it reads from the guest's arguments
+	// as the GPU holds them.
+	PushThreadCountsAddress(vk_buffer, pipeline, args_buffer->BufferDeviceAddress() + args_offset);
+	MarkDispatchCheckpoint(m_context.GetGraphics(), vk_buffer, GpuCheckpointKind::DispatchIndirect,
+	                       submit_id, input_info, bindings, static_cast<uint32_t>(args_addr),
+	                       static_cast<uint32_t>(args_addr >> 32u), 0);
+	vk_buffer.dispatchIndirect(records.Handle(), groups);
+	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	MarkGpuCheckpoint(m_context.GetGraphics(), vk_buffer, GpuCheckpointKind::DispatchDone,
+	                  submit_id, {&program.shader_hash, 1});
+	m_context.GetBufferCache().OnCommandRecorded();
+	ResetBindings();
+	lap.Mark(PerfStats::SpanId::DispatchRecord);
+	return true;
+}
+
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode) {
@@ -546,6 +710,18 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			               input_info.stage.program->shader_hash);
 		}
 		RebindBuffers(bindings);
+		vk::DeviceAddress thread_counts = 0;
+		if (use_thread_dimensions) {
+			// The shader loads its thread counts from a record by address (see
+			// EmitDispatchThreadCount). Written before recording starts: the ring can wait and
+			// restart the scheduler.
+			static_assert(std::size(input_info.dispatch_threads_num) ==
+			              ShaderRecompiler::IR::PushData::DispatchThreadAxes);
+			auto& records = m_context.GetBufferCache().GetDrawRecordBuffer();
+			thread_counts = records.BufferDeviceAddress() +
+			                records.Copy(input_info.dispatch_threads_num,
+			                             sizeof(input_info.dispatch_threads_num), 16);
+		}
 		lap.Mark(PerfStats::SpanId::DispatchBindings);
 
 		vk_buffer                          = buffer.Handle();
@@ -567,11 +743,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 		if (use_thread_dimensions) {
 			// The shader masks lanes past these counts, as the hardware does for partial groups.
-			static_assert(std::size(input_info.dispatch_threads_num) ==
-			              ShaderRecompiler::IR::PushData::DispatchThreadDwordCount);
-			vk_buffer.pushConstants(pipeline.pipeline_layout, vk::ShaderStageFlagBits::eCompute,
-			                        0, sizeof(input_info.dispatch_threads_num),
-			                        input_info.dispatch_threads_num);
+			PushThreadCountsAddress(vk_buffer, pipeline, thread_counts);
 		}
 		MarkDispatchCheckpoint(m_context.GetGraphics(), vk_buffer, GpuCheckpointKind::Dispatch,
 		                       submit_id, input_info, bindings, thread_group_x, thread_group_y,

@@ -342,6 +342,21 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${mesh_indirect_shader_header}")
 
+set(dispatch_thread_shader_source "${gpu_tiler_shader_dir}/dispatch_thread_args.comp")
+set(dispatch_thread_shader_spv "${gpu_tiler_generated_dir}/dispatch_thread_args.spv")
+set(dispatch_thread_shader_header "${gpu_tiler_generated_dir}/dispatch_thread_args_spv.h")
+add_custom_command(
+	OUTPUT "${dispatch_thread_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${dispatch_thread_shader_spv}" "${dispatch_thread_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${dispatch_thread_shader_spv} -DOUTPUT=${dispatch_thread_shader_header}
+	        -DSYMBOL=DISPATCH_THREAD_ARGS_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${dispatch_thread_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${dispatch_thread_shader_header}")
+
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
 set(gpu_blit_shader_sources
 	"${gpu_tiler_shader_dir}/gpu_blit_fs_triangle.vert"
@@ -724,6 +739,11 @@ if(BUILD_TESTING)
 	add_test(NAME graphics_shadow_pipelines
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --shadow-pipeline-only)
 	set_tests_properties(graphics_shadow_pipelines PROPERTIES SKIP_RETURN_CODE 77)
+	# Indirect dispatches, with thread counts read on the CPU as well as left on the GPU.
+	add_test(NAME native_indirect_dispatch_cpu_threads
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --perf-stats-wiring-only)
+	set_tests_properties(native_indirect_dispatch_cpu_threads PROPERTIES
+		ENVIRONMENT "KYTY_DEBUG_THREAD_ARGS=0")
 	# The performance statistics a draw and a dispatch record through the production paths.
 	add_test(NAME perf_stats_wiring
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --perf-stats-wiring-only)

@@ -393,8 +393,11 @@ struct PushData {
 	// Mesh draws reserve seven dwords: index_count, vertex offset, first
 	// instance, index element size, index address, and the slice base group.
 	static constexpr uint32_t        MeshDrawDwordCount = 7;
-	// A compute dispatch sized in threads passes its thread counts per axis ahead of shader data.
+	// A compute dispatch sized in threads reserves three dwords ahead of shader data. The first two
+	// hold the device address of its three thread counts, so that an indirect dispatch can leave
+	// them where the GPU wrote them; the third is unused.
 	static constexpr uint32_t        DispatchThreadDwordCount = 3;
+	static constexpr uint32_t        DispatchThreadAxes       = 3;
 	static constexpr uint32_t NoStart    = UINT32_MAX;
 	std::array<uint32_t, DwordCount> dwords {};
 

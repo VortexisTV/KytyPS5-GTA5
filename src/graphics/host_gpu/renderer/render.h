@@ -32,6 +32,7 @@ struct RenderDepthInfo;
 struct RenderColorInfo;
 struct DrawCallInfo;
 class MeshIndirectArgs;
+class DispatchThreadArgs;
 struct DrawEmitInfo;
 struct DrawIndexBufferSource;
 struct DrawRenderState;
@@ -220,6 +221,13 @@ public:
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                      uint32_t mode);
+	// An indirect dispatch sized in threads, with the arguments left on the GPU: a compute pass
+	// turns the thread counts into workgroup counts and the shader reads the thread counts where
+	// the guest keeps them. False, with nothing recorded, for a dispatch that needs the counts on
+	// the CPU (one that may turn out to be a clear, or that runs in bands); the caller then reads
+	// them and dispatches directly.
+	[[nodiscard]] bool DispatchThreads(uint64_t submit_id, CommandBuffer& buffer,
+	                                   uint64_t args_addr, uint32_t mode);
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	void                           FindBuffers(PreparedBindings& bindings);
@@ -338,6 +346,7 @@ private:
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::vector<uint32_t>                 m_image_occurrences;
 	std::unique_ptr<MeshIndirectArgs>     m_mesh_indirect; // Created on first GPU-args draw.
+	std::unique_ptr<DispatchThreadArgs>   m_dispatch_thread_args; // On first such dispatch.
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

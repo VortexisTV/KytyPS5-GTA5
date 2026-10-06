@@ -594,15 +594,9 @@ uint32_t EmitLaneId(EmitterState& state) {
 	           : EmitSubgroupLocalInvocationId(state);
 }
 
-uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
-	auto&      state  = ctx.state;
-	const auto result = state.builder.AllocateId();
-	const auto index  = inst.Arg(0).U32();
-	if (state.program.stage != ShaderType::Mesh || index >= IR::PushData::MeshDrawDwordCount) {
-		ctx.Fail(inst, "invalid mesh draw parameter");
-	}
-	// Push-constant dwords 0 and 1 hold the device address of the draw's parameter record, so
-	// that an indirect draw can have the GPU write the record from its arguments.
+// Loads dword `index` of the record whose device address push-constant dwords 0 and 1 hold.
+static uint32_t EmitPushRecordDword(EmitterState& state, uint32_t index) {
+	const auto result    = state.builder.AllocateId();
 	const auto push_word = [&](uint32_t word) {
 		const auto pointer = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state),
@@ -631,22 +625,29 @@ uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return result;
 }
 
+uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
+	const auto index = inst.Arg(0).U32();
+	if (ctx.state.program.stage != ShaderType::Mesh || index >= IR::PushData::MeshDrawDwordCount) {
+		ctx.Fail(inst, "invalid mesh draw parameter");
+	}
+	// The record is the draw's parameters, so that an indirect draw can have the GPU write it
+	// from its arguments.
+	return EmitPushRecordDword(ctx.state, index);
+}
+
 uint32_t EmitDispatchThreadCount(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&       state   = ctx.state;
-	const auto  result  = state.builder.AllocateId();
 	const auto  index   = inst.Arg(0).U32();
 	const auto* compute = state.program.stage == ShaderType::Compute ? state.input_info.compute
 	                                                                 : nullptr;
 	if (compute == nullptr || !compute->dispatch_thread_dimensions ||
-	    index >= IR::PushData::DispatchThreadDwordCount) {
+	    index >= IR::PushData::DispatchThreadAxes) {
 		ctx.Fail(inst, "invalid dispatch thread count");
 	}
-	const auto pointer = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer,
-	                          state.push_constant_variable, ConstantU32(state, 0),
-	                          ConstantU32(state, index));
-	state.builder.AddFunction(spv::OpLoad, TypeU32(state), result, pointer);
-	return result;
+	// The record is the dispatch's three thread counts: where the CPU knows them it writes them,
+	// and for an indirect dispatch it is the guest's argument block as the GPU holds it, which the
+	// CPU then never has to read back.
+	return EmitPushRecordDword(state, index);
 }
 
 uint32_t EmitGetUserData(EmitterState& state, IR::ScalarReg reg) {

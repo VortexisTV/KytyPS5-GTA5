@@ -1735,6 +1735,18 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 		// on every argument page a shader wrote, downloads the page's whole dirty range and waits
 		// for the GPU, and the GPU's copy is then read, and waited for, all the same.
 		PerfStats::Add(PerfStats::CounterId::DispatchesThreadSized);
+		// The executor first: it leaves the counts on the GPU, where no read waits for them, and
+		// declines only the dispatches that need them here. KYTY_DEBUG_THREAD_ARGS=0 reads them
+		// on the CPU every time, as before.
+		static const bool on_gpu = [] {
+			const char* text = std::getenv("KYTY_DEBUG_THREAD_ARGS");
+			return text == nullptr || std::strcmp(text, "0") != 0;
+		}();
+		m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+		if (on_gpu && m_renderer.GetRenderExecutor().DispatchThreads(m_submit_id, CurrentBuffer(),
+		                                                             args_addr, mode)) {
+			return;
+		}
 		auto&                       buffers = m_renderer.GetBufferCache();
 		const auto*                 guest   = reinterpret_cast<const void*>(args_addr);
 		vk::DispatchIndirectCommand args {};

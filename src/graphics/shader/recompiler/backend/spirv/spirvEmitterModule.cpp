@@ -645,9 +645,14 @@ void DefineModule(EmitterState& state) {
 
 	state.builder.RequireCapability(spv::CapabilityShader);
 	state.builder.RequireCapability(spv::CapabilitySignedZeroInfNanPreserve);
-	// Mesh shaders load their draw parameter record through a device address.
-	const bool physical_addresses =
-	    state.program.info.uses_dma || state.program.stage == ShaderType::Mesh;
+	// Mesh shaders load their draw parameter record through a device address, and compute
+	// shaders dispatched in threads their thread counts.
+	const bool dispatch_thread_counts = state.program.stage == ShaderType::Compute &&
+	                                    state.input_info.compute != nullptr &&
+	                                    state.input_info.compute->dispatch_thread_dimensions;
+	const bool physical_addresses = state.program.info.uses_dma ||
+	                                state.program.stage == ShaderType::Mesh ||
+	                                dispatch_thread_counts;
 	if (physical_addresses) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);
