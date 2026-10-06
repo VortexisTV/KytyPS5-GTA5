@@ -2404,6 +2404,16 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	return image.FindView(desc.view_info);
 }
 
+void TextureCache::CopyDepthStencilToColor(ImageId source, const ImageDesc& source_desc,
+                                           ImageId destination, const ImageDesc& destination_desc,
+                                           vk::Rect2D scissor, uint32_t sample, bool stencil) {
+	UpdateImage(source);
+	(void)FindRenderTarget(destination, destination_desc);
+	m_blit_helper.CopyDepthStencilToColor(GetImage(source), GetImage(destination),
+	                                      source_desc.view_info, destination_desc.view_info,
+	                                      scissor, sample, stencil);
+}
+
 vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) {
 	if (desc.type != BindingType::RenderTarget) {
 		EXIT("TextureCache: invalid color-target binding\n");

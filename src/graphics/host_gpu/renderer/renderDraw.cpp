@@ -2355,6 +2355,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	// A color metadata operation, depth copy or resolve instead of a draw.
 	const auto operation =
 	    ConsumeMetadataColorOperation(buffer) ? Pm4OpTimer::MetadataOp
+	    : DepthStencilCopyToColor(buffer, args.render_target_slice_offset) ? Pm4OpTimer::DepthCopy
 	    : DepthStencilCopy(buffer)            ? Pm4OpTimer::DepthCopy
 	    : ResolveColorTargets(buffer, args.render_target_slice_offset) ? Pm4OpTimer::Resolve
 	                                                                   : Pm4OpTimer::Drawn;
@@ -2488,6 +2489,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	// A color metadata operation, depth copy or resolve instead of a draw.
 	const auto operation =
 	    ConsumeMetadataColorOperation(buffer) ? Pm4OpTimer::MetadataOp
+	    : DepthStencilCopyToColor(buffer, args.render_target_slice_offset) ? Pm4OpTimer::DepthCopy
 	    : DepthStencilCopy(buffer)            ? Pm4OpTimer::DepthCopy
 	    : ResolveColorTargets(buffer, args.render_target_slice_offset) ? Pm4OpTimer::Resolve
 	                                                                   : Pm4OpTimer::Drawn;

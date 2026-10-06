@@ -2270,7 +2270,9 @@ static bool PredictGraphicsDraw(
 	// operations without translating their shaders, and a translation must not run that the real
 	// draw never would.
 	const auto color_mode = ctx.GetColorControl().mode;
-	if (color_mode > 1) {
+	const auto& render_control = ctx.GetRenderControl();
+	if (color_mode > 1 || render_control.copy_depth_to_color ||
+	    render_control.copy_stencil_to_color) {
 		return false;
 	}
 	const auto& override    = ctx.GetDepthRenderOverride();

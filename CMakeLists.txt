@@ -385,6 +385,31 @@ foreach(shader_source IN LISTS gpu_blit_shader_sources)
 endforeach()
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 
+foreach(copy_aspect IN ITEMS depth stencil)
+	foreach(copy_ms IN ITEMS 0 1)
+		set(copy_shader_name "gpu_blit_${copy_aspect}_to_color_${copy_ms}")
+		set(copy_shader_header "${gpu_blit_generated_dir}/${copy_shader_name}_spv.h")
+		set(copy_shader_spv "${gpu_blit_generated_dir}/${copy_shader_name}.spv")
+		string(TOUPPER "${copy_shader_name}_SPV" copy_shader_symbol)
+		set(copy_stencil 0)
+		if(copy_aspect STREQUAL "stencil")
+			set(copy_stencil 1)
+		endif()
+		add_custom_command(
+			OUTPUT "${copy_shader_header}"
+			COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_blit_generated_dir}"
+			COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+			        -DCOPY_STENCIL=${copy_stencil} -DCOPY_MS=${copy_ms}
+			        -o "${copy_shader_spv}" "${gpu_tiler_shader_dir}/gpu_blit_depth_stencil_to_color.frag"
+			COMMAND ${CMAKE_COMMAND} -DINPUT=${copy_shader_spv} -DOUTPUT=${copy_shader_header}
+			        -DSYMBOL=${copy_shader_symbol} -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+			DEPENDS "${gpu_tiler_shader_dir}/gpu_blit_depth_stencil_to_color.frag"
+			VERBATIM
+		)
+		list(APPEND kyty_emulator_src "${copy_shader_header}")
+	endforeach()
+endforeach()
+
 list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/emulator.h"
 	"${KYTY_SOURCE_DIR}/emulator.cpp"

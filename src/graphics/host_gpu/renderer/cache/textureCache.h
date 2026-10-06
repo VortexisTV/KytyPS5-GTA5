@@ -129,6 +129,9 @@ public:
 		return image;
 	}
 	void MarkGpuWritten(ImageId id);
+	void CopyDepthStencilToColor(ImageId source, const ImageDesc& source_desc, ImageId destination,
+	                             const ImageDesc& destination_desc, vk::Rect2D scissor,
+	                             uint32_t sample, bool stencil);
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);

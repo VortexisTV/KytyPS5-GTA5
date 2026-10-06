@@ -381,6 +381,71 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	BindRenderTarget(r.image_id);
 }
 
+bool RenderExecutor::DepthStencilCopyToColor(CommandBuffer& buffer,
+                                             uint32_t       render_target_slice_offset) {
+	const auto& hw      = buffer.GetRegisters();
+	const auto& control = hw.GetRenderControl();
+	if (!control.copy_depth_to_color && !control.copy_stencil_to_color) {
+		return false;
+	}
+	const auto& z       = hw.GetDepthRenderTarget();
+	const auto& color   = hw.GetRenderTarget(0);
+	const bool  stencil = control.copy_stencil_to_color;
+	if (hw.GetColorControl().mode == 0 || color.base.addr == 0 ||
+	    (render_target_mask_slot(hw.GetRenderTargetMask(), 0) & 1u) == 0) {
+		return true;
+	}
+	// DB copies replace MRT0's scalar export and select a depth/stencil sample; they do not
+	// enable depth tests or write the source attachment. Fullscreen copy rectangles make every
+	// sample lit, so COPY_CENTROID selects COPY_SAMPLE as well.
+	if (control.copy_depth_to_color == control.copy_stencil_to_color ||
+	    (stencil && z.stencil_info.format == Prospero::StencilFormat::kInvalid) ||
+	    (!stencil && z.z_info.format == Prospero::DepthFormat::kInvalid) ||
+	    color.info.channel_order != Prospero::ChannelOrder::kStandard) {
+		DepthFatal(
+		    "unsupported DB-to-color copy: depth=%u stencil=%u color format=%u type=%u order=%u",
+		    control.copy_depth_to_color, stencil, static_cast<uint32_t>(color.info.format),
+		    static_cast<uint32_t>(color.info.channel_type),
+		    static_cast<uint32_t>(color.info.channel_order));
+	}
+	auto       read_desc = MakeDepthTargetDesc(buffer, z);
+	auto&      cache     = m_context.GetTextureCache();
+	const auto read_id   = cache.FindImage(read_desc);
+	BindRenderTarget(read_id);
+	RenderColorInfo destination {};
+	ResolveRenderColorTarget(buffer, destination, render_target_slice_offset, 0, false, true);
+	if (!destination.image_id) {
+		return true;
+	}
+	const auto format = destination.desc.view_info.format;
+	const bool supported_format =
+	    stencil ? (format == vk::Format::eR8Uint || format == vk::Format::eR16Uint ||
+	               format == vk::Format::eR32Uint)
+	            : (format == vk::Format::eR16Unorm || format == vk::Format::eR16Sfloat ||
+	               format == vk::Format::eR32Sfloat);
+	if (!supported_format || destination.desc.info.samples != 1 ||
+	    control.copy_sample >= read_desc.info.samples ||
+	    read_desc.view_info.layer_count != destination.desc.view_info.layer_count) {
+		DepthFatal("unsupported DB-to-color copy: depth=%u stencil=%u source samples=%u "
+		           "copy sample=%u centroid=%u destination format=%s samples=%u layers=%u/%u",
+		           control.copy_depth_to_color, stencil, read_desc.info.samples,
+		           control.copy_sample, control.copy_centroid, vk::to_string(format).c_str(),
+		           destination.desc.info.samples, read_desc.view_info.layer_count,
+		           destination.desc.view_info.layer_count);
+	}
+	const auto         target_extent = destination.Extent();
+	const vk::Extent2D extent {std::min(target_extent.width, read_desc.info.extent.width),
+	                           std::min(target_extent.height, read_desc.info.extent.height)};
+	const auto         clipped =
+	    calc_final_scissor(hw.GetScreenViewport(), hw.GetScanModeControl(), extent, 0);
+	const vk::Rect2D scissor {{clipped.left, clipped.top},
+	                          {static_cast<uint32_t>(clipped.right - clipped.left),
+	                           static_cast<uint32_t>(clipped.bottom - clipped.top)}};
+	cache.CopyDepthStencilToColor(read_id, read_desc, destination.image_id, destination.desc,
+	                              scissor, control.copy_sample, stencil);
+	return true;
+}
+
 bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
 	const auto& hw       = buffer.GetRegisters();
 	const auto& z        = hw.GetDepthRenderTarget();

@@ -408,6 +408,11 @@ struct RenderExecutorTestAccess {
     executor.DrawAuto(0, command, args);
   }
 
+  static void DrawIndex(RenderExecutor &executor, CommandBuffer &command,
+                        const DrawIndexArgs &args) {
+    executor.DrawIndex(0, command, args);
+  }
+
   static bool TryConsumeComputeImageClear(RenderExecutor &executor,
       const ShaderComputeInputInfo &input, CommandBuffer &command,
       uint32_t x, uint32_t y, uint32_t z, uint32_t mode) {
@@ -13263,6 +13268,253 @@ public:
         }
       }
       DestroyBuffer(&copy_readback);
+
+      // DB_RENDER_CONTROL copies must replace dummy pixel exports, even without
+      // a VS/PS. Preserve the unselected destination layer and pixels outside
+      // the copy rectangle.
+      const auto saved_copy_registers = registers;
+      const auto saved_copy_shaders = shaders;
+      shaders = {};
+      registers = {};
+      registers.SetDepthRenderTarget(copy_target);
+      registers.SetDepthRenderOverride({});
+      registers.SetDepthControl({});
+      registers.SetColorControl({1, 0xcc});
+      registers.SetRenderTargetMask(0xf);
+      registers.SetScreenScissor(2, 1, 6, 7);
+      registers.SetWindowScissor(0, 0, copy_side, copy_side, false);
+      registers.SetGenericScissor(0, 0, copy_side, copy_side, false);
+      registers.SetScanModeControl({});
+      struct ColorCopyCase {
+        const char *label;
+        bool stencil;
+        Prospero::ChannelLayout layout;
+        Prospero::ChannelType type;
+        uint32_t bytes;
+      };
+      constexpr std::array color_copy_cases{
+          ColorCopyCase{"depth to R32F", false, Prospero::ChannelLayout::k32,
+                        Prospero::ChannelType::kFloat, 4},
+          ColorCopyCase{"stencil to R8UI", true, Prospero::ChannelLayout::k8,
+                        Prospero::ChannelType::kUInt, 1},
+          ColorCopyCase{"depth to R16UNORM", false, Prospero::ChannelLayout::k16,
+                        Prospero::ChannelType::kUNorm, 2},
+          ColorCopyCase{"stencil to R16UI", true, Prospero::ChannelLayout::k16,
+                        Prospero::ChannelType::kUInt, 2}};
+      for (size_t index = 0; index < color_copy_cases.size(); ++index) {
+        const auto &test = color_copy_cases[index];
+        registers.SetRenderControl({});
+        registers.SetColorBase(0, {.addr = base + 0x200000 + index * 0x20000});
+        registers.SetColorInfo(0, {.format = test.layout,
+                                   .channel_type = test.type,
+                                   .channel_order = Prospero::ChannelOrder::kStandard});
+        registers.SetColorAttrib(0, {});
+        registers.SetColorAttrib2(0, {.height = copy_side - 1, .width = copy_side - 1});
+        registers.SetColorAttrib3(0, {.tile_mode = Prospero::TileMode::kLinear, .dimension = 1});
+        registers.SetColorView(0, {.base_array_slice_index = 1, .last_array_slice_index = 1});
+        RenderColorInfo color_destination{};
+        RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(),
+                                                           color_destination, 0);
+        (void)texture_cache.FindRenderTarget(color_destination.image_id, color_destination.desc);
+        auto &color_image = texture_cache.GetImage(color_destination.image_id);
+        color_image.Transit(vk::ImageLayout::eTransferDstOptimal,
+                            vk::AccessFlagBits2::eTransferWrite, {}, scheduler.Current().Handle());
+        vk::ClearColorValue initial_color{};
+        if (test.stencil) {
+          initial_color.uint32[0] = 0xc4;
+        } else {
+          initial_color.float32[0] = 0.5f;
+        }
+        const vk::ImageSubresourceRange all_layers{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 2};
+        scheduler.Current().Handle().clearColorImage(color_image.backing.image,
+                                                     vk::ImageLayout::eTransferDstOptimal,
+                                                     initial_color, all_layers);
+        RenderExecutorTestAccess::ResetBindings(executor);
+        HW::RenderControl color_copy_control{};
+        color_copy_control.copy_depth_to_color = !test.stencil;
+        color_copy_control.copy_stencil_to_color = test.stencil;
+        color_copy_control.copy_centroid = true;
+        registers.SetRenderControl(color_copy_control);
+        if ((index & 1u) == 0) {
+          RenderExecutorTestAccess::DrawAuto(executor, scheduler.Current(),
+                                             {.vertex_count = 3, .instance_count = 1});
+        } else {
+          RenderExecutorTestAccess::DrawIndex(executor, scheduler.Current(),
+                                              {.index_count = 3, .instance_count = 1});
+        }
+        auto readback = CreateHostBuffer(name, copy_layer_texels * 2 * test.bytes,
+                                         vk::BufferUsageFlagBits::eTransferDst, {});
+        const vk::BufferImageCopy download{
+            0, 0, 0, {vk::ImageAspectFlagBits::eColor, 0, 0, 2}, {}, {copy_side, copy_side, 1}};
+        color_image.Download(std::span{&download, 1}, readback.buffer, 0, readback.size);
+        scheduler.Current().Handle().pipelineBarrier2(bounds_dependency);
+        scheduler.Finish();
+        const auto pixels = ReadBuffer(name, readback, readback.size / sizeof(uint32_t));
+        const auto *pixel_bytes = reinterpret_cast<const uint8_t *>(pixels.data());
+        for (uint32_t layer = 0; layer < 2; ++layer) {
+          for (uint32_t y = 0; y < copy_side; ++y) {
+            for (uint32_t x = 0; x < copy_side; ++x) {
+              const bool copied = layer == 1 && x >= 2 && x < 6 && y >= 1 && y < 7;
+              const uint32_t expected = test.stencil ? (copied ? 0x5au : 0xc4u)
+                                        : test.bytes == 4
+                                            ? std::bit_cast<uint32_t>(copied ? 0.25f : 0.5f)
+                                            : (copied ? 0x4000u : 0x8000u);
+              uint32_t actual = 0;
+              std::memcpy(&actual,
+                          pixel_bytes + ((layer * copy_side + y) * copy_side + x) * test.bytes,
+                          test.bytes);
+              Require(name, test.label, actual == expected,
+                      "DB-to-color copy lost source values, clipping, or layer "
+                      "selection");
+            }
+          }
+        }
+        Require(name, "DB-to-color destination ownership", color_image.IsGpuModified(),
+                "copied color image was not published as GPU-written");
+        DestroyBuffer(&readback);
+      }
+      // Seed two different depth samples through the existing color-to-MS-depth
+      // helper. A DB copy of sample 1 must read 0.75, rather than sample 0's
+      // 0.25 or their average.
+      registers.SetRenderControl({});
+      auto ms_copy_target = copy_target;
+      ms_copy_target.z_info.num_samples = 1;
+      ms_copy_target.z_read_base_addr = ms_copy_target.z_write_base_addr = base + 0x300000;
+      ms_copy_target.stencil_read_base_addr = ms_copy_target.stencil_write_base_addr =
+          base + 0x320000;
+      ms_copy_target.depth_view.slice_start = ms_copy_target.depth_view.slice_max = 0;
+      registers.SetDepthRenderTarget(ms_copy_target);
+      registers.SetDepthControl(copy_seed_control);
+      RenderDepthInfo ms_copy_source{};
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(),
+                                                         ms_copy_source);
+      (void)texture_cache.FindDepthTarget(ms_copy_source.image_id, ms_copy_source.desc);
+      registers.SetColorBase(0, {.addr = base + 0x340000});
+      registers.SetColorInfo(0, {.format = Prospero::ChannelLayout::k32_32_32_32,
+                                 .channel_type = Prospero::ChannelType::kFloat,
+                                 .channel_order = Prospero::ChannelOrder::kStandard});
+      registers.SetColorView(0, {});
+      RenderColorInfo packed_samples{};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(),
+                                                         packed_samples, 0);
+      (void)texture_cache.FindRenderTarget(packed_samples.image_id, packed_samples.desc);
+      auto &packed_image = texture_cache.GetImage(packed_samples.image_id);
+      packed_image.Transit(vk::ImageLayout::eTransferDstOptimal,
+                           vk::AccessFlagBits2::eTransferWrite, {}, scheduler.Current().Handle());
+      const vk::ClearColorValue sample_values(std::array<float, 4>{0.25f, 0.75f, 0, 0});
+      const vk::ImageSubresourceRange one_color_layer{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+      scheduler.Current().Handle().clearColorImage(packed_image.backing.image,
+                                                   vk::ImageLayout::eTransferDstOptimal,
+                                                   sample_values, one_color_layer);
+      {
+        BlitHelper blit(context.GetGraphics(), scheduler);
+        blit.ReinterpretColorAsMsDepth(packed_image,
+                                       texture_cache.GetImage(ms_copy_source.image_id));
+        scheduler.Finish();
+      }
+      RenderExecutorTestAccess::ResetBindings(executor);
+      registers.SetDepthControl({});
+      registers.SetColorBase(0, {.addr = base + 0x360000});
+      registers.SetColorInfo(0, {.format = Prospero::ChannelLayout::k32,
+                                 .channel_type = Prospero::ChannelType::kFloat,
+                                 .channel_order = Prospero::ChannelOrder::kStandard});
+      registers.SetScreenScissor(0, 0, copy_side, copy_side);
+      RenderColorInfo ms_copy_destination{};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(),
+                                                         ms_copy_destination, 0);
+      RenderExecutorTestAccess::ResetBindings(executor);
+      HW::RenderControl ms_copy_control{};
+      ms_copy_control.copy_depth_to_color = true;
+      ms_copy_control.copy_sample = 1;
+      ms_copy_control.copy_centroid = true;
+      registers.SetRenderControl(ms_copy_control);
+      RenderExecutorTestAccess::DrawAuto(executor, scheduler.Current(),
+                                         {.vertex_count = 3, .instance_count = 1});
+      const auto ms_copy_pixels = ReadCachedTexel(name, context, ms_copy_destination.image_id, {},
+                                                  {copy_side, copy_side, 1});
+      Require(name, "selected MS depth sample",
+              std::ranges::all_of(
+                  ms_copy_pixels,
+                  [](uint32_t value) { return value == std::bit_cast<uint32_t>(0.75f); }),
+              "DB-to-color copy selected the wrong sample or averaged the "
+              "depth samples");
+
+      auto &ms_stencil_image = texture_cache.GetImage(ms_copy_source.image_id);
+      ms_stencil_image.Transit(vk::ImageLayout::eTransferDstOptimal,
+                               vk::AccessFlagBits2::eTransferWrite, {},
+                               scheduler.Current().Handle());
+      const vk::ImageSubresourceRange one_stencil_layer{vk::ImageAspectFlagBits::eStencil, 0, 1, 0,
+                                                        1};
+      scheduler.Current().Handle().clearDepthStencilImage(
+          ms_stencil_image.backing.image, vk::ImageLayout::eTransferDstOptimal,
+          vk::ClearDepthStencilValue{0, 0x5a}, one_stencil_layer);
+      registers.SetColorBase(0, {.addr = base + 0x370000});
+      registers.SetColorInfo(0, {.format = Prospero::ChannelLayout::k8,
+                                 .channel_type = Prospero::ChannelType::kUInt,
+                                 .channel_order = Prospero::ChannelOrder::kStandard});
+      RenderColorInfo ms_stencil_destination{};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(),
+                                                         ms_stencil_destination, 0);
+      RenderExecutorTestAccess::ResetBindings(executor);
+      ms_copy_control.copy_depth_to_color = false;
+      ms_copy_control.copy_stencil_to_color = true;
+      registers.SetRenderControl(ms_copy_control);
+      RenderExecutorTestAccess::DrawIndex(executor, scheduler.Current(),
+                                          {.index_count = 3, .instance_count = 1});
+      const auto ms_stencil_pixels = ReadCachedTexel(name, context, ms_stencil_destination.image_id,
+                                                     {}, {copy_side, copy_side, 1});
+      Require(name, "multisampled stencil copy",
+              std::ranges::all_of(ms_stencil_pixels,
+                                  [](uint32_t value) { return value == 0x5a5a5a5au; }),
+              "multisampled stencil DB-to-color copy lost its integer values");
+      ms_copy_control.copy_depth_to_color = true;
+      ms_copy_control.copy_stencil_to_color = false;
+      registers.SetColorInfo(0, {.format = Prospero::ChannelLayout::k32,
+                                 .channel_type = Prospero::ChannelType::kFloat,
+                                 .channel_order = Prospero::ChannelOrder::kStandard});
+
+      // The destination may be a color alias of the depth source itself.
+      registers.SetRenderControl({});
+      auto in_place_target = ms_copy_target;
+      in_place_target.z_info.num_samples = 0;
+      in_place_target.z_read_base_addr = in_place_target.z_write_base_addr = base + 0x380000;
+      in_place_target.stencil_info = {};
+      in_place_target.stencil_read_base_addr = in_place_target.stencil_write_base_addr = 0;
+      registers.SetDepthRenderTarget(in_place_target);
+      registers.SetDepthControl(copy_seed_control);
+      RenderDepthInfo in_place_source{};
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(),
+                                                         in_place_source);
+      (void)texture_cache.FindDepthTarget(in_place_source.image_id, in_place_source.desc);
+      auto &in_place_image = texture_cache.GetImage(in_place_source.image_id);
+      in_place_image.Transit(vk::ImageLayout::eTransferDstOptimal,
+                             vk::AccessFlagBits2::eTransferWrite, {}, scheduler.Current().Handle());
+      const vk::ImageSubresourceRange one_depth_layer{vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1};
+      scheduler.Current().Handle().clearDepthStencilImage(
+          in_place_image.backing.image, vk::ImageLayout::eTransferDstOptimal,
+          vk::ClearDepthStencilValue{0.375f, 0}, one_depth_layer);
+      RenderExecutorTestAccess::ResetBindings(executor);
+      registers.SetDepthControl({});
+      registers.SetColorBase(0, {.addr = in_place_target.z_read_base_addr});
+      registers.SetColorAttrib3(0, {.tile_mode = Prospero::TileMode::kDepth, .dimension = 1});
+      ms_copy_control.copy_sample = 0;
+      registers.SetRenderControl(ms_copy_control);
+      RenderExecutorTestAccess::DrawAuto(executor, scheduler.Current(),
+                                         {.vertex_count = 3, .instance_count = 1});
+      RenderColorInfo in_place_destination{};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(),
+                                                         in_place_destination, 0);
+      const auto in_place_pixels = ReadCachedTexel(name, context, in_place_destination.image_id, {},
+                                                   {copy_side, copy_side, 1});
+      Require(name, "in-place depth expansion",
+              std::ranges::all_of(
+                  in_place_pixels,
+                  [](uint32_t value) { return value == std::bit_cast<uint32_t>(0.375f); }),
+              "in-place DB-to-color copy read stale guest memory or lost its "
+              "depth values");
+      RenderExecutorTestAccess::ResetBindings(executor);
+      registers = saved_copy_registers;
+      shaders = saved_copy_shaders;
 
       ShaderTextureResource copy_sample_descriptor{};
       copy_sample_descriptor.fields[0] =
@@ -38285,6 +38537,37 @@ void CheckPm4PolygonOffsetRegisters(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4PolygonOffset");
 }
 
+void CheckPm4DepthCopyControls(RenderContext &renderer) {
+  constexpr const char *name = "Pm4DepthCopyControls";
+  GraphicsInitJmpTables();
+  CommandProcessor processor(renderer, 0);
+  for (const bool indirect : {false, true}) {
+    for (const uint32_t value : {0x84u, 0x788u, 0xf8cu, 0u}) {
+      std::array<uint32_t, 2> registers{Pm4::DB_RENDER_CONTROL, value};
+      const auto address = reinterpret_cast<uint64_t>(registers.data());
+      const std::array<uint32_t, 3> direct{KYTY_PM4(3, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO),
+                                           Pm4::DB_RENDER_CONTROL, value};
+      const std::array<uint32_t, 5> indirect_packet{
+          KYTY_PM4(5, Pm4::IT_SET_CONTEXT_REG_INDIRECT, Pm4::R_ZERO),
+          static_cast<uint32_t>(address), static_cast<uint32_t>(address >> 32u), 0x80000000u, 1u};
+      Pm4Execution execution;
+      const auto packet =
+          indirect ? std::span<const uint32_t>(indirect_packet) : std::span<const uint32_t>(direct);
+      Require(name, "packet decoding",
+              processor.Process(execution, packet) == Pm4ProcessResult::Complete,
+              "DB copy controls aborted during register decoding");
+      const auto &control = processor.GetCtx().GetRenderControl();
+      Require(name, "copy state",
+              control.copy_depth_to_color == ((value & 4u) != 0) &&
+                  control.copy_stencil_to_color == ((value & 8u) != 0) &&
+                  control.copy_centroid == ((value & 0x80u) != 0) &&
+                  control.copy_sample == ((value >> 8u) & 0xfu),
+              "DB copy controls were lost or retained after being reset");
+    }
+  }
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckPm4DepthControlHighBits(RenderContext &renderer) {
   GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
@@ -39784,6 +40067,7 @@ int main(int argc, char **argv) {
     CheckPm4BlendColorRegisterRanges(vulkan.RuntimeRenderer());
     CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
     CheckPm4DepthControlHighBits(vulkan.RuntimeRenderer());
+    CheckPm4DepthCopyControls(vulkan.RuntimeRenderer());
     CheckPm4DepthRenderOverride(vulkan.RuntimeRenderer());
     CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
     return 0;
@@ -40112,6 +40396,7 @@ int main(int argc, char **argv) {
   CheckPm4BlendColorRegisterRanges(vulkan.RuntimeRenderer());
   CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
   CheckPm4DepthControlHighBits(vulkan.RuntimeRenderer());
+  CheckPm4DepthCopyControls(vulkan.RuntimeRenderer());
   CheckPm4DepthRenderOverride(vulkan.RuntimeRenderer());
   CheckShaderFusion();
   CheckPm4WaitPackets(vulkan.RuntimeRenderer());
