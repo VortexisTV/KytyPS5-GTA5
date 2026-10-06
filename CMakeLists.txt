@@ -348,6 +348,8 @@ set(gpu_blit_shader_sources
 	"${gpu_tiler_shader_dir}/gpu_blit_color_to_ms_depth.frag"
 	"${gpu_tiler_shader_dir}/gpu_video_out_overlay.frag"
 	"${gpu_tiler_shader_dir}/gpu_video_out_downscale.frag"
+	"${gpu_tiler_shader_dir}/gpu_dcc_clear_scan.comp"
+	"${gpu_tiler_shader_dir}/gpu_dcc_clear_fill.comp"
 )
 foreach(shader_source IN LISTS gpu_blit_shader_sources)
 	get_filename_component(shader_name "${shader_source}" NAME_WE)
