@@ -68,7 +68,9 @@ void GpuResourceManager::MapMemory(uint64_t vaddr, uint64_t size) {
         std::lock_guard lock(m_mapped_ranges_mutex);
         m_mapped_ranges.Add(vaddr, size);
     }
-    m_mapping_epoch.fetch_add(1, std::memory_order_release);
+
+    // A newly mapped range must participate in the next selective BDA pass.
+    m_buffer_cache.PublishBdaHints(vaddr, size);
 }
 
 void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -98,28 +100,35 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
 
 void GpuResourceManager::PrepareBda() {
 	PerfStats::Span span(PerfStats::SpanId::BdaPrepare);
-	// A DMA shader can read any cached buffer, so a pass synchronizes every one of them, and one
-	// is requested before every DMA draw and dispatch. After a complete pass, another can only
-	// find something to upload once a page turns CPU-dirty, hot pages come due, a buffer is added
-	// or removed, or the GPU mappings change; each of those advances the epoch. The epoch is read
-	// before the pass, so a change made while the pass runs makes the next request repeat it.
-	const auto epoch =
-	    m_buffer_cache.SynchronizationEpoch() + m_mapping_epoch.load(std::memory_order_acquire);
-	if (m_bda_epoch == epoch) {
-		PerfStats::Add(PerfStats::CounterId::BdaPassesSkipped);
-	} else {
-		std::shared_lock lock(m_mapped_ranges_mutex);
-		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-			m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-		});
-		m_bda_epoch = epoch;
+
+	std::shared_lock lock(m_mapped_ranges_mutex);
+
+	switch (Config::GetBdaSyncMode()) {
+		case Config::BdaSyncMode::Legacy:
+			m_buffer_cache.SynchronizeBdaLegacy(m_mapped_ranges);
+			break;
+
+		case Config::BdaSyncMode::Selective: {
+			if (!m_buffer_cache.SynchronizeBdaSelective(m_mapped_ranges)) {
+				m_buffer_cache.SynchronizeBdaLegacy(m_mapped_ranges);
+			}
+			break;
+		}
+
+		case Config::BdaSyncMode::SelectiveChecked: {
+			if (!m_buffer_cache.SynchronizeBdaSelective(m_mapped_ranges)) {
+				m_buffer_cache.SynchronizeBdaLegacy(m_mapped_ranges);
+			}
+			EXIT_IF(!m_buffer_cache.CheckBdaHintInvariant(m_mapped_ranges));
+			break;
+		}
 	}
+
 	m_fault_process_pending = true;
 }
 
 void GpuResourceManager::RunGarbageCollector() {
 	PerfStats::Span span(PerfStats::SpanId::GarbageCollect);
-	RegionManager::AdvanceGeneration();
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();
