@@ -629,7 +629,7 @@ static void AaCheck(const HW::AaSampleControl& c, const HW::AaConfig& cf) {
 }
 
 uint64_t DrawPhaseTimer::Hash() {
-	static const uint64_t hash = [] {
+	static const uint64_t hash = []() -> uint64_t {
 		const char* text = std::getenv("KYTY_DEBUG_DRAW_PHASES");
 		if (text == nullptr) {
 			return uint64_t {0};
