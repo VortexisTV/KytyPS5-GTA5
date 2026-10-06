@@ -10,6 +10,24 @@ namespace Common {
 
 void InitializeThreads();
 
+// Raises the calling thread's scheduling priority for the emulator threads that limit the frame
+// rate: Thread_Gpu and, with deferred recording, the thread that records its commands.
+// KYTY_CP_PRIORITY: 0 = leave unchanged, 1 = above normal (default), 2 = highest. Also opts the
+// thread out of Windows power throttling (EcoQoS). No-op elsewhere.
+void RaiseCurrentThreadPriority();
+
+// The same for the short-running service threads Thread_Gpu waits on: the video-out present
+// thread, the Vulkan queue-submission thread and the command scheduler's priority (completion)
+// thread. They block between bursts and never spin; at a guest thread's priority a readied one
+// waits for that thread's quantum to end whenever all CPUs are busy. KYTY_SERVICE_PRIORITY:
+// 0 = leave unchanged, 1 = above normal, 2 = highest (default). No-op elsewhere.
+void RaiseServiceThreadPriority();
+[[nodiscard]] int ServiceThreadPriorityLevel();
+
+// sched_yield: gives the processor to another thread that is ready to run on this CPU and
+// returns at once when there is none (FreeBSD sched_relinquish). True when another thread ran.
+bool YieldToReadyThread();
+
 using thread_func_t    = void (*)(void*);
 using wait_poll_func_t = void (*)();
 

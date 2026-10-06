@@ -1069,19 +1069,30 @@ void KernelDispatchPendingSignalForCurrentThread() {
 		return;
 	}
 
-	for (int signum = 0; signum < static_cast<int>(std::size(g_exception_handlers)); signum++) {
-		if (!PthreadTakePendingSignal(current, signum)) {
-			continue;
+	int signum = -1;
+	if (GuestSchedLegacy()) {
+		for (int candidate = 0; candidate < static_cast<int>(std::size(g_exception_handlers));
+		     candidate++) {
+			if (PthreadTakePendingSignal(current, candidate)) {
+				signum = candidate;
+				break;
+			}
 		}
-
-		auto* handler = reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum]);
-		if (handler != nullptr) {
-			SignalDispatchScope scope;
-			auto                ctx = CreateSignalUcontext();
-			SanitizeNonGuestSignalUcontext(&ctx, current);
-			handler(signum, &ctx);
-		}
+	} else {
+		// One load when nothing is pending; otherwise the same lowest-first take as the scan.
+		signum = PthreadTakeLowestPendingSignal(current,
+		                                        static_cast<int>(std::size(g_exception_handlers)));
+	}
+	if (signum < 0) {
 		return;
+	}
+
+	auto* handler = reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum]);
+	if (handler != nullptr) {
+		SignalDispatchScope scope;
+		auto                ctx = CreateSignalUcontext();
+		SanitizeNonGuestSignalUcontext(&ctx, current);
+		handler(signum, &ctx);
 	}
 }
 

@@ -115,6 +115,11 @@ void                  PthreadWakeForSignal(Pthread thread);
 void                  PthreadQueuePendingSignal(Pthread thread, int signum);
 bool                  PthreadHasPendingSignal(Pthread thread, int signum);
 bool                  PthreadTakePendingSignal(Pthread thread, int signum);
+// The lowest pending signal below `limit`, taken; -1 when none (one load in that case).
+int PthreadTakeLowestPendingSignal(Pthread thread, int limit);
+// KYTY_GUEST_SCHED=legacy restores the old guest scheduling calls: sched_yield adds Sleep(0) after
+// an empty SwitchToThread, and signal polls scan all 64 bits.
+[[nodiscard]] bool GuestSchedLegacy();
 bool PthreadGetGuestStack(Pthread thread, uint64_t* stack_addr, uint64_t* stack_size);
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 bool TestGuestStackOwnerLifecycle(uint64_t* first_address, uint64_t* second_address,

@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/threads.h"
 #include "graphics/host_gpu/gpuCrashDiagnostics.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandHooks.h"
@@ -316,6 +317,7 @@ void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& ope
 }
 
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
+	Common::RaiseServiceThreadPriority();
 	while (!stop.stop_requested()) {
 		PendingOperation operation;
 		{
@@ -691,9 +693,13 @@ void CommandScheduler::EnableAsyncSubmit() {
 void CommandScheduler::SubmitThread(std::stop_token stop) {
 	KYTY_PROFILER_THREAD("GpuQueueSubmit");
 	if (m_stream != nullptr) {
+		// Deferred recording: this thread records Thread_Gpu's commands and limits the frame rate
+		// with it.
+		Common::RaiseCurrentThreadPriority();
 		m_stream->Consume(stop);
 		return;
 	}
+	Common::RaiseServiceThreadPriority();
 	for (;;) {
 		SubmitJob job;
 		{

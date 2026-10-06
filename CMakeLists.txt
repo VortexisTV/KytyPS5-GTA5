@@ -504,6 +504,13 @@ add_executable(perf_stats_tests EXCLUDE_FROM_ALL
 target_link_libraries(perf_stats_tests common)
 target_include_directories(perf_stats_tests PRIVATE ${inc_headers})
 
+# Service-thread priority, sched_yield and the pending-signal fast path.
+add_executable(thread_service_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ThreadServiceTests.cpp"
+)
+target_link_libraries(thread_service_tests common)
+target_include_directories(thread_service_tests PRIVATE ${inc_headers})
+
 add_executable(ime_dialog_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImeDialogTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/imeCommon.cpp"
@@ -689,6 +696,7 @@ if(BUILD_TESTING)
 	add_test(NAME shader_precompile_record COMMAND $<TARGET_FILE:shader_precompile_record_tests>)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME perf_stats COMMAND $<TARGET_FILE:perf_stats_tests>)
+	add_test(NAME thread_service COMMAND $<TARGET_FILE:thread_service_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
@@ -781,6 +789,7 @@ if(BUILD_TESTING)
 		shader_precompile_record_tests
 		lru_cache_tests
 		perf_stats_tests
+		thread_service_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests

@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <chrono>             // IWYU pragma: keep
 #include <condition_variable> // IWYU pragma: keep
+#include <cstdlib>
 #include <mutex>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && KYTY_COMPILER == KYTY_COMPILER_CLANG
@@ -185,6 +186,56 @@ static std::atomic<int> g_thread_counter = 0;
 void InitializeThreads() {
 	g_main_thread     = std::this_thread::get_id();
 	g_main_thread_int = Thread::GetThreadIdUnique();
+}
+
+#ifdef KYTY_WIN_CS
+static void RaiseCurrentThreadPriorityLevel(int level) {
+	if (level == 0) {
+		return;
+	}
+	auto* thread = GetCurrentThread();
+	(void)SetThreadPriority(thread, level == 2 ? THREAD_PRIORITY_HIGHEST
+	                                           : THREAD_PRIORITY_ABOVE_NORMAL);
+	// Keep the thread off efficiency scheduling (EcoQoS) even when the window is in the
+	// background.
+	THREAD_POWER_THROTTLING_STATE throttling {};
+	throttling.Version     = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+	throttling.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+	throttling.StateMask   = 0;
+	(void)SetThreadInformation(thread, ThreadPowerThrottling, &throttling, sizeof(throttling));
+}
+#endif
+
+static int PriorityLevelFromEnv(const char* name, int fallback) {
+	const char* value = std::getenv(name);
+	return value != nullptr && value[0] >= '0' && value[0] <= '2' ? value[0] - '0' : fallback;
+}
+
+void RaiseCurrentThreadPriority() {
+#ifdef KYTY_WIN_CS
+	static const int level = PriorityLevelFromEnv("KYTY_CP_PRIORITY", 1);
+	RaiseCurrentThreadPriorityLevel(level);
+#endif
+}
+
+int ServiceThreadPriorityLevel() {
+	static const int level = PriorityLevelFromEnv("KYTY_SERVICE_PRIORITY", 2);
+	return level;
+}
+
+void RaiseServiceThreadPriority() {
+#ifdef KYTY_WIN_CS
+	RaiseCurrentThreadPriorityLevel(ServiceThreadPriorityLevel());
+#endif
+}
+
+bool YieldToReadyThread() {
+#ifdef KYTY_WIN_CS
+	return SwitchToThread() != 0;
+#else
+	std::this_thread::yield();
+	return true;
+#endif
 }
 
 Thread::Thread(thread_func_t func, void* arg)
