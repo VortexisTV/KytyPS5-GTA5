@@ -8,6 +8,8 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/drainStats.h"
+#include "graphics/host_gpu/renderer/gpuZones.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "kernel/memory.h"
 
@@ -26,6 +28,9 @@ constexpr size_t MaxPageFaults    = 1024;
 constexpr size_t PageFaultAreaSize = MaxPageFaults * sizeof(uint64_t);
 // One bit per page for any uncached DMA access, then one per page for a dropped DMA store.
 constexpr size_t FaultBitmapBytes = BufferCache::CACHING_NUMPAGES / 8;
+// fault_buffer_process.comp splits the two bitmaps at ACCESS_WORDS, which spells this out.
+static_assert(BufferCache::CACHING_NUMPAGES ==
+              (uint64_t {3} << (39u - BufferCache::CACHING_PAGEBITS)));
 
 } // namespace
 
@@ -84,6 +89,7 @@ FaultManager::~FaultManager() {
 void FaultManager::ProcessFaultBuffer() {
 	const GpuWaitScope wait_scope(PerfStats::SpanId::GpuWaitFaults);
 	if (const auto wait_tick = m_fault_areas[m_current_area]; wait_tick != 0) {
+		DrainStats::ReasonScope reason(DrainStats::Reason::FaultBuffer);
 		m_scheduler.Wait(wait_tick);
 		m_scheduler.PopPendingOperations();
 	}
@@ -121,6 +127,7 @@ void FaultManager::ProcessFaultBuffer() {
 
 	m_scheduler.EndRendering();
 	auto command = m_scheduler.Current().Handle();
+	GpuZones::Mark(command, DrainStats::Zone::FaultBuffer);
 	vk::DependencyInfo dependency {};
 	dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
 	dependency.bufferMemoryBarrierCount = 1;
@@ -152,7 +159,7 @@ void FaultManager::ProcessFaultBuffer() {
 		constexpr uint64_t    StoreGranule = 4ull * 1024ull * 1024ull;
 		std::vector<uint64_t> dropped_stores;
 		for (uint32_t index = 1; index <= count; ++index) {
-			const auto page = faults[index] & ~uint64_t {1};
+			const auto page = BufferCache::GuestAddress(faults[index] & ~uint64_t {1});
 			if ((faults[index] & 1u) != 0) {
 				dropped_stores.push_back(page);
 				fault_ranges.Add(page & ~(StoreGranule - 1u), StoreGranule);

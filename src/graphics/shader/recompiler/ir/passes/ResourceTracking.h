@@ -5,9 +5,8 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
-// Collects immutable resource topology from typed SSA handles, interns their resolved dwords in
-// descriptor_sources, then writes dense indices to handle flags and MemoryInfo.
-void TrackResources(Program& program);
+// Resolves native descriptor sources, plans their scalar reads, and assigns dense resource bindings.
+void TrackResources(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg);
 
 // A compute shader's images whose descriptors it picks per lane, such as the material textures of
 // ray-tracing hits, read a mid-grey, opaque stand-in until such texture tables are bound, rather

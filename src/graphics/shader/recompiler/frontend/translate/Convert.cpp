@@ -1,7 +1,5 @@
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
-#include <bit>
-
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
 IR::F32 Translator::SelectF32(IR::U1 condition, IR::F32 true_value, IR::F32 false_value) {
@@ -51,51 +49,6 @@ void Translator::V_CVT_F32_UBYTE(const Decoder::Instruction& inst, uint32_t byte
 void Translator::V_CVT_F32_U32(const Decoder::Instruction& inst) {
 	WriteOperand(DestinationOperand(inst),
 	             ir.Emit(IR::ValueOpcode::ConvertF32U32, {ReadU32(SourceAt(inst, 0))}));
-}
-
-// A double operand: a register pair, or a constant that encodes a double. A float inline constant
-// becomes the same value as a double, and a literal holds the double's high DWORD.
-IR::U64 Translator::ReadF64Bits(const Decoder::Operand& operand) {
-	const auto constant = [&](uint64_t bits) {
-		return ir.ConstructU64(IR::U32(IR::Value(static_cast<uint32_t>(bits))),
-		                       IR::U32(IR::Value(static_cast<uint32_t>(bits >> 32u))));
-	};
-	if (operand.kind == Decoder::OperandKind::FloatInlineConstant) {
-		return constant(std::bit_cast<uint64_t>(
-		    static_cast<double>(std::bit_cast<float>(operand.value))));
-	}
-	if (operand.kind == Decoder::OperandKind::LiteralConstant) {
-		return constant(static_cast<uint64_t>(operand.value) << 32u);
-	}
-	return ReadU64(operand);
-}
-
-bool Translator::Float64Instruction(const Decoder::Instruction& inst) {
-	using O = Decoder::Opcode;
-	IR::Value result;
-	switch (inst.opcode) {
-		case O::V_CVT_F64_I32:
-			result = ir.Emit(IR::ValueOpcode::ConvertF64S32, {ReadU32(SourceAt(inst, 0))});
-			break;
-		case O::V_CVT_F64_F32:
-			result = ir.Emit(IR::ValueOpcode::ConvertF64F32,
-			                 {ReadOperand(SourceAt(inst, 0), IR::Type::F32)});
-			break;
-		case O::V_CVT_F32_F64:
-			result = ir.Emit(IR::ValueOpcode::ConvertF32F64, {ReadF64Bits(SourceAt(inst, 0))});
-			break;
-		case O::V_FRACT_F64:
-			result = ir.Emit(IR::ValueOpcode::FPFract64, {ReadF64Bits(SourceAt(inst, 0))});
-			break;
-		case O::V_FMA_F64:
-			result = ir.Emit(IR::ValueOpcode::FPFma64,
-			                 {ReadF64Bits(SourceAt(inst, 0)), ReadF64Bits(SourceAt(inst, 1)),
-			                  ReadF64Bits(SourceAt(inst, 2))});
-			break;
-		default: return false;
-	}
-	WriteOperand(DestinationOperand(inst), result);
-	return true;
 }
 
 void Translator::V_CVT_F32_I32(const Decoder::Instruction& inst) {

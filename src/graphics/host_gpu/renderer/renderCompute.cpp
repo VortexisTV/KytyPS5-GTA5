@@ -13,6 +13,8 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/gpuCrashDiagnostics.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/gpuZones.h"
 #include "graphics/host_gpu/renderer/frameDump.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
@@ -289,7 +291,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_z, uint32_t mode) {
 	PerfStats::Span dispatch_span(PerfStats::SpanId::Dispatch);
 	EXIT_IF(buffer.IsInvalid());
-	m_context.GetCommandScheduler().PopPendingOperations();
+	m_context.GetCommandScheduler().PopPendingOperations(false);
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -344,10 +346,16 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderComputeInputInfo input_info {};
 	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
-	const auto compute_program =
-	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	const auto compute_program = [&] {
+		DrainStats::SlowLookupTimer compile_timer(DrainStats::Kind::ShaderCompile);
+		return m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	}();
 	if (!compute_program) {
 		// Temporary until RT is implemented.
+		return;
+	}
+	if (DebugSkipShader(input_info.stage.program->shader_hash, DebugShaderKind::Compute))
+	    [[unlikely]] {
 		return;
 	}
 	if (use_thread_dimensions) {
@@ -454,8 +462,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	buffer.EndRendering();
-	auto& pipeline =
-	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	auto& pipeline = [&]() -> PipelineCache::Pipeline& {
+		DrainStats::SlowLookupTimer create_timer(DrainStats::Kind::PipelineCreate);
+		return m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	}();
 	auto& bindings = m_compute_bindings;
 	bool has_storage_writes = HasShaderBufferWrites(input_info.stage);
 	has_storage_writes =
@@ -498,6 +508,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			}
 		}
 		RebindImages(bindings);
+		if (ImageUsersEnabled()) [[unlikely]] {
+			PreparedBindings* const compute_stages[] {&bindings};
+			NoteImageUsers(m_context.GetTextureCache(), compute_stages, {}, nullptr, 0,
+			               input_info.stage.program->shader_hash);
+		}
 		RebindBuffers(bindings);
 
 		vk_buffer                          = buffer.Handle();
@@ -509,6 +524,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			// ordering while allowing the queue to execute asynchronously.
 			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 		}
+		if (DebugFullBarriers()) [[unlikely]] {
+			m_context.GetCommandScheduler().EndRendering();
+			RecordFullBarrier(vk_buffer);
+		}
+		GpuZones::Mark(vk_buffer, DrainStats::Zone::GameDispatch,
+		               input_info.stage.program->shader_hash);
 		ResetLoopWatchdogDispatchClock(m_context, vk_buffer, program);
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 		if (use_thread_dimensions) {
@@ -568,6 +589,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	MarkGpuCheckpoint(m_context.GetGraphics(), vk_buffer, GpuCheckpointKind::DispatchDone,
 	                  submit_id, {&program.shader_hash, 1});
+	m_context.GetBufferCache().OnCommandRecorded();
 	ResetBindings();
 }
 
@@ -576,7 +598,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	PerfStats::Span dispatch_span(PerfStats::SpanId::Dispatch);
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
 	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
-	m_context.GetCommandScheduler().PopPendingOperations();
+	m_context.GetCommandScheduler().PopPendingOperations(false);
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchIndirect), submit_id,
 	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
 	                    0, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);
@@ -586,14 +608,24 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 	ShaderComputeInputInfo input_info {};
-	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
-	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	const auto compute_program = [&] {
+		DrainStats::SlowLookupTimer compile_timer(DrainStats::Kind::ShaderCompile);
+		return m_context.GetPipelineCache().GetComputeProgram(
+		    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	}();
 	if (!compute_program) {
 		// Temporary until RT is implemented.
 		return;
 	}
+	if (DebugSkipShader(input_info.stage.program->shader_hash, DebugShaderKind::Compute))
+	    [[unlikely]] {
+		return;
+	}
 	buffer.EndRendering();
-	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	auto& pipeline = [&]() -> PipelineCache::Pipeline& {
+		DrainStats::SlowLookupTimer create_timer(DrainStats::Kind::PipelineCreate);
+		return m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	}();
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	FindBuffers(bindings);
@@ -604,6 +636,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		m_context.PrepareBda();
 	}
 	RebindImages(bindings);
+	if (ImageUsersEnabled()) [[unlikely]] {
+		PreparedBindings* const compute_stages[] {&bindings};
+		NoteImageUsers(m_context.GetTextureCache(), compute_stages, {}, nullptr, 0,
+		               input_info.stage.program->shader_hash);
+	}
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
 	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
@@ -629,6 +666,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                              vk::PipelineStageFlagBits::eTransfer,
 	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
 	                          1, &barrier, 0, nullptr, 0, nullptr);
+	if (DebugFullBarriers()) [[unlikely]] {
+		m_context.GetCommandScheduler().EndRendering();
+		RecordFullBarrier(vk_buffer);
+	}
+	GpuZones::Mark(vk_buffer, DrainStats::Zone::GameDispatch, input_info.stage.program->shader_hash);
 	ResetLoopWatchdogDispatchClock(m_context, vk_buffer, program);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	// The group counts live in GPU memory; the arguments name the guest address they come from.
@@ -639,6 +681,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	MarkGpuCheckpoint(m_context.GetGraphics(), vk_buffer, GpuCheckpointKind::DispatchDone,
 	                  submit_id, {&program.shader_hash, 1});
+	m_context.GetBufferCache().OnCommandRecorded();
 	ResetBindings();
 }
 

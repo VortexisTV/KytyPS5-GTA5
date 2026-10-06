@@ -11,9 +11,12 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
-#include <atomic>
+#include <array>
+#include <chrono>
+#include <deque>
 #include <map>
 #include <span>
+#include <unordered_map>
 #include <utility>
 #include <string>
 #include <vector>
@@ -31,9 +34,21 @@ class BufferCache {
 public:
 	static constexpr uint32_t CACHING_PAGEBITS  = 14;
 	static constexpr uint64_t CACHING_PAGESIZE  = uint64_t {1} << CACHING_PAGEBITS;
-	static constexpr uint64_t CACHING_NUMPAGES  = uint64_t {1} << (40 - CACHING_PAGEBITS);
+	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
 	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
+
+	static constexpr uint64_t PageIndex(uint64_t address) {
+		return (address < LOWER_ADDRESS_SIZE
+		            ? address
+		            : address - LibKernel::Memory::kExtendedMemoryBase + LOWER_ADDRESS_SIZE) >>
+		       CACHING_PAGEBITS;
+	}
+	static constexpr uint64_t GuestAddress(uint64_t offset) {
+		return offset < LOWER_ADDRESS_SIZE
+		           ? offset
+		           : offset - LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemoryBase;
+	}
 
 	BufferCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
 	            TextureCache& texture_cache);
@@ -44,38 +59,36 @@ public:
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
+	// FindBuffer, keeping `id` while it is a live buffer covering the range (as ObtainBuffer does):
+	// buffers never overlap, so a live buffer over the range is the one FindBuffer would find.
+	[[nodiscard]] BufferId RefindBuffer(BufferId id, uint64_t vaddr, uint64_t size) {
+		return !IsBufferInvalid(id) && m_slot_buffers[id].IsInBounds(vaddr, size)
+		           ? id
+		           : FindBuffer(vaddr, size);
+	}
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
 	                                                        BufferId id              = {});
-	// Counts GPU writes through the cache that overlap the range, so a caller can tell whether
-	// GPU-owned bytes changed without reading them back. The first call starts watching the range;
-	// only writes after it are counted.
-	[[nodiscard]] uint64_t GpuWriteCount(uint64_t vaddr, uint64_t size);
-	// Keeps CPU writes to the range faulting: a hot page stays writable, and the texture cache
-	// learns about CPU writes to an image only from faults.
-	void ClearHotPages(uint64_t vaddr, uint64_t size) {
-		m_memory_tracker.ClearHotPagesIfAny(vaddr, size);
-	}
-
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return m_staging_buffer;
-			case MemoryUsage::Stream: return m_stream_buffer;
+			case MemoryUsage::Stream: return ActiveStream();
 			case MemoryUsage::Download: return m_download_buffer;
 			case MemoryUsage::DeviceLocal: return m_device_buffer;
 		}
 		EXIT("BufferCache: invalid utility-buffer usage\n");
 	}
+	// The ring that per-draw stream copies go to (see bufferCache.cpp).
+	[[nodiscard]] StreamBuffer& ActiveStream() noexcept;
+	// Device-addressable ring for per-draw parameter records that shaders load by address.
+	[[nodiscard]] StreamBuffer& GetDrawRecordBuffer() noexcept { return m_draw_record_buffer; }
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] Buffer* GetLoopWatchdogBuffer() noexcept { return &m_loop_watchdog_buffer; }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
-	// Stores bytes the GPU has not written into a page it owns without taking the page back.
-	// Returns false when the store has to go through guest memory the usual way.
-	[[nodiscard]] bool TryWriteBesideGpu(uint64_t vaddr, std::span<const uint8_t> data);
 	// Reads guest bytes from the cached buffer holding them, waiting for the GPU work recorded so
 	// far. Returns false when no buffer caches them or the CPU changed them since the upload, so
 	// guest memory holds the latest bytes. A shader's DMA stores reach only the cached copy.
@@ -87,28 +100,33 @@ public:
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool IsPageGpuDirtyHint(uint64_t vaddr) const noexcept {
+		return m_memory_tracker.IsPageGpuDirtyHint(vaddr);
+	}
+	// Changes whenever bytes become GPU-dirty or a download starts, which is also the only way a
+	// GPU-dirty range can become clean again (see m_clean_pages). GPU thread only.
+	[[nodiscard]] uint64_t GpuDirtyGeneration() const noexcept { return m_gpu_dirty_generation; }
+	// Eager readback of hot pages: memory that CPU reads have faulted on. A write recorded to a
+	// hot page is downloaded at the next flush point, so its bytes are usually published before
+	// the CPU reads them again. OnCommandRecorded() marks writes of the bindings obtained so far
+	// as recorded; only recorded writes are downloaded.
+	void               OnCommandRecorded();
+	void               RecordEagerReadbacks();
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	void               PublishBdaHints(uint64_t vaddr, uint64_t size) noexcept;
+	void               SynchronizeBdaLegacy(const RangeSet& mapped);
+	[[nodiscard]] bool SynchronizeBdaSelective(const RangeSet& mapped);
+	[[nodiscard]] bool CheckBdaHintInvariant(const RangeSet& mapped);
 	// For diagnostics: copies the bytes the buffer caching the range holds, whatever its tracking
 	// says, and waits for them (see DiagnosticMemoryReader).
 	void ReadDiagnosticMemory(uint64_t vaddr, uint64_t size, std::vector<uint8_t>& gpu,
 	                          std::vector<uint8_t>& cpu, std::string& note);
-	// Advances whenever SynchronizeBuffersInRange could upload something over ranges it has
-	// already synchronized: new work in the memory tracker, or a buffer registered or removed.
-	[[nodiscard]] uint64_t SynchronizationEpoch() const noexcept {
-		// Both counters only grow, so their sum changes whenever either does.
-		return m_memory_tracker.UploadEpoch() + m_layout_epoch.load(std::memory_order_acquire);
-	}
 	void               RunGarbageCollector();
-	// Records host-visible shadows of hot readback buffers written since the last call. Call
-	// before every submit so a CPU read never has to drain the GPU for data already produced.
-	void RecordHotShadows();
-	// Whether a draw or dispatch just wrote a buffer that should be shadowed and submitted now,
-	// rather than at the next flush.
-	[[nodiscard]] bool EagerShadowPending() const noexcept { return m_eager_shadow_pending; }
 
 private:
 	friend struct BufferCacheTestAccess;
+	friend struct PerformanceMemoryTestAccess;
 
 	bool IsBufferInvalid(BufferId id) const {
 		const auto* buffer = m_slot_buffers.try_get(id);
@@ -124,7 +142,7 @@ private:
 		bool                has_stream_leap;
 	};
 
-	using PageTable = MultiLevelPageTable<BufferId, CACHING_PAGEBITS, 40, 16>;
+	using PageTable = MultiLevelPageTable<BufferId, CACHING_PAGEBITS, 44, 20>;
 	static_assert(CACHING_PAGESIZE == (uint64_t {1} << PageTable::kPageBits));
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
 	void TouchBuffer(const Buffer& buffer);
@@ -141,41 +159,26 @@ private:
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
-	// Queues backing publication; callers wait before clearing dirty pages or reusing their data.
+	// Records downloads of the range's unarmed GPU-dirty pages, arms them, and queues their
+	// publication, which finalizes them. Returns false when there was nothing to arm.
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Records copies of `buffer` into the download ring; returns where the ring maps them.
-	[[nodiscard]] std::pair<uint8_t*, uint64_t> RecordDownload(Buffer&                     buffer,
+	[[nodiscard]] std::pair<uint8_t*, uint64_t> RecordDownload(Buffer&                      buffer,
 	                                                           std::vector<vk::BufferCopy>& copies,
 	                                                           uint64_t total_size);
-	void WriteBackShadow(BufferId id, uint64_t tick);
-	void WriteHostMemory(uint64_t vaddr, std::span<const uint8_t> data);
-	// A readback the GPU thread has submitted and a faulting guest thread waits for; zero id when
-	// the readback completed on the spot.
-	struct ReadbackTicket {
-		uint64_t id   = 0;
-		uint64_t tick = 0;
-	};
-	struct PendingReadback {
-		struct Part {
-			uint64_t address = 0;
-			uint64_t offset  = 0; // in m_download_buffer
-			uint64_t size    = 0;
-		};
-		uint64_t          id          = 0;
-		uint64_t          tick        = 0; // the submission that produces the bytes
-		uint64_t          after_tick  = 0; // CurrentTick() once it was submitted
-		uint64_t          fault_vaddr = 0; // for a synchronous retry
-		uint64_t          fault_size  = 0;
-		uint64_t          vaddr       = 0; // the range whose ownership passes to the CPU
-		uint64_t          size        = 0;
-		bool              is_write    = false;
-		bool              downloaded  = false; // copied now rather than served by a shadow
-		bool              valid       = true;  // no GPU write to the range since the copy
-		std::vector<Part> parts;
-	};
-	ReadbackTicket ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write,
-	                               bool allow_async = false);
-	void           FinishReadback(uint64_t id);
+	// Thread_Gpu: arms the readback window around [vaddr, vaddr+size).
+	void RecordReadback(uint64_t vaddr, uint64_t size, bool is_write);
+	// Other threads: publish GPU-dirty pages without draining Thread_Gpu.
+	void ReadMemoryAsync(uint64_t vaddr, uint64_t size, bool is_write);
+	void MarkReadbackHot(uint64_t vaddr);
+	void QueueEagerReadback(uint64_t vaddr, uint64_t size);
+	// Whether a recorded download of these bytes has not finished publishing.
+	[[nodiscard]] bool InFlightIntersects(uint64_t vaddr, uint64_t size);
+	void               PruneInFlight();
+	[[nodiscard]] bool SynchronizeBdaWord(size_t word, const RangeSet& mapped);
+	[[nodiscard]] bool SynchronizeBdaRegion(uint64_t region, const RangeSet& mapped);
+	[[nodiscard]] bool SynchronizeDirtyOwners(const RegionBits& dirty, uint64_t region_begin,
+	                                          uint64_t begin, uint64_t end);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -189,27 +192,64 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
-	std::vector<BufferId>                             m_hot_written;
-	bool                                              m_eager_shadow_pending = false;
-	std::vector<PendingReadback>                      m_pending_readbacks;
-	uint64_t                                          m_next_readback_id = 1;
-	struct WriteWatch {
-		uint64_t size   = 0;
-		uint64_t writes = 0;
-	};
-	std::map<uint64_t, WriteWatch>                    m_write_watches;
-	uint64_t                                          m_write_watch_span = 0; // largest watch
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
+	StreamBuffer                                      m_draw_record_buffer;
+	// KYTY_DEBUG_AB=streamhost: a stream ring in device memory for the A/B (see ActiveStream).
+	std::unique_ptr<StreamBuffer> m_stream_device;
 	TextureCache&                                     m_texture_cache;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
-	std::atomic_uint64_t m_layout_epoch {0};
+	uint64_t m_readback_token     = 0;
+	// Tracker pages hit by CPU read faults, with the tick of their latest fault.
+	static constexpr size_t HotReadbackPages = 64;
+	std::unordered_map<uint64_t, uint64_t> m_hot_pages;
+	std::vector<uint64_t>                  m_eager_pending; // Written by unrecorded commands.
+	std::vector<uint64_t>                  m_eager_ready;   // Written by recorded commands.
+	// Downloaded byte ranges whose backing is not written yet, oldest first. They left
+	// m_gpu_modified_ranges when recorded; the other bytes of their pages are already valid.
+	struct InFlightDownload {
+		uint64_t                                   tick = 0;
+		std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	};
+	std::deque<InFlightDownload> m_inflight_downloads;
+	// HasGpuDirtyBytes: tracker pages found clean, valid while m_gpu_dirty_generation is
+	// unchanged. It is bumped when bytes become GPU-dirty or a download starts; nothing else can
+	// dirty a page. GPU thread only, like HasGpuDirtyBytes.
+	struct CleanPage {
+		uint64_t page       = UINT64_MAX;
+		uint64_t generation = 0;
+	};
+	std::array<CleanPage, 64> m_clean_pages {};
+	uint64_t                  m_gpu_dirty_generation = 1;
+	// ObtainBuffer's stream-ring copies of the current BDA epoch, by range (see there).
+	struct StreamCopy {
+		uint64_t vaddr        = 0;
+		uint64_t size         = 0;
+		uint64_t epoch        = 0; // 0: none.
+		uint64_t tick         = 0;
+		uint64_t gpu_writes   = 0; // m_gpu_dirty_generation.
+		uint64_t image_writes = 0; // TextureCache::GpuModifiedGeneration.
+		Buffer*  stream       = nullptr;
+		uint64_t offset       = 0;
+	};
+	static constexpr size_t StreamCopySlots = 4096;
+	std::vector<StreamCopy> m_stream_copies = std::vector<StreamCopy>(StreamCopySlots);
+	// KYTY_VERIFY_STREAM_REUSE=1: whether to copy again anyway (after comparing; see there).
+	[[nodiscard]] static bool VerifyStreamReuse(const StreamCopy& copy);
+	// ObtainBufferForImage's staged uploads, by range, with the time of the latest.
+	struct ImageStage {
+		uint64_t                              vaddr = 0;
+		uint64_t                              size  = 0;
+		std::chrono::steady_clock::time_point time {};
+	};
+	std::array<ImageStage, 256> m_image_stages {};
+	[[nodiscard]] bool          IsRepeatedImageStage(uint64_t vaddr, uint64_t size);
 };
 
 } // namespace Libs::Graphics

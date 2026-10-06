@@ -2,8 +2,6 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_REGIONMANAGER_H_
 
 #include "common/assert.h"
-#include "common/emulatorConfig.h"
-#include "common/perfStats.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
@@ -13,7 +11,6 @@
 #include <memory>
 #include <mutex>
 #include <utility>
-#include <xxhash.h>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #ifndef NOMINMAX
@@ -75,11 +72,39 @@ private:
 };
 
 static_assert(std::atomic_uint32_t::is_always_lock_free);
+static_assert(std::atomic<uint64_t>::is_always_lock_free);
+
+// Sets region hint bits, then the hint word's summary bit. Consumers exchange a summary word
+// before its hint words, so a publisher that sees its summary bit already set (sequentially
+// consistent with that exchange) knows the consumer will still claim these hint bits.
+inline void PublishBdaHintBits(std::atomic<uint64_t>& hint_word, uint64_t bits,
+                               std::atomic<uint64_t>& summary_word,
+                               uint64_t summary_bit) noexcept {
+	hint_word.fetch_or(bits, std::memory_order_seq_cst);
+	// Skip the shared read-modify-write when possible: one summary word covers 16 GiB.
+	if ((summary_word.load(std::memory_order_seq_cst) & summary_bit) == 0) {
+		summary_word.fetch_or(summary_bit, std::memory_order_seq_cst);
+	}
+}
+
+// Readback state of the queried pages: GPU-dirty pages are either armed (a recorded download
+// publishes them at `tick`) or unarmed (their bytes still need a download).
+struct ReadbackState {
+	bool     gpu_dirty = false;
+	bool     unarmed   = false;
+	uint64_t tick      = 0; // Highest publication tick among armed pages.
+};
 
 class RegionManager final {
 public:
-	RegionManager(PageManager& page_manager, uint64_t cpu_addr)
-	    : m_page_manager(page_manager), m_cpu_addr(cpu_addr) {
+	RegionManager(PageManager& page_manager, uint64_t cpu_addr,
+	              std::atomic<uint64_t>& bda_hint_word, std::atomic<uint64_t>& bda_summary_word,
+	              std::atomic<int64_t>& armed_pages)
+	    : m_page_manager(page_manager), m_cpu_addr(cpu_addr), m_bda_hint_word(bda_hint_word),
+	      m_bda_hint_mask(uint64_t {1} << ((cpu_addr / TRACKER_REGION_SIZE) % 64u)),
+	      m_bda_summary_word(bda_summary_word),
+	      m_bda_summary_mask(uint64_t {1} << ((cpu_addr / TRACKER_REGION_SIZE / 64u) % 64u)),
+	      m_armed_pages(armed_pages) {
 		if (m_cpu_addr % TRACKER_REGION_SIZE != 0) {
 			EXIT("invalid region tracking manager construction\n");
 		}
@@ -90,86 +115,64 @@ public:
 
 	KYTY_CLASS_NO_COPY(RegionManager);
 
+	// The region split into 64 slices of this many pages (64 KiB); see CpuDirtySlices.
+	static constexpr size_t CPU_DIRTY_SLICE_PAGES = TRACKER_REGION_PAGES / 64;
+	static_assert(TRACKER_REGION_PAGES % 64 == 0 && CPU_DIRTY_SLICE_PAGES != 0);
+
+	// Lock-free: bit s is set while a page of slice s may be CPU-dirty. Every change to the
+	// CPU-dirty bits publishes this under the lock before the pages' write protection changes, so
+	// a clear bit means that nothing written there by the CPU still needs uploading. A reader
+	// that sees a clear bit just before a write is published is ordered as if it had taken the
+	// lock before that write.
+	[[nodiscard]] uint64_t CpuDirtySlices() const noexcept {
+		return m_cpu_dirty_slices.load(std::memory_order_acquire);
+	}
+
 	[[nodiscard]] uint64_t GetCpuAddr() const { return m_cpu_addr; }
+	void                   PublishBdaHint() const noexcept {
+		PublishBdaHintBits(m_bda_hint_word, m_bda_hint_mask, m_bda_summary_word,
+		                   m_bda_summary_mask);
+	}
+	// Caller holds lock. This snapshot is only a discovery hint; uploads read the live bits.
+	[[nodiscard]] const RegionBits& CpuDirtyBits() const noexcept { return m_cpu_dirty; }
 	template <DirtySource source>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
-		const auto& bits        = GetBits<source>();
-		return bits.Any(start, end);
-	}
-	template <DirtySource source>
-	[[nodiscard]] bool IsFullyModified(uint64_t offset, uint64_t size) const {
-		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
-		return GetBits<source>().All(start, end);
+		return GetBits<source>().AnyInRange(start, end);
 	}
 
-	// Caller holds lock. This is only a candidate snapshot; the upload path still rechecks and
-	// changes ownership under the lock. Already uploaded hot pages are due next generation.
-	[[nodiscard]] RegionBits UploadCandidates(uint64_t vaddr, uint64_t size) const {
-		const auto [start, end] = GetPageRange(vaddr, size);
-		RegionBits candidates(m_cpu_dirty, start, end);
-		if (m_hot_any && m_upload_generation == Generation()) {
-			candidates &= ~(m_hot & m_hot_uploaded);
-		}
-		return candidates;
-	}
-
-	// How an upload treats pages that the CPU rewrites every frame ("hot"). A hot page is left
-	// dirty and writable so it stops faulting; instead it is re-uploaded at most once per
-	// submission, and only when its contents changed. A page whose contents stop changing leaves
-	// the regime again (see CoolDownGenerations), and a GPU write ends it because GPU-dirty and
-	// CPU-dirty are mutually exclusive states.
-	enum class HotPolicy { Preserve, ClearAll, ClearAndUnhot };
-
-	// Global submission generation; advanced once per completed GPU submission.
-	static void AdvanceGeneration() noexcept {
-		s_generation.fetch_add(1, std::memory_order_relaxed);
-	}
-	[[nodiscard]] static uint64_t Generation() noexcept {
-		return s_generation.load(std::memory_order_relaxed);
-	}
-
-	// Forget hot state for pages leaving the cache or joining a new host buffer. The stored
-	// content hashes must go too: a new buffer needs every dirty page uploaded regardless.
-	// Returns whether any of the pages was hot.
-	bool ClearHot(uint64_t vaddr, uint64_t size) {
-		if (!m_hot_any && !m_hot_hash) {
-			return false;
-		}
-		const auto [start, end] = GetPageRange(vaddr, size);
-		const bool was_hot      = RegionBits(m_hot, start, end).Any();
-		m_hot.UnsetRange(start, end);
-		m_hot_uploaded.UnsetRange(start, end);
-		m_faulted_recently.UnsetRange(start, end);
-		if (m_hot_hash) {
-			std::fill(m_hot_hash->begin() + static_cast<std::ptrdiff_t>(start),
-			          m_hot_hash->begin() + static_cast<std::ptrdiff_t>(end), 0);
-		}
-		m_hot_any = m_hot.Any();
-		return was_hot;
-	}
-
-	template <DirtySource source, bool enable, bool from_fault = false>
+	template <DirtySource source, bool enable>
 	void ChangeState(uint64_t vaddr, uint64_t size) {
 		const auto [start, end] = GetPageRange(vaddr, size);
 		if constexpr (source == DirtySource::Cpu && enable) {
-			if (RegionBits(m_gpu_dirty, start, end).Any()) {
+			if (m_gpu_dirty.AnyInRange(start, end)) {
 				EXIT("CPU dirty state conflicts with GPU dirty state\n");
-			}
-			if constexpr (from_fault) {
-				NoteCpuFault(start, end);
 			}
 		}
 		if constexpr (source == DirtySource::Gpu && enable) {
-			if (RegionBits(m_cpu_dirty, start, end).Any()) {
+			if (m_cpu_dirty.AnyInRange(start, end)) {
 				EXIT("GPU dirty state conflicts with CPU dirty state\n");
 			}
 		}
 		auto& bits = GetBits<source>();
+		if constexpr (source == DirtySource::Gpu) {
+			// A new GPU write or an explicit unmark supersedes any recorded download: its
+			// publication must no longer clear these pages.
+			Disarm(start, end);
+			m_stale_readable.UnsetRange(start, end);
+		}
 		if constexpr (enable) {
 			bits.SetRange(start, end);
 		} else {
 			bits.UnsetRange(start, end);
+		}
+		if constexpr (source == DirtySource::Cpu) {
+			PublishCpuDirtySlices();
+		}
+		if constexpr (source == DirtySource::Cpu && enable) {
+			// Publish every write, even if already dirty: a selective pass may have consumed
+			// the previous hint. The caller still holds the region lock while publishing.
+			PublishBdaHint();
 		}
 		if constexpr (source == DirtySource::Cpu) {
 			UpdateProtection<!enable, false>();
@@ -179,109 +182,192 @@ public:
 	}
 
 	template <DirtySource source, bool clear, typename Func>
-	void ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func,
-	                          HotPolicy policy = HotPolicy::ClearAll) {
+	void ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func) {
 		const auto [start, end] = GetPageRange(vaddr, size);
 		auto&      bits         = GetBits<source>();
-		RegionBits mask(bits, start, end);
-		if constexpr (source == DirtySource::Cpu && clear) {
-			if (policy == HotPolicy::Preserve && m_hot_any) {
-				RefreshHotUploads();
-				const RegionBits hot_in_range(m_hot, start, end);
-				if (hot_in_range.Any()) {
-					// Hot pages already uploaded this submission drop out of the upload set; the
-					// rest stay dirty (and writable) but are recorded as uploaded.
-					mask &= ~(hot_in_range & m_hot_uploaded);
-					m_hot_uploaded |= hot_in_range;
-					// A hot page is often bound in every submission but rewritten only once per
-					// frame. Hash its contents and upload only when they actually changed.
-					const auto candidates = mask & hot_in_range;
-					if (candidates.Any()) {
-						PerfStats::Span hash_span(PerfStats::SpanId::HotPageHash);
-						const auto      generation = static_cast<uint32_t>(Generation());
-						uint64_t        hashed     = 0;
-						uint64_t        changed    = 0;
-						if (!m_hot_hash) {
-							m_hot_hash =
-							    std::make_unique<std::array<uint64_t, TRACKER_REGION_PAGES>>();
-							m_hot_hash->fill(0);
-							m_hot_changed =
-							    std::make_unique<std::array<uint32_t, TRACKER_REGION_PAGES>>();
-							m_hot_changed->fill(generation);
-						}
-						// Pages unchanged for CoolDownGenerations leave the hot set: clean and
-						// write-protected again, so their next write faults like any other. They
-						// are protected before the hash below, so a write that landed first is
-						// uploaded and a later one faults.
-						RegionBits cooled;
-						for (const auto [first, last]: candidates) {
-							for (auto page = first; page < last; page++) {
-								if (generation - (*m_hot_changed)[page] >= CoolDownGenerations) {
-									cooled.Set(page);
-								}
-							}
-						}
-						if (cooled.Any()) {
-							m_hot &= ~cooled;
-							m_hot_uploaded &= ~cooled;
-							m_hot_any = m_hot.Any();
-							m_cpu_dirty &= ~cooled;
-							UpdateProtection<true, false>();
-							PerfStats::Add(PerfStats::CounterId::HotPagesCooled, cooled.Count());
-						}
-						for (const auto [first, last]: candidates) {
-							for (auto page = first; page < last; page++) {
-								const auto hash = XXH3_64bits(
-								    reinterpret_cast<const void*>(m_cpu_addr +
-								                                  page * TRACKER_PAGE_SIZE),
-								    TRACKER_PAGE_SIZE);
-								hashed++;
-								if (hash == (*m_hot_hash)[page]) {
-									mask.Unset(page);
-								} else {
-									(*m_hot_hash)[page]    = hash;
-									(*m_hot_changed)[page] = generation;
-									changed++;
-								}
-							}
-						}
-						PerfStats::Add(PerfStats::CounterId::HotPagesHashed, hashed);
-						PerfStats::Add(PerfStats::CounterId::HotPagesChanged, changed);
-					}
-					auto to_clear = mask & ~m_hot;
-					m_cpu_dirty &= ~to_clear;
-					UpdateProtection<true, false>();
-					ForEachRange(mask, std::forward<Func>(func));
-					return;
-				}
+		if constexpr (source == DirtySource::Cpu) {
+			// Every CPU-dirty change updates the write protection, so with no dirty page in the
+			// range, clearing it and updating the protection would change nothing. Buffers are
+			// bound per draw, usually clean.
+			if (!bits.AnyInRange(start, end)) {
+				return;
 			}
-			bits.UnsetRange(start, end);
-			if (policy == HotPolicy::ClearAndUnhot && m_hot_any) {
-				m_hot.UnsetRange(start, end);
-				m_hot_uploaded.UnsetRange(start, end);
-				m_hot_any = m_hot.Any();
-			}
-			UpdateProtection<true, false>();
-			ForEachRange(mask, std::forward<Func>(func));
-			return;
 		}
+		RegionBits mask(bits, start, end);
 		if constexpr (clear) {
+			if constexpr (source == DirtySource::Gpu) {
+				Disarm(start, end);
+				m_stale_readable.UnsetRange(start, end);
+			}
 			bits.UnsetRange(start, end);
 			if constexpr (source == DirtySource::Cpu) {
+				PublishCpuDirtySlices();
 				UpdateProtection<true, false>();
 			} else {
 				UpdateProtection<false, true>();
 			}
 		}
-		ForEachRange(mask, std::forward<Func>(func));
+		for (const auto [first, last]: mask) {
+			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
+		}
+	}
+
+	// Calls func(address, bytes) for runs of GPU-dirty pages that no recorded download covers.
+	// Caller holds lock.
+	template <typename Func>
+	void ForEachUnarmedGpuRange(uint64_t vaddr, uint64_t size, Func&& func) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		RegionBits mask(m_gpu_dirty, start, end);
+		if (m_arms != nullptr) {
+			for (const auto [first, last]: RegionBits(m_arms->armed, start, end)) {
+				mask.UnsetRange(first, last);
+			}
+		}
+		for (const auto [first, last]: mask) {
+			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
+		}
+	}
+
+	// Arms the GPU-dirty, unarmed pages of the range: a download recorded with `token` publishes
+	// them at `tick`. Caller holds lock.
+	void Arm(uint64_t vaddr, uint64_t size, uint64_t token, uint64_t tick) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		if (m_arms == nullptr) {
+			m_arms = std::make_unique<Arms>();
+		}
+		int64_t armed = 0;
+		for (size_t page = start; page < end; page++) {
+			if (m_gpu_dirty.Get(page) && !m_arms->armed.Get(page)) {
+				m_arms->armed.Set(page);
+				m_arms->token[page] = token;
+				m_arms->tick[page]  = tick;
+				armed++;
+			}
+		}
+		m_armed_pages.fetch_add(armed, std::memory_order_relaxed);
+	}
+
+	// Publication of `token` finished: pages still armed by it are no longer GPU-dirty. Pages
+	// re-dirtied or re-armed since keep their state. Caller holds lock.
+	void Finalize(uint64_t vaddr, uint64_t size, uint64_t token) {
+		if (m_arms == nullptr) {
+			return;
+		}
+		const auto [start, end] = GetPageRange(vaddr, size);
+		int64_t    finalized    = 0;
+		for (size_t page = start; page < end; page++) {
+			if (m_arms->armed.Get(page) && m_arms->token[page] == token) {
+				m_arms->armed.Unset(page);
+				m_gpu_dirty.Unset(page);
+				m_stale_readable.Unset(page);
+				finalized++;
+			}
+		}
+		if (finalized != 0) {
+			m_armed_pages.fetch_sub(finalized, std::memory_order_relaxed);
+			UpdateProtection<false, true>();
+		}
+	}
+
+	// Caller holds lock.
+	void SetReadbackHot(uint64_t vaddr, uint64_t size, bool hot) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		if (hot) {
+			m_hot.SetRange(start, end);
+		} else {
+			m_hot.UnsetRange(start, end);
+		}
+	}
+
+	// Relaxed readback: lets guest threads read hot GPU-dirty pages of the range that a recorded
+	// download is already publishing, with their previous bytes, until that publication or
+	// the next GPU write to them. Returns false, granting nothing, when a GPU-dirty page of
+	// the range is not armed or not hot. Only hot pages, which guest reads keep faulting on,
+	// are opened: Thread_Gpu may read other GPU-dirty pages directly and rely on the fault.
+	// Caller holds lock.
+	[[nodiscard]] bool GrantStaleRead(uint64_t vaddr, uint64_t size) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		bool       granted      = false;
+		for (const auto [first, last]: RegionBits(m_gpu_dirty, start, end)) {
+			for (size_t page = first; page < last; page++) {
+				if (m_arms == nullptr || !m_arms->armed.Get(page) || !m_hot.Get(page)) {
+					return false;
+				}
+			}
+			granted = true;
+		}
+		if (!granted) {
+			return false;
+		}
+		for (const auto [first, last]: RegionBits(m_gpu_dirty, start, end)) {
+			for (size_t page = first; page < last; page++) {
+				m_stale_readable.Set(page);
+			}
+		}
+		UpdateProtection<false, true>();
+		return true;
+	}
+
+	// Caller holds lock.
+	void QueryReadback(uint64_t vaddr, uint64_t size, ReadbackState& state) const {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		for (const auto [first, last]: RegionBits(m_gpu_dirty, start, end)) {
+			state.gpu_dirty = true;
+			for (size_t page = first; page < last; page++) {
+				if (m_arms != nullptr && m_arms->armed.Get(page)) {
+					state.tick = std::max(state.tick, m_arms->tick[page]);
+				} else {
+					state.unarmed = true;
+				}
+			}
+		}
+	}
+
+	// Lock-free and possibly stale: whether the page holding vaddr is GPU-dirty.
+	[[nodiscard]] bool GpuDirtyHint(uint64_t vaddr) const noexcept {
+		return m_gpu_dirty.GetRelaxed((vaddr - m_cpu_addr) / TRACKER_PAGE_SIZE);
+	}
+
+	// Caller holds lock.
+	[[nodiscard]] bool HasArmed(uint64_t vaddr, uint64_t size) const {
+		if (m_arms == nullptr) {
+			return false;
+		}
+		const auto [start, end] = GetPageRange(vaddr, size);
+		return m_arms->armed.AnyInRange(start, end);
 	}
 
 	TrackingSpinLock lock;
 
 private:
+	struct Arms {
+		RegionBits                                 armed;
+		std::array<uint64_t, TRACKER_REGION_PAGES> token {};
+		std::array<uint64_t, TRACKER_REGION_PAGES> tick {};
+	};
+
+	void Disarm(size_t start, size_t end) {
+		if (m_arms == nullptr) {
+			return;
+		}
+		int64_t disarmed = 0;
+		for (const auto [first, last]: RegionBits(m_arms->armed, start, end)) {
+			disarmed += static_cast<int64_t>(last - first);
+		}
+		if (disarmed != 0) {
+			m_arms->armed.UnsetRange(start, end);
+			m_armed_pages.fetch_sub(disarmed, std::memory_order_relaxed);
+		}
+	}
+
+	// Caller holds lock, after changing the CPU-dirty bits and before changing the protection.
+	void PublishCpuDirtySlices() noexcept {
+		m_cpu_dirty_slices.store(m_cpu_dirty.SliceSummary(), std::memory_order_release);
+	}
+
 	template <bool track, bool is_read>
 	void UpdateProtection() {
-		const auto protection = is_read ? ~m_gpu_dirty : m_cpu_dirty;
+		const auto protection = is_read ? ~m_gpu_dirty | m_stale_readable : m_cpu_dirty;
 		auto&      previous   = is_read ? m_readable : m_writable;
 		auto       mask       = protection ^ previous;
 		if (mask.None()) {
@@ -319,79 +405,25 @@ private:
 		        static_cast<size_t>((offset + size + TRACKER_PAGE_SIZE - 1) / TRACKER_PAGE_SIZE)};
 	}
 
-	template <typename Func>
-	void ForEachRange(const RegionBits& bits, Func&& func) const {
-		for (const auto [first, last]: bits) {
-			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
-		}
-	}
-
-	// A page that faults twice within FaultWindow submissions is hot. The window is a coarse
-	// generation stamp: the "faulted recently" set is wiped whenever it is older than the window.
-	// Wider windows (128) turned once-per-frame rewrites hot too, but hashing those pages every
-	// submission cost more than their faults did.
-	static constexpr uint64_t FaultWindow = 16;
-	// A hot page whose contents have not changed for this many submissions cools down. GTA V kept
-	// 55-83% of its hashed hot pages unchanged this long; hashing them twice per frame cost more
-	// than the occasional fault that re-heats one.
-	static constexpr uint32_t CoolDownGenerations = 64;
-
-	void NoteCpuFault(size_t start, size_t end) {
-		if (!Config::HotPageTrackingEnabled()) {
-			return;
-		}
-		const auto generation = s_generation.load(std::memory_order_relaxed);
-		if (generation - m_fault_generation >= FaultWindow) {
-			m_faulted_recently.Clear();
-			m_fault_generation = generation;
-		}
-		const RegionBits range_recent(m_faulted_recently, start, end);
-		if (range_recent.Any()) {
-			const auto newly_hot = range_recent & ~m_hot;
-			if (newly_hot.Any()) {
-				m_hot |= newly_hot;
-				m_hot_any = true;
-				// A page turning hot starts afresh: a hash from an earlier hot period may match
-				// contents the GPU copy no longer has, and its quiet time starts now.
-				if (m_hot_hash) {
-					for (const auto [first, last]: newly_hot) {
-						std::fill(m_hot_hash->begin() + static_cast<std::ptrdiff_t>(first),
-						          m_hot_hash->begin() + static_cast<std::ptrdiff_t>(last), 0);
-						std::fill(m_hot_changed->begin() + static_cast<std::ptrdiff_t>(first),
-						          m_hot_changed->begin() + static_cast<std::ptrdiff_t>(last),
-						          static_cast<uint32_t>(generation));
-					}
-				}
-			}
-		}
-		m_faulted_recently.SetRange(start, end);
-	}
-
-	void RefreshHotUploads() {
-		const auto generation = s_generation.load(std::memory_order_relaxed);
-		if (generation != m_upload_generation) {
-			m_hot_uploaded.Clear();
-			m_upload_generation = generation;
-		}
-	}
-
-	inline static std::atomic_uint64_t s_generation {0};
-
 	PageManager& m_page_manager;
 	uint64_t     m_cpu_addr = 0;
 	RegionBits   m_cpu_dirty;
+	// See CpuDirtySlices. A new region starts fully CPU-dirty.
+	std::atomic<uint64_t> m_cpu_dirty_slices {~uint64_t {0}};
 	RegionBits   m_gpu_dirty;
 	RegionBits   m_writable;
 	RegionBits   m_readable;
+	// GPU-dirty pages guest threads may read with their previous bytes (GrantStaleRead).
+	RegionBits   m_stale_readable;
+	// Pages guest reads keep faulting on (BufferCache's hot readback pages).
 	RegionBits   m_hot;
-	RegionBits   m_hot_uploaded;
-	RegionBits   m_faulted_recently;
-	std::unique_ptr<std::array<uint64_t, TRACKER_REGION_PAGES>> m_hot_hash;
-	// Generation (low 32 bits) at which each hot page's contents last changed.
-	std::unique_ptr<std::array<uint32_t, TRACKER_REGION_PAGES>> m_hot_changed;
-	uint64_t     m_fault_generation  = 0;
-	uint64_t     m_upload_generation = 0;
-	bool         m_hot_any           = false;
+	std::atomic<uint64_t>& m_bda_hint_word;
+	uint64_t               m_bda_hint_mask;
+	std::atomic<uint64_t>& m_bda_summary_word;
+	uint64_t               m_bda_summary_mask;
+	// Allocated when a page is first armed; most regions never hold a pending readback.
+	std::unique_ptr<Arms>  m_arms;
+	std::atomic<int64_t>&  m_armed_pages;
 };
 
 } // namespace Libs::Graphics

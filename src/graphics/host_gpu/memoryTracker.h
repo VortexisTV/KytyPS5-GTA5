@@ -25,92 +25,113 @@ public:
 
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
-	// One locked pass answering "CPU-dirty somewhere and GPU-dirty nowhere", the fast-path test
-	// ObtainBuffer makes for every small read-only binding.
-	[[nodiscard]] bool IsRegionCpuModifiedAndGpuClean(uint64_t vaddr, uint64_t size) {
-		CheckNotInUploadCallback();
-		bool cpu_any = false;
-		bool gpu_any = false;
-		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-			std::scoped_lock lock(manager->lock);
-			if (manager->IsModified<DirtySource::Gpu>(offset, bytes)) {
-				gpu_any = true;
-				return true;
-			}
-			cpu_any |= manager->IsModified<DirtySource::Cpu>(offset, bytes);
-			return false;
-		});
-		return !gpu_any && cpu_any;
-	}
+	// !IsRegionGpuModified && IsRegionCpuModified, taking each region's lock once.
+	[[nodiscard]] bool IsRegionOnlyCpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
-	// Read-only candidate walk for BDA synchronization. Uncreated regions are CPU-dirty by
-	// definition. Release each region lock before invoking the callback, which may upload buffers
-	// and reenter the tracker. Changes after a snapshot are covered by the upload epoch.
-	template <typename Func>
-	void ForEachUploadCandidateRange(uint64_t vaddr, uint64_t size, Func&& func) {
+
+	// Asynchronous readback. A recorded download arms the GPU-dirty pages it copies with a unique
+	// token and its publication tick; the publication callback finalizes (un-dirties) only pages
+	// still armed with its token. Any GPU-dirty transition in between disarms the page, so a GPU
+	// write recorded after the download is never lost. Armed pages stay GPU-dirty (NoAccess)
+	// until finalized, and waiters use their tick instead of draining the GPU.
+	[[nodiscard]] ReadbackState QueryReadback(uint64_t vaddr, uint64_t size);
+	void ArmReadback(uint64_t vaddr, uint64_t size, uint64_t token, uint64_t tick);
+	void FinalizeReadback(uint64_t vaddr, uint64_t size, uint64_t token);
+	// Hot pages (guest threads keep reading them after GPU writes; see BufferCache) are the only
+	// ones GrantStaleRead opens.
+	void SetReadbackHot(uint64_t vaddr, uint64_t size, bool hot) {
 		CheckNotInUploadCallback();
-		ValidateRange(vaddr, size);
-		const auto end = vaddr + size;
-		while (vaddr < end) {
-			const auto base   = vaddr & ~(TRACKER_REGION_SIZE - 1);
-			const auto finish = std::min(end, base + TRACKER_REGION_SIZE);
-			auto* manager = m_regions[base / TRACKER_REGION_SIZE].load(std::memory_order_acquire);
-			if (manager == nullptr) {
-				func(vaddr, finish - vaddr);
-			} else {
-				const auto candidates = [&] {
-					std::scoped_lock lock(manager->lock);
-					return manager->UploadCandidates(vaddr, finish - vaddr);
-				}();
-				for (const auto [first, last]: candidates) {
-					const auto start = std::max(vaddr, base + first * TRACKER_PAGE_SIZE);
-					const auto stop  = std::min(finish, base + last * TRACKER_PAGE_SIZE);
-					func(start, stop - start);
-				}
-			}
-			vaddr = finish;
-		}
-	}
-	// Advances whenever uploading a range again could copy something the previous upload of it
-	// did not: a page turning CPU-dirty, hot-page state being reset, a new region (regions start
-	// CPU-dirty) or a new submission generation (hot pages upload once per generation). Each
-	// change is published after the state it describes, so an epoch read before an upload
-	// accounts for everything that upload can see.
-	[[nodiscard]] uint64_t UploadEpoch() const noexcept {
-		// Both counters only grow, so their sum changes whenever either does.
-		return m_upload_epoch.load(std::memory_order_acquire) + RegionManager::Generation();
-	}
-	// Drops hot-page state for a range that now belongs to a new host buffer.
-	void ClearHotPages(uint64_t vaddr, uint64_t size) {
-		Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-			std::scoped_lock lock(manager->lock);
-			manager->ClearHot(manager->GetCpuAddr() + offset, bytes);
-		});
-		// A CPU-dirty page that stops being hot uploads again.
-		AdvanceUploadEpoch();
-	}
-	// As ClearHotPages, for a range that must keep faulting on every CPU write; the upload epoch
-	// moves only when a page actually stops being hot.
-	void ClearHotPagesIfAny(uint64_t vaddr, uint64_t size) {
-		bool cleared = false;
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			std::scoped_lock lock(manager->lock);
-			cleared |= manager->ClearHot(manager->GetCpuAddr() + offset, bytes);
+			manager->SetReadbackHot(manager->GetCpuAddr() + offset, bytes, hot);
 		});
-		if (cleared) {
-			AdvanceUploadEpoch();
-		}
 	}
+	// Relaxed readback: when every GPU-dirty page of the range is armed and hot, lets guest
+	// threads read those pages with their previous bytes until the download publishes them or
+	// the GPU writes them again. Returns whether it did.
+	[[nodiscard]] bool GrantStaleRead(uint64_t vaddr, uint64_t size) {
+		CheckNotInUploadCallback();
+		bool granted = true;
+		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			std::scoped_lock lock(manager->lock);
+			granted = manager->GrantStaleRead(manager->GetCpuAddr() + offset, bytes) && granted;
+		});
+		return granted;
+	}
+	[[nodiscard]] bool HasArmedPages(uint64_t vaddr, uint64_t size);
+	// Lock-free and possibly stale: whether the tracker page holding vaddr is GPU-dirty. Only
+	// for choosing a read path whose outcome stays correct either way.
+	[[nodiscard]] bool IsPageGpuDirtyHint(uint64_t vaddr) const noexcept {
+		const auto index = vaddr / TRACKER_REGION_SIZE;
+		if (index >= REGION_COUNT) {
+			return false;
+		}
+		const auto* manager = m_regions[index].load(std::memory_order_acquire);
+		return manager != nullptr && manager->GpuDirtyHint(vaddr);
+	}
+
+	// Lock-free: true when every tracker region the range touches exists and none of the 64 KiB
+	// slices it touches holds a CPU-dirty page (see RegionManager::CpuDirtySlices). Then a locked
+	// upload pass over the range would find nothing to copy and change nothing. False when unsure.
+	[[nodiscard]] bool IsRegionCpuCleanHint(uint64_t vaddr, uint64_t size) const noexcept {
+		if (size == 0 || vaddr >= TRACKER_ADDRESS_SIZE || size > TRACKER_ADDRESS_SIZE - vaddr) {
+			return false;
+		}
+		constexpr uint64_t SLICE_SIZE = RegionManager::CPU_DIRTY_SLICE_PAGES * TRACKER_PAGE_SIZE;
+		const uint64_t     end        = vaddr + size;
+		for (uint64_t address = vaddr; address < end;) {
+			const auto  index   = address / TRACKER_REGION_SIZE;
+			const auto* manager = m_regions[index].load(std::memory_order_acquire);
+			if (manager == nullptr) {
+				return false;
+			}
+			const auto region_start = index * TRACKER_REGION_SIZE;
+			const auto region_end   = region_start + TRACKER_REGION_SIZE;
+			const auto first_slice  = (address - region_start) / SLICE_SIZE;
+			const auto last_slice   = (std::min(end, region_end) - 1 - region_start) / SLICE_SIZE;
+			const auto slices =
+			    (last_slice == 63 ? ~uint64_t {0} : (uint64_t {1} << (last_slice + 1)) - 1) &
+			    (~uint64_t {0} << first_slice);
+			if ((manager->CpuDirtySlices() & slices) != 0) {
+				return false;
+			}
+			address = region_end;
+		}
+		return true;
+	}
+
+	// One conservative hint per tracker region. CPU-dirty bits remain authoritative.
+	// Dirty transitions, region creation, buffer registration and mapping publish hints.
+	// A pass exchanges each word once before inspecting it; publications after that exchange
+	// remain pending. Unfinished regions must be restored, never cleared a second time.
+	// Summary words hold one bit per hint word, so a pass with nothing dirty reads 64 words
+	// instead of 4096. A pass exchanges a summary word before the hint words it flags.
+	static constexpr size_t      BDA_HINT_WORDS = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE / 64;
+	static constexpr size_t      BDA_SUMMARY_WORDS = BDA_HINT_WORDS / 64;
+	void                         PublishBdaHints(uint64_t vaddr, uint64_t size) noexcept;
+	[[nodiscard]] uint64_t       ConsumeBdaSummaryWord(size_t summary) noexcept;
+	void                         RestoreBdaSummary(size_t summary, uint64_t words) noexcept;
+	[[nodiscard]] uint64_t       ConsumeBdaHintWord(size_t word) noexcept;
+	void                         RestoreBdaHints(size_t word, uint64_t bits) noexcept;
+	// Pending means the next pass will find the region: both its hint and summary bits are set.
+	[[nodiscard]] bool           IsBdaHintPending(uint64_t region) const noexcept;
+	[[nodiscard]] RegionManager* FindRegion(uint64_t region) const noexcept {
+		EXIT_IF(region >= REGION_COUNT);
+		return m_regions[region].load(std::memory_order_acquire);
+	}
+	[[nodiscard]] RegionBits SnapshotCpuDirty(RegionManager& manager);
+	// Diagnostic used after a completed selective pass over mapped, registered owners.
+	[[nodiscard]] bool BdaHintsCoverCpuDirty(uint64_t vaddr, uint64_t size);
+
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
 		static_assert(std::is_invocable_v<Flush&>);
 		CheckNotInUploadCallback();
 
-		bool newly_dirty = false;
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			const bool should_flush = [&] {
 				// Perform both the GPU modification check and CPU state change with the lock in
@@ -120,19 +141,13 @@ public:
 				if (manager->IsModified<DirtySource::Gpu>(offset, bytes)) {
 					return true;
 				}
-				newly_dirty |= !manager->IsFullyModified<DirtySource::Cpu>(offset, bytes);
-				manager->ChangeState<DirtySource::Cpu, true, true>(manager->GetCpuAddr() + offset,
-				                                                   bytes);
+				manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 				return false;
 			}();
 			if (should_flush) {
 				on_flush();
 			}
 		});
-		// Re-marking pages that are already CPU-dirty gives an upload nothing new to copy.
-		if (newly_dirty) {
-			AdvanceUploadEpoch();
-		}
 	}
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	void ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
@@ -143,6 +158,17 @@ public:
 	void ValidateGpuDirtyPages(const RangeSet&, uint64_t, uint64_t, const char*) const noexcept {}
 	void ValidateGpuDirtyOwnership(const RangeSet&, uint64_t, uint64_t, const char*) {}
 #endif
+
+	// Runs of GPU-dirty pages whose bytes no recorded download covers yet.
+	template <typename Func>
+	void ForEachUnarmedDownloadRange(uint64_t vaddr, uint64_t size, Func&& func) {
+		static_assert(std::is_nothrow_invocable_v<Func&, uint64_t, uint64_t>);
+		CheckNotInUploadCallback();
+		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			std::scoped_lock lock(manager->lock);
+			manager->ForEachUnarmedGpuRange(manager->GetCpuAddr() + offset, bytes, func);
+		});
+	}
 
 	template <bool clear, typename Func>
 	void ForEachDownloadRange(uint64_t vaddr, uint64_t size, Func&& func) {
@@ -168,10 +194,8 @@ public:
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			manager->lock.lock();
-			manager->ForEachModifiedRange<DirtySource::Cpu, true>(
-			    manager->GetCpuAddr() + offset, bytes, range_func,
-			    is_written ? RegionManager::HotPolicy::ClearAndUnhot
-			               : RegionManager::HotPolicy::Preserve);
+			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
+			                                                      bytes, range_func);
 			if (!is_written) {
 				manager->lock.unlock();
 			}
@@ -230,15 +254,15 @@ private:
 
 	static void    ValidateRange(uint64_t vaddr, uint64_t size);
 	RegionManager* GetOrCreateRegion(uint64_t index);
-	void           AdvanceUploadEpoch() noexcept {
-		m_upload_epoch.fetch_add(1, std::memory_order_release);
-	}
 
-	std::atomic_uint64_t                           m_upload_epoch {0};
 	std::unique_ptr<std::atomic<RegionManager*>[]> m_regions;
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;
+	std::unique_ptr<std::atomic<uint64_t>[]>       m_bda_hints;
+	std::unique_ptr<std::atomic<uint64_t>[]>       m_bda_summary;
+	// Pages armed by recorded downloads across all regions; zero lets queries skip the walk.
+	std::atomic<int64_t>                           m_armed_pages {0};
 };
 
 } // namespace Libs::Graphics

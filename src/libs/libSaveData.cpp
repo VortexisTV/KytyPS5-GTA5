@@ -371,6 +371,40 @@ static int read_save_blocks(const std::filesystem::path& directory, uint64_t* bl
 	return OK;
 }
 
+// Older builds wrote sce_sys/param.bin as "KSDP", u32 version (1), u32 user_param, i64 mtime,
+// then title, sub_title and detail, each a u32 length followed by that many bytes.
+static constexpr uint64_t LEGACY_SAVE_PARAM_MAX_SIZE = 4096;
+
+static bool parse_legacy_save_param(const std::vector<uint8_t>& bytes, SaveDataParam* param) {
+	size_t     offset = 0;
+	const auto take   = [&](void* out, size_t size) {
+		if (size > bytes.size() - offset) {
+			return false;
+		}
+		std::memcpy(out, bytes.data() + offset, size);
+		offset += size;
+		return true;
+	};
+	char     magic[4] {};
+	uint32_t version = 0;
+	if (!take(magic, sizeof(magic)) || std::memcmp(magic, "KSDP", sizeof(magic)) != 0 ||
+	    !take(&version, sizeof(version)) || version != 1 ||
+	    !take(&param->user_param, sizeof(param->user_param)) ||
+	    !take(&param->mtime, sizeof(param->mtime))) {
+		return false;
+	}
+	for (uint32_t type = 1; type <= 3; type++) {
+		const auto field  = param_text_field(*param, type);
+		uint32_t   length = 0;
+		if (!take(&length, sizeof(length)) || length > bytes.size() - offset) {
+			return false;
+		}
+		std::memcpy(field.data, bytes.data() + offset, std::min<size_t>(length, field.size - 1));
+		offset += length;
+	}
+	return offset == bytes.size();
+}
+
 static int read_save_param(const std::filesystem::path& path, SaveDataParam* param) {
 	std::error_code error;
 	const bool exists = std::filesystem::exists(path, error);
@@ -384,16 +418,23 @@ static int read_save_param(const std::filesystem::path& path, SaveDataParam* par
 	if (file.IsInvalid()) {
 		return SAVE_DATA_ERROR_INTERNAL;
 	}
-	if (file.Size() != sizeof(*param)) {
+	const auto size = file.Size();
+	if (size == sizeof(*param)) {
+		uint32_t read = 0;
+		file.Read(param, sizeof(*param), &read);
+		return read == sizeof(*param) ? OK : SAVE_DATA_ERROR_BROKEN;
+	}
+	if (size > LEGACY_SAVE_PARAM_MAX_SIZE) {
 		return SAVE_DATA_ERROR_BROKEN;
 	}
-	SaveDataParam loaded {};
-	uint32_t      read = 0;
-	file.Read(&loaded, sizeof(loaded), &read);
-	if (read != sizeof(loaded)) {
+	std::vector<uint8_t> bytes(static_cast<size_t>(size));
+	uint32_t             read = 0;
+	file.Read(bytes.data(), static_cast<uint32_t>(bytes.size()), &read);
+	SaveDataParam legacy {};
+	if (read != bytes.size() || !parse_legacy_save_param(bytes, &legacy)) {
 		return SAVE_DATA_ERROR_BROKEN;
 	}
-	*param = loaded;
+	*param = legacy;
 	return OK;
 }
 

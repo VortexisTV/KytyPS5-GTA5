@@ -7,6 +7,8 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 
 void AllocateBindings(Program& program, uint32_t push_data_start_dword = 0);
 
+bool UsesFlattenedSrt(const Program& program);
+
 const DescriptorBinding* FindBinding(const BindingLayout& layout, DescriptorBindingKind kind);
 
 // The loop header a structured loop's latch (its continue target, a block apart from the header)

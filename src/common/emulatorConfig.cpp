@@ -3,6 +3,7 @@
 #include "common/assert.h"
 
 #include <algorithm>
+#include <atomic>
 #include <memory>
 
 namespace Config {
@@ -51,6 +52,10 @@ PresentMode GetPresentMode() {
 	return g_config->present_mode;
 }
 
+BdaSyncMode GetBdaSyncMode() {
+	return g_config->bda_sync_mode;
+}
+
 int32_t GetGpuIndex() {
 	return g_config->gpu_index;
 }
@@ -81,6 +86,10 @@ bool VulkanValidationEnabled() {
 
 bool ShaderValidationEnabled() {
 	return g_config->shader_validation_enabled;
+}
+
+bool ShaderPrecompileEnabled() {
+	return g_config->shader_precompile_enabled;
 }
 
 ShaderOptimizationType GetShaderOptimizationType() {
@@ -147,13 +156,97 @@ bool PlayGoHackEnabled() {
 	return g_config->playgo_hack_enabled;
 }
 
-bool HotPageTrackingEnabled() {
-	return g_config->hot_page_tracking;
+uint32_t GetDrainStatsInterval() {
+	return g_config->drain_stats_interval;
 }
 
-AsyncShaders GetAsyncShaders() {
-	return g_config->async_shaders;
+bool DccGpuClearEnabled() {
+	return g_config->dcc_gpu_clear_enabled;
 }
+
+bool AsyncSubmitEnabled() {
+	return g_config->async_submit_enabled;
+}
+
+bool GpuMeshIndirectEnabled() {
+	return g_config->gpu_mesh_indirect_enabled;
+}
+
+uint32_t GetGpuFramesAhead() {
+	return g_config->gpu_frames_ahead;
+}
+
+
+uint32_t GetLabelFlushIntervalUs() {
+	return g_config->label_flush_interval_us;
+}
+
+// A runtime override; 0 means the configured value.
+static std::atomic<uint32_t> g_gpu_timestamp_scale_override {0};
+
+uint32_t GetGpuTimestampScalePercent() {
+	const auto percent = g_gpu_timestamp_scale_override.load(std::memory_order_relaxed);
+	return percent != 0 ? percent : g_config->gpu_timestamp_scale_percent;
+}
+
+void SetGpuTimestampScalePercent(uint32_t percent) {
+	g_gpu_timestamp_scale_override.store(std::clamp(percent, 100u, 200u),
+	                                     std::memory_order_relaxed);
+}
+
+// A runtime override: -1 means the configured value.
+static std::atomic<int> g_pipeline_libraries_override {-1};
+
+bool PipelineLibrariesEnabled() {
+	const auto enabled = g_pipeline_libraries_override.load(std::memory_order_relaxed);
+	return enabled >= 0 ? enabled != 0 : g_config->pipeline_libraries_enabled;
+}
+
+void SetPipelineLibrariesEnabled(bool enabled) {
+	g_pipeline_libraries_override.store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
+static std::atomic<int> g_async_pipelines_override {-1};
+
+bool AsyncPipelinesEnabled() {
+	const auto enabled = g_async_pipelines_override.load(std::memory_order_relaxed);
+	return enabled >= 0 ? enabled != 0 : g_config->async_pipelines_enabled;
+}
+
+void SetAsyncPipelinesEnabled(bool enabled) {
+	g_async_pipelines_override.store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
+static std::atomic<int> g_speculative_draws_override {-1};
+
+bool SpeculativeDrawsEnabled() {
+	const auto enabled = g_speculative_draws_override.load(std::memory_order_relaxed);
+	return enabled >= 0 ? enabled != 0 : g_config->speculative_draws_enabled;
+}
+
+void SetSpeculativeDrawsEnabled(bool enabled) {
+	g_speculative_draws_override.store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
+bool RecordThreadEnabled() {
+	return g_config->record_thread_enabled;
+}
+
+bool HardwareBufferBoundsEnabled() {
+	return g_config->hardware_buffer_bounds;
+}
+
+static std::atomic<int> g_relaxed_readback_override {-1};
+
+bool RelaxedReadbackEnabled() {
+	const auto enabled = g_relaxed_readback_override.load(std::memory_order_relaxed);
+	return enabled >= 0 ? enabled != 0 : g_config->relaxed_readback_enabled;
+}
+
+void SetRelaxedReadbackEnabled(bool enabled) {
+	g_relaxed_readback_override.store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled() {

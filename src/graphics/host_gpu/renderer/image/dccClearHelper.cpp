@@ -4,7 +4,6 @@
 #include "common/assert.h"
 #include "gpu_blit_shaders/gpu_dcc_clear_fill_spv.h"
 #include "gpu_blit_shaders/gpu_dcc_clear_scan_spv.h"
-#include "graphics/host_gpu/gpuCrashDiagnostics.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -144,7 +143,6 @@ void DccClearHelper::Record(const Request& request, std::span<const vk::ImageVie
 		push.record    = slice;
 		command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
 		                      sizeof(push), &push);
-		MarkGpuCheckpoint(m_graphics, command, GpuCheckpointKind::DccClear, 0, {}, slice);
 		command.dispatch(1, 1, 1);
 	}
 
@@ -174,7 +172,6 @@ void DccClearHelper::Record(const Request& request, std::span<const vk::ImageVie
 		push.record = slice;
 		command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
 		                      sizeof(push), &push);
-		MarkGpuCheckpoint(m_graphics, command, GpuCheckpointKind::DccClear, 0, {}, slice, 1);
 		command.dispatchIndirect(m_stream.Handle(), records_offset + slice * RecordSize);
 	}
 

@@ -29,11 +29,23 @@ struct GraphicContext {
 	bool                               memory_budget_ext_enabled             = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               sample_rate_shading_enabled           = false;
+	// bool fp64_denorm_preserve = false; // Temporarily disabled.
+	// Layout support is sufficient for static pipeline feedback flags. Dynamic state is optional.
 	bool                               attachment_feedback_loop_enabled      = false;
+	bool                                      attachment_feedback_loop_dynamic_enabled = false;
 	bool                               provoking_vertex_last_enabled         = false;
+	// VK_EXT_conditional_rendering: lets GPU-written DCC clear keys be applied without readback.
+	bool                               conditional_rendering_enabled         = false;
+	// VK_EXT_graphics_pipeline_library: compile pipeline stages as libraries and link them.
+	bool                               pipeline_library_enabled              = false;
+	bool                               pipeline_library_fast_linking         = false;
+	// VK_KHR_pipeline_executable_properties, enabled only for KYTY_DEBUG_PIPELINE_STATS.
+	bool                               pipeline_executable_info_enabled      = false;
 	bool                               supports_block_texel_view              = false;
-	bool                               graphics_pipeline_library_enabled      = false;
-	bool                               graphics_pipeline_library_fast_linking = false;
+	// Storage buffer word accesses leave their range check to robustBufferAccess2, and storage
+	// buffer ranges are rounded down to whole dwords (see
+	// ShaderRecompiler::SetHardwareStorageBufferBounds).
+	bool                               hardware_storage_buffer_bounds         = false;
 	bool                               device_fault_enabled                   = false;
 	bool                               device_checkpoints_enabled             = false;
 	// VK_KHR_shader_clock shaderDeviceClock, which the loop watchdog uses to time guest loops.

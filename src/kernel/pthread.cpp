@@ -238,7 +238,8 @@ static bool KernelRealtimeToTimespec(bool precise, KernelTimespec* tp) {
 		return false;
 	}
 
-	Kernel100nsToTimespec(value - WINDOWS_UNIX_EPOCH_DELTA_100NS, tp);
+	const auto shift = Common::DebugTimeOffsetSeconds() * 10000000;
+	Kernel100nsToTimespec(value - WINDOWS_UNIX_EPOCH_DELTA_100NS + static_cast<uint64_t>(shift), tp);
 	return true;
 }
 
@@ -512,15 +513,6 @@ static void SchedulerBackoffOnce() {
 #endif
 }
 
-static bool SleepMicroSchedulerBackoff(uint64_t microseconds) {
-	if (microseconds > 1) {
-		return false;
-	}
-
-	SchedulerBackoffOnce();
-	return true;
-}
-
 static void SleepMicroWithSignalPoll(uint64_t microseconds) {
 	if (microseconds == 0) {
 		KernelDispatchPendingSignalForCurrentThread();
@@ -529,9 +521,7 @@ static void SleepMicroWithSignalPoll(uint64_t microseconds) {
 
 	while (microseconds > 0) {
 		const auto step = std::min<uint64_t>(microseconds, SIGNAL_APC_POLL_MICROS);
-		if (!SleepMicroSchedulerBackoff(step)) {
-			Common::Thread::SleepMicro(step);
-		}
+		Common::Thread::SleepMicro(step);
 		microseconds -= step;
 		KernelDispatchPendingSignalForCurrentThread();
 	}
@@ -3657,6 +3647,7 @@ int KYTY_SYSV_ABI KernelClockGetres(KernelClockid clock_id, KernelTimespec* tp) 
 }
 
 int KYTY_SYSV_ABI KernelClockGettime(KernelClockid clock_id, KernelTimespec* tp) {
+	COUNT_CALL();
 	// Called constantly by Python frame/timer code.
 
 	if (tp == nullptr) {
@@ -3688,6 +3679,7 @@ int KYTY_SYSV_ABI KernelClockGettime(KernelClockid clock_id, KernelTimespec* tp)
 }
 
 int KYTY_SYSV_ABI KernelGettimeofday(KernelTimeval* tp) {
+	COUNT_CALL();
 	// PRINT_NAME();
 
 	if (tp == nullptr) {
@@ -3703,6 +3695,7 @@ int KYTY_SYSV_ABI KernelGettimeofday(KernelTimeval* tp) {
 	ticks |= ft.dwLowDateTime;
 	ticks /= 10;
 	ticks -= 11644473600000000ULL;
+	ticks += static_cast<uint64_t>(Common::DebugTimeOffsetSeconds() * 1000000);
 	tp->tv_sec  = static_cast<int64_t>(ticks / 1000000);
 	tp->tv_usec = static_cast<int64_t>(ticks % 1000000);
 #else
@@ -3805,14 +3798,17 @@ int KYTY_SYSV_ABI KernelConvertUtcToLocaltime(int64_t utc_time, int64_t* local_t
 }
 
 uint64_t KYTY_SYSV_ABI KernelGetTscFrequency() {
+	COUNT_CALL();
 	return KernelGetTscFrequencyNative();
 }
 
 uint64_t KYTY_SYSV_ABI KernelReadTsc() {
+	COUNT_CALL();
 	return KernelReadTscNative();
 }
 
 uint64_t KYTY_SYSV_ABI KernelGetProcessTime() {
+	COUNT_CALL();
 	const auto frequency = KernelGetTscFrequencyNative();
 	if (frequency == 0) {
 		return static_cast<uint64_t>(Loader::Timer::GetTimeMs() * 1000.0);
@@ -3824,10 +3820,12 @@ uint64_t KYTY_SYSV_ABI KernelGetProcessTime() {
 }
 
 uint64_t KYTY_SYSV_ABI KernelGetProcessTimeCounter() {
+	COUNT_CALL();
 	return KernelGetElapsedTsc();
 }
 
 uint64_t KYTY_SYSV_ABI KernelGetProcessTimeCounterFrequency() {
+	COUNT_CALL();
 	return KernelGetTscFrequencyNative();
 }
 
@@ -3842,28 +3840,19 @@ void KYTY_SYSV_ABI KernelSetThreadDtors(thread_dtors_func_t dtors) {
 }
 
 int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
-	Common::Timer t;
-	t.Start();
+	COUNT_CALL();
 	SleepMicroWithSignalPoll(microseconds);
-	// double ts = t.GetTimeS();
-	// LOGF("\tactual: %g microseconds\n", ts * 1000000.0);
 	return OK;
 }
 
 unsigned int KYTY_SYSV_ABI KernelSleep(unsigned int seconds) {
-	PRINT_NAME();
-	LOGF("\tsleep: %u\n", seconds);
-	Common::Timer t;
-	t.Start();
 	SleepMicroWithSignalPoll(static_cast<uint64_t>(seconds) * 1000000ull);
-	double ts = t.GetTimeS();
-	LOGF("\tactual: %g seconds\n", ts);
 	return OK;
 }
 
 int KYTY_SYSV_ABI KernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rmtp) {
-	PRINT_NAME();
-
+	COUNT_CALL();
+	
 	if (rqtp == nullptr) {
 		return KERNEL_ERROR_EFAULT;
 	}
@@ -3880,13 +3869,7 @@ int KYTY_SYSV_ABI KernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rm
 	uint64_t nanos =
 	    static_cast<uint64_t>(rqtp->tv_sec) * 1000000000ull + static_cast<uint64_t>(rqtp->tv_nsec);
 
-	LOGF("\tnanosleep: %" PRIu64 "\n", nanos);
-
-	Common::Timer t;
-	t.Start();
 	SleepNanoWithSignalPoll(nanos);
-	double ts = t.GetTimeS();
-	LOGF("\tactual: %g nanoseconds\n", ts * 1000000000.0);
 
 	if (rmtp != nullptr) {
 		rmtp->tv_sec  = 0;

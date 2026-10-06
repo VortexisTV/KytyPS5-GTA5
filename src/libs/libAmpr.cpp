@@ -3,6 +3,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
@@ -12,9 +13,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -194,6 +200,13 @@ static int GetHostPathStat(const std::string& host_path, LibKernel::FileSystem::
 	return OK;
 }
 
+// KYTY_DEBUG_APR=1 prints each path's first resolution, file reads as DebugAprRead describes and
+// the read rate, to find reads a game keeps repeating.
+static bool AprDebugEnabled() {
+	static const bool enabled = std::getenv("KYTY_DEBUG_APR") != nullptr;
+	return enabled;
+}
+
 static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) {
 	if (guest_path == nullptr || guest_path[0] == '\0') {
 		return LibKernel::KERNEL_ERROR_EINVAL;
@@ -239,6 +252,12 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 		}
 		if (log_missing) {
 			LOGF("\tAPR resolve missing path: %s -> %s\n", guest_path, info.host_path.c_str());
+		}
+		if (AprDebugEnabled()) {
+			std::printf("apr-resolve: %s -> %s size=0x%llx result=0x%x\n", guest_path,
+			            info.host_path.c_str(), static_cast<unsigned long long>(info.file_size),
+			            static_cast<uint32_t>(info.result));
+			std::fflush(stdout);
 		}
 	} else if (info.result == OK) {
 		AprShared::RegisterHostPath(info.file_id, info.host_path, info.file_size, info.is_dir);
@@ -685,8 +704,6 @@ constexpr int      PROT_AMPR_READ                = 0x40;
 constexpr int      PROT_AMPR_WRITE               = 0x80;
 constexpr int      PROT_ACP_READ                 = 0x100;
 constexpr int      PROT_ACP_WRITE                = 0x200;
-constexpr uint64_t AMM_VA_START                  = 0x0000001000000000ull;
-constexpr uint64_t AMM_VA_SIZE                   = 0x0000001000000000ull;
 constexpr uint64_t APR_MAX_READ_LENGTH           = 0x0000000100000000ull;
 constexpr uint64_t APR_MAX_FILE_OFFSET           = 0x0000010000000000ull;
 constexpr uint64_t APR_MAX_APP_ADDRESS           = 0x0000f00000000000ull;
@@ -744,19 +761,6 @@ struct CommandBufferState {
 	uint64_t                         gather_scatter_file_offset = 0;
 };
 
-struct AmmAutoPoolRange {
-	uint64_t start = 0;
-	uint64_t size  = 0;
-	uint64_t used  = 0;
-};
-
-struct AmmVirtualAddressRanges {
-	uint64_t va_start          = 0;
-	uint64_t va_end            = 0;
-	uint64_t multimap_va_start = 0;
-	uint64_t multimap_va_end   = 0;
-};
-
 struct AmmUsageStatsData {
 	uint64_t size_in_bytes                                    = 0;
 	uint16_t num_page_table_pool_entries                      = 0;
@@ -770,8 +774,6 @@ static_assert(sizeof(AmmUsageStatsData) == 0x18);
 static std::mutex                                       g_command_buffer_mutex;
 static std::unordered_map<uint64_t, CommandBufferState> g_command_buffers;
 static std::unordered_map<uint64_t, uint64_t>           g_command_buffer_aliases;
-static std::mutex                                       g_amm_auto_pool_mutex;
-static std::vector<AmmAutoPoolRange>                    g_amm_auto_pool;
 using CommandBufferIterator = std::unordered_map<uint64_t, CommandBufferState>::iterator;
 
 static bool HasQueuedCommands(const CommandBufferState& state) {
@@ -1227,48 +1229,20 @@ static int NormalizeAmmProtection(int prot) {
 	return normalized;
 }
 
-static bool AllocateAmmAutoDirectMemory(uint64_t size, int memory_type, uint64_t* dmem_offset) {
-	if (dmem_offset == nullptr || size == 0) {
-		return false;
-	}
-
-	std::scoped_lock lock(g_amm_auto_pool_mutex);
-
-	for (auto& range: g_amm_auto_pool) {
-		const auto aligned_used = (range.used + (AMM_PAGE_SIZE - 1u)) & ~(AMM_PAGE_SIZE - 1u);
-		if (aligned_used <= range.size && size <= range.size - aligned_used) {
-			*dmem_offset = range.start + aligned_used;
-			range.used   = aligned_used + size;
-			return true;
-		}
-	}
-
-	int64_t allocated = 0;
-	if (LibKernel::Memory::KernelAllocateDirectMemory(
-	        0, LibKernel::Memory::KernelGetDirectMemorySize(), size, AMM_PAGE_SIZE, memory_type,
-	        &allocated) != OK) {
-		return false;
-	}
-
-	*dmem_offset = static_cast<uint64_t>(allocated);
-	return true;
-}
-
 static int ExecuteAmmMapCommand(const CommandBufferState::AmmMapCommand& command) {
 	if (!ValidateAmmMapArgs(command.va, command.size)) {
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
 
-	uint64_t dmem_offset = command.dmem_offset;
-	if (command.kind == AmmCommandKind::MapAuto &&
-	    !AllocateAmmAutoDirectMemory(command.size, command.type, &dmem_offset)) {
-		return LibKernel::KERNEL_ERROR_EAGAIN;
+	if (command.kind == AmmCommandKind::MapAuto) {
+		return LibKernel::Memory::MapAutomaticMemory(command.va, command.size, command.type,
+		                                             NormalizeAmmProtection(command.prot));
 	}
 
 	void* addr = reinterpret_cast<void*>(command.va);
 	return LibKernel::Memory::KernelMapDirectMemory2(
 	    &addr, command.size, command.type, NormalizeAmmProtection(command.prot), AMM_MAP_FIXED,
-	    static_cast<int64_t>(dmem_offset), AMM_PAGE_SIZE);
+	    static_cast<int64_t>(command.dmem_offset), AMM_PAGE_SIZE);
 }
 
 static bool AppendAmmMapRecord(uint64_t                                 command_buffer,
@@ -1294,6 +1268,91 @@ static bool AppendAmmMapRecord(uint64_t                                 command_
 
 static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offset,
                                uint64_t destination, uint64_t size, uint64_t* bytes_read);
+
+// With AprShared::AprDebugEnabled: each distinct file read once, and again whenever its repeat
+// count reaches a power of two, and every 5 s the read rate. A read repeated 64 and 1024 times
+// has its thread's next calls traced (and twice every thread's), with KYTY_DEBUG_CALL_COUNTS.
+static void DebugAprRead(const std::string& path, uint64_t offset, uint64_t size,
+                         uint64_t destination, uint64_t bytes_read, int result) {
+	if (!AprShared::AprDebugEnabled()) {
+		return;
+	}
+	static std::mutex                      mutex;
+	static std::map<std::string, uint64_t> counts;
+	const auto key = fmt::format("{} offset=0x{:x} size=0x{:x} dst=0x{:x} read=0x{:x} result=0x{:x}",
+	                             path, offset, size, destination, bytes_read,
+	                             static_cast<uint32_t>(result));
+	uint64_t count = 0;
+	{
+		std::scoped_lock lock(mutex);
+		count = ++counts[key];
+		// Every 5 s: the reads and bytes read in the window.
+		static uint64_t window_reads = 0;
+		static uint64_t window_bytes = 0;
+		static auto     window_start = std::chrono::steady_clock::now();
+		window_reads++;
+		window_bytes += bytes_read;
+		const auto now = std::chrono::steady_clock::now();
+		if (now - window_start >= std::chrono::seconds(5)) {
+			const double seconds = std::chrono::duration<double>(now - window_start).count();
+			std::printf("apr-rate: t=%.0fs reads/s=%.1f MB/s=%.1f\n",
+			            static_cast<double>(Loader::Timer::GetTimeMs()) / 1000.0,
+			            static_cast<double>(window_reads) / seconds,
+			            static_cast<double>(window_bytes) / seconds / 1e6);
+			std::fflush(stdout);
+			window_reads = 0;
+			window_bytes = 0;
+			window_start = now;
+		}
+	}
+	if ((count & (count - 1)) == 0) {
+		std::printf("apr-read x%llu tid=%d: %s\n", static_cast<unsigned long long>(count),
+		            Common::Thread::GetThreadIdUnique(), key.c_str());
+		std::fflush(stdout);
+	}
+	if (count == 64 || count == 1024) {
+		Libs::TraceCalls(400);
+		static std::atomic<int> windows {0};
+		if (windows.fetch_add(1) < 2) {
+			Libs::TraceAllCalls(std::chrono::milliseconds(150));
+		}
+	}
+}
+
+// Games read a large file region once and keep it, unless a texture streamer is asked to keep more
+// than it can fit and reloads the same textures in turn (Graphics::NoteStreamingThrash).
+static void NoteRepeatedRead(uint32_t file_id, uint64_t offset, uint64_t size) {
+	constexpr uint64_t MinSize = 1024 * 1024;
+	constexpr uint32_t Repeats = 4;
+	constexpr auto     Window  = std::chrono::seconds(10);
+	if (size < MinSize) {
+		return;
+	}
+	struct Read {
+		uint64_t                              key   = 0;
+		uint32_t                              count = 0;
+		std::chrono::steady_clock::time_point first;
+	};
+	static std::mutex            mutex;
+	static std::array<Read, 256> reads;
+	const uint64_t key = (static_cast<uint64_t>(file_id) * 0x9E3779B97F4A7C15ull) ^
+	                     (offset * 0xC2B2AE3D27D4EB4Full) ^ size;
+	const auto     now  = std::chrono::steady_clock::now();
+	bool           note = false;
+	{
+		std::scoped_lock lock(mutex);
+		auto&            read = reads[(key ^ (key >> 29u)) % reads.size()];
+		if (read.key != key || now - read.first > Window) {
+			read = {key, 1, now};
+		} else if (++read.count >= Repeats) {
+			read = {key, 0, now};
+			note = true;
+		}
+	}
+	if (note) {
+		Graphics::NoteStreamingThrash();
+	}
+}
 
 static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_result,
                                    uint32_t* error_offset) {
@@ -1369,6 +1428,8 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 				uint64_t bytes_read = 0;
 				auto result = ReadHostFileToGuest(host_path, command.file_offset,
 				                                  command.destination, command.size, &bytes_read);
+				DebugAprRead(host_path, command.file_offset, command.size, command.destination,
+				             bytes_read, result);
 				if (result != OK) {
 					LOGF("\tAPR submit read failed: id=0x%08" PRIx32 ", result=0x%08" PRIx32
 					     ", path=%s\n",
@@ -1377,6 +1438,7 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 					*error_offset     = static_cast<uint32_t>(command.record_offset);
 					return OK;
 				}
+				NoteRepeatedRead(command.file_id, command.file_offset, bytes_read);
 			} break;
 			case CommandKind::KernelEvent: {
 				const auto& command = state.kernel_event_commands[entry.index];
@@ -2360,25 +2422,15 @@ static int KYTY_SYSV_ABI AmmGiveDirectMemory(int64_t search_start, int64_t searc
                                              int64_t* dmem_offset) {
 	PRINT_NAME();
 
-	if (dmem_offset == nullptr || size == 0 ||
-	    (usage != AMM_USAGE_DIRECT && usage != AMM_USAGE_AUTO)) {
+	constexpr uint64_t block_size = 0x200000;
+	if (dmem_offset == nullptr || size == 0 || (size & (block_size - 1)) != 0 ||
+	    (align & (block_size - 1)) != 0 || (usage != AMM_USAGE_DIRECT && usage != AMM_USAGE_AUTO)) {
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
 
-	int64_t allocated = 0;
-	int     result = LibKernel::Memory::KernelAllocateDirectMemory(search_start, search_end, size,
-	                                                               align, 0, &allocated);
-	if (result != OK) {
-		return result;
-	}
-
-	*dmem_offset = allocated;
-	if (usage == AMM_USAGE_AUTO) {
-		std::scoped_lock lock(g_amm_auto_pool_mutex);
-		g_amm_auto_pool.push_back(AmmAutoPoolRange {static_cast<uint64_t>(allocated), size, 0});
-	}
-
-	return OK;
+	return LibKernel::Memory::AllocateDirectMemory(search_start, search_end, size,
+	                                               align != 0 ? align : block_size, 0, dmem_offset,
+	                                               usage == AMM_USAGE_AUTO);
 }
 
 static void KYTY_SYSV_ABI AmmGetVirtualAddressRanges(uint64_t* va_start, uint64_t* va_end,
@@ -2386,19 +2438,18 @@ static void KYTY_SYSV_ABI AmmGetVirtualAddressRanges(uint64_t* va_start, uint64_
                                                      uint64_t* multimap_va_end) {
 	PRINT_NAME();
 
+	constexpr auto end = LibKernel::Memory::kExtendedMemoryBase + LibKernel::Memory::kExtendedMemorySize;
 	if (va_start != nullptr) {
-		AprShared::WriteGuest(reinterpret_cast<uint64_t>(va_start), AMM_VA_START);
+		AprShared::WriteGuest(reinterpret_cast<uint64_t>(va_start), LibKernel::Memory::kExtendedMemoryBase);
 	}
 	if (va_end != nullptr) {
-		AprShared::WriteGuest(reinterpret_cast<uint64_t>(va_end), AMM_VA_START + AMM_VA_SIZE);
+		AprShared::WriteGuest(reinterpret_cast<uint64_t>(va_end), end);
 	}
 	if (multimap_va_start != nullptr) {
-		AprShared::WriteGuest(reinterpret_cast<uint64_t>(multimap_va_start),
-		                      AMM_VA_START + AMM_VA_SIZE / 2u);
+		AprShared::WriteGuest(reinterpret_cast<uint64_t>(multimap_va_start), end);
 	}
 	if (multimap_va_end != nullptr) {
-		AprShared::WriteGuest(reinterpret_cast<uint64_t>(multimap_va_end),
-		                      AMM_VA_START + AMM_VA_SIZE);
+		AprShared::WriteGuest(reinterpret_cast<uint64_t>(multimap_va_end), end);
 	}
 }
 

@@ -20,16 +20,17 @@
 #include <spirv/unified1/GLSL.std.450.h>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
-struct InputBinding : IR::StageInput {
+struct InputBinding: IR::StageInput {
 	uint32_t variable_id = 0;
 };
 
-struct OutputBinding : IR::StageOutput {
+struct OutputBinding: IR::StageOutput {
 	uint32_t variable_id        = 0;
 	uint32_t mesh_data_variable = 0;
 };
@@ -67,7 +68,9 @@ struct SpirvRequirements {
 	bool function_scratch             = false;
 	bool pixel_valid_mask             = false;
 	bool buffer_int64_atomics         = false;
+	bool shared_int64_atomics         = false;
 	bool coherent_buffers             = false;
+	bool float64                      = false;
 };
 
 SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
@@ -78,62 +81,69 @@ struct EmitterState {
 	      program(program_), input_info(input_info_),
 	      requirements(AnalyzeProgramRequirements(program_)) {}
 
-	Builder                                          builder;
-	const IR::Program&                               program;
-	ShaderStageInputInfo                             input_info;
-	std::array<uint32_t, 7>                          tess_variables {};
-	uint32_t                                         tess_inner_variable = 0;
+	Builder                 builder;
+	const IR::Program&      program;
+	ShaderStageInputInfo    input_info;
+	std::array<uint32_t, 7> tess_variables {};
+	uint32_t                tess_inner_variable = 0;
 
 	const SpirvRequirements                          requirements;
-	uint32_t                                         lane_count              = 1;
-	uint32_t                                         lane_half               = 0;
-	uint32_t                                         storage_buffer_variable = 0;
+	uint32_t                                         lane_count                  = 1;
+	uint32_t                                         lane_half                   = 0;
+	uint32_t                                         storage_buffer_variable     = 0;
 	uint32_t                                         storage_buffer_u64_variable = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
-	uint32_t                                         bda_pagetable_variable  = 0;
-	uint32_t                                         fault_buffer_variable   = 0;
-	uint32_t                                         bda_pointer_function    = 0;
-	uint32_t                                         gds_variable            = 0;
-	uint32_t                                         gds_length              = 0;
-	uint32_t                                         push_constant_variable  = 0;
+	uint32_t                                         bda_pagetable_variable       = 0;
+	uint32_t                                         fault_buffer_variable        = 0;
+	uint32_t                                         bda_pointer_function         = 0;
+	uint32_t                                         gds_variable                 = 0;
+	uint32_t                                         gds_length                   = 0;
+	uint32_t                                         push_constant_variable       = 0;
 	uint32_t                                         shader_data_storage_variable = 0;
-	uint32_t                                         flattened_srt_variable  = 0;
-	uint32_t                                         loop_watchdog_variable  = 0;
+	uint32_t                                         flattened_srt_variable       = 0;
+	uint32_t                                         loop_watchdog_variable       = 0;
 	// Per-invocation count of loop back edges evaluated, checked against the watchdog limit.
-	uint32_t                                         loop_watchdog_counter   = 0;
+	uint32_t                                         loop_watchdog_counter        = 0;
 	// Low device clock word at the invocation's first abort check, when the watchdog times loops.
-	uint32_t                                         loop_watchdog_start     = 0;
+	uint32_t                                         loop_watchdog_start          = 0;
 	// Private table describing every buffer format, for formatted loads through descriptors the
 	// GPU selects at run time.
-	uint32_t                                         buffer_format_table     = 0;
-	uint32_t                                         lds_variable            = 0;
+	uint32_t                                         buffer_format_table          = 0;
+	uint32_t                                         lds_variable                 = 0;
+	uint32_t                                         lds_u64_variable             = 0;
 	std::array<uint32_t, 2>                          scratch_variable {};
 	std::array<uint32_t, IR::ImageBindingCount>      image_variables {};
-	uint32_t                   sampler_variable                      = 0;
-	uint32_t                   main_func                             = 0;
-	uint32_t                   mesh_guest_func                       = 0;
-	uint32_t                   mesh_allocation                       = 0;
-	uint32_t                   mesh_primitive_data                   = 0;
-	uint32_t                   mesh_primitives                       = 0;
-	uint32_t                   mesh_cull                             = 0;
-	uint32_t                   entry_label                           = 0;
-	uint32_t                   current_label                         = 0;
-	const IR::Block*           current_block                         = nullptr;
-	uint32_t                   pixel_valid_mask_variable             = 0;
-	uint32_t                   subgroup_local_invocation_id_variable = 0;
-	uint32_t                   per_vertex_variable                   = 0;
-	uint32_t                   point_size_variable                   = 0;
-	uint32_t                   clip_distance_variable                = 0;
-	uint32_t                   invalid_position_clip_distance        = UINT32_MAX;
-	uint32_t                   cull_distance_variable                = 0;
-	uint32_t                   layer_variable                        = 0;
-	uint32_t                   viewport_index_variable               = 0;
-	uint32_t                   depth_variable                        = 0;
-	uint32_t                   sample_mask_variable                  = 0;
-	std::vector<InputBinding>  inputs;
-	std::vector<OutputBinding> outputs;
-	std::vector<uint32_t>      interface_variables;
-	std::unordered_map<const IR::Block*, uint32_t> labels;
+	uint32_t                                         sampler_variable          = 0;
+	uint32_t                                         main_func                 = 0;
+	uint32_t                                         mesh_guest_func           = 0;
+	uint32_t                                         mesh_allocation           = 0;
+	uint32_t                                         mesh_primitive_data       = 0;
+	uint32_t                                         mesh_primitives           = 0;
+	uint32_t                                         mesh_cull                 = 0;
+	uint32_t                                         entry_label               = 0;
+	uint32_t                                         current_label             = 0;
+	const IR::Block*                                 current_block             = nullptr;
+	uint32_t                                         pixel_valid_mask_variable = 0;
+	uint32_t                                         subgroup_local_invocation_id_variable = 0;
+	uint32_t                                         helper_invocation_variable            = 0;
+	uint32_t                                         per_vertex_variable                   = 0;
+	uint32_t                                         point_size_variable                   = 0;
+	uint32_t                                         clip_distance_variable                = 0;
+	uint32_t                                         invalid_position_clip_distance = UINT32_MAX;
+	uint32_t                                         cull_distance_variable         = 0;
+	uint32_t                                         layer_variable                 = 0;
+	uint32_t                                         viewport_index_variable        = 0;
+	uint32_t                                         depth_variable                 = 0;
+	uint32_t                                         sample_mask_variable           = 0;
+	std::vector<InputBinding>                        inputs;
+	std::vector<OutputBinding>                       outputs;
+	std::vector<uint32_t>                            interface_variables;
+	std::unordered_map<const IR::Block*, uint32_t>   labels;
+	// Long select(index == constant, ...) chains (V_MOVRELS reads) become one OpSwitch at their
+	// outermost select; their inner selects emit nothing (see EmitIndexedSelect).
+	bool                                             indexed_selects_found = false;
+	std::unordered_set<const IR::Inst*>              indexed_select_heads;
+	std::unordered_set<const IR::Inst*>              indexed_select_members;
 };
 
 uint32_t TypeVoid(EmitterState& state);
@@ -146,6 +156,7 @@ uint32_t TypeU32Pair(EmitterState& state);
 uint32_t TypeI32(EmitterState& state);
 uint32_t TypeI32Pair(EmitterState& state);
 uint32_t TypeF32(EmitterState& state);
+uint32_t TypeF64(EmitterState& state);
 uint32_t TypeU32Vector(EmitterState& state, uint32_t components);
 
 uint32_t TypeU32Composite(EmitterState& state, uint32_t components);
@@ -174,6 +185,10 @@ template <spv::Op opcode, IR::Type type, typename... Args>
 uint32_t EmitNative(EmitterState& state, Args... args) {
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(opcode, TypeId(state, type), result, args...);
+	if constexpr (type == IR::Type::F64 &&
+	              (opcode == spv::OpFMul || opcode == spv::OpFDiv || opcode == spv::OpExtInst)) {
+		state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
+	}
 	return result;
 }
 
@@ -269,12 +284,27 @@ uint32_t VertexParameterComponentCount(const InputBinding& input);
 
 uint32_t VertexParameterScalarType(EmitterState& state, VertexInputScalarKind kind);
 
-
 uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo& exp);
 
 uint32_t ConstantU32(EmitterState& state, uint32_t value);
 
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state);
+// Whether a wave32 guest program may run in a 64-lane host subgroup (vertex stages: drivers need
+// not take a required subgroup size there). Host lanes 32-63 are then a second guest wave, so
+// lane choices and ballots stay within the invocation's own 32 lanes.
+bool     WaveHalvesInHostSubgroup(const EmitterState& state);
+// The invocation's own 32-lane word of a host ballot, per WaveHalvesInHostSubgroup.
+uint32_t EmitOwnWaveHalfWord(EmitterState& state, uint32_t ballot);
+// 32 in host lanes 32-63 when WaveHalvesInHostSubgroup, else 0.
+uint32_t EmitOwnWaveHalfBase(EmitterState& state);
+// The lane that V_READLANE and V_PERMLANE(X)16 read for guest lane `lane`: the lane itself if the
+// host launched it, else the highest launched lane below it in the same guest wave. A partly
+// filled host wave has no invocations for its last lanes, which the guest still has: a shader can
+// switch them on (S_OR/S_ORN2_SAVEEXEC) and read them back, and a host shuffle from them is
+// undefined. Those lanes are outside every guest live mask, so a wave-wide OR/AND/MIN/MAX (row
+// scans with DPP row_shr, V_PERMLANEX16, V_READLANE of each row's last lane) leaves them holding
+// what the highest launched lane below holds.
+uint32_t EmitLaunchedLaneAtOrBelow(EmitterState& state, uint32_t lane);
 
 [[noreturn]] void ExitDescriptorBindingFailure(const EmitterState&       state,
                                                IR::DescriptorBindingKind kind, uint32_t resource,
@@ -377,6 +407,7 @@ Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::
 void EmitMemoryOffsets(EmitterState& state);
 
 uint32_t LdsDwordCount(const EmitterState& state);
+void EnsureLdsStorage(EmitterState& state);
 
 struct MemoryResourceAccess {
 	IR::ResourceKind      kind             = IR::ResourceKind::None;
@@ -399,6 +430,12 @@ uint32_t EmitMemoryElementIndex(EmitterState& state, const MemoryResourceAccess&
 
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                    uint32_t index);
+
+// EmitMemoryElementInBounds for a plain word load or store (not an atomic, a formatted or a
+// subword store): constant true for a storage buffer whose range the device checks (see
+// HardwareStorageBufferBounds).
+uint32_t EmitWordAccessInBounds(EmitterState& state, const MemoryResourceAccess& access,
+                                uint32_t index);
 
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                   uint32_t index);
@@ -493,6 +530,10 @@ uint32_t EmitGuestToHostAddress(ValueEmitContext& ctx, uint32_t address);
 // These templates accept local lambdas from several emitter translation units.
 template <typename Fn>
 void EmitIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
+	if (condition == ConstantBool(state, true)) {
+		fn();
+		return;
+	}
 	const auto then_label  = state.builder.AllocateId();
 	const auto merge_label = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);

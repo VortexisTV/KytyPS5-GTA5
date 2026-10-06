@@ -23,14 +23,10 @@ enum class ShaderOptimizationType { None, Size, Performance };
 
 enum class LogDirection { Silent, Console, File };
 
-// What happens when a draw needs a shader or pipeline that is not compiled yet.
-enum class AsyncShaders {
-	Off,    // build it now, with the guest waiting
-	On,     // build it on a worker thread and drop the draw until it is ready
-	WarmUp, // Off until the guest shows a frame that needed nothing new, then On
-};
 
 enum class PresentMode { Fifo, Mailbox, Immediate };
+
+enum class BdaSyncMode { Selective, Legacy, SelectiveChecked };
 
 using Keymap = std::vector<std::string>;
 
@@ -52,6 +48,7 @@ struct ConfigOptions {
 	int32_t                user_id                     = DEFAULT_USER_ID;
 	std::string            audio_input_device;
 	PresentMode            present_mode                = PresentMode::Mailbox;
+	BdaSyncMode            bda_sync_mode                   = BdaSyncMode::Selective;
 	int32_t                gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	bool                   vr_enabled                  = false;
@@ -60,6 +57,7 @@ struct ConfigOptions {
 	uint32_t               console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
+	bool                   shader_precompile_enabled       = true;
 	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::None;
 	LogDirection           shader_log_direction        = LogDirection::Silent;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
@@ -76,8 +74,19 @@ struct ConfigOptions {
 	bool                   readback_linear_images      = false;
 	bool                   tessellation_enabled        = false;
 	bool                   playgo_hack_enabled         = false;
-	bool                   hot_page_tracking           = true;
-	AsyncShaders           async_shaders               = AsyncShaders::On;
+	uint32_t               drain_stats_interval        = 0;
+	bool                   dcc_gpu_clear_enabled       = true;
+	bool                   async_submit_enabled        = true;
+	bool                   gpu_mesh_indirect_enabled   = true;
+	uint32_t               gpu_frames_ahead            = 0;
+	uint32_t               label_flush_interval_us     = 2000;
+	uint32_t               gpu_timestamp_scale_percent = 100;
+	bool                   pipeline_libraries_enabled  = true;
+	bool                   async_pipelines_enabled     = false;
+	bool                   relaxed_readback_enabled    = false;
+	bool                   speculative_draws_enabled   = true;
+	bool                   record_thread_enabled       = true;
+	bool                   hardware_buffer_bounds      = true;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -92,6 +101,7 @@ const std::string& GetUserName();
 int32_t  GetUserId();
 const std::string& GetAudioInputDevice();
 PresentMode GetPresentMode();
+BdaSyncMode        GetBdaSyncMode();
 int32_t GetGpuIndex();
 bool     FullscreenEnabled();
 bool     VrEnabled();
@@ -101,6 +111,7 @@ uint32_t GetConsoleLanguage();
 bool     VulkanValidationEnabled();
 
 bool                   ShaderValidationEnabled();
+bool                   ShaderPrecompileEnabled();
 ShaderOptimizationType GetShaderOptimizationType();
 LogDirection           GetShaderLogDirection();
 std::filesystem::path  GetShaderLogFolder();
@@ -125,8 +136,52 @@ bool RenderDocEnabled();
 bool ReadbackLinearImagesEnabled();
 bool TessellationEnabled();
 bool PlayGoHackEnabled();
-bool HotPageTrackingEnabled();
-AsyncShaders GetAsyncShaders();
+// Seconds between GPU wait reports; 0 disables the accounting.
+uint32_t GetDrainStatsInterval();
+// Apply GPU-written DCC fast clears on the GPU instead of reading the keys back.
+bool DccGpuClearEnabled();
+// Submit the GPU thread's command buffers from a dedicated queue thread.
+bool AsyncSubmitEnabled();
+// Build mesh-emulated indirect draws with GPU-written arguments on the GPU.
+bool GpuMeshIndirectEnabled();
+// Frames the game may build ahead of Thread_Gpu at sceAgcSuspendPoint; 0 waits for idle.
+uint32_t GetGpuFramesAhead();
+// Minimum time between submits made at plain RELEASE_MEM labels; 0 submits at every idle label.
+uint32_t GetLabelFlushIntervalUs();
+// Stretch time measured between guest GPU timestamps within a frame, in percent (100 = off).
+// Games that size their dynamic resolution from GPU timestamps then leave more GPU headroom.
+uint32_t GetGpuTimestampScalePercent();
+// Changes it while running; takes effect at the next timestamp.
+void     SetGpuTimestampScalePercent(uint32_t percent);
+// Build new graphics pipelines from separately compiled, cached parts (pipeline libraries) where
+// the GPU driver supports it, so a new pipeline stalls for less time.
+bool PipelineLibrariesEnabled();
+// Changes it while running; applies to pipelines created afterwards.
+void SetPipelineLibrariesEnabled(bool enabled);
+// Color draws whose graphics pipeline is still compiling may be skipped instead of waiting.
+// Depth-only passes always wait, since later draws sample their shadow maps. Needs pipeline
+// libraries. Off by default to preserve all draws while compiling new pipelines.
+bool AsyncPipelinesEnabled();
+// Changes it while running.
+void SetAsyncPipelinesEnabled(bool enabled);
+// A game thread reading memory the GPU is still writing gets the previous bytes at once instead
+// of waiting, as on hardware when the CPU reads before the GPU has written; the new bytes follow
+// with the download already under way. Off by default: a value can be a frame old.
+bool RelaxedReadbackEnabled();
+// Changes it while running.
+void SetRelaxedReadbackEnabled(bool enabled);
+// A second thread prepares draws' shader resources ahead of the GPU thread, which takes them
+// when they are still what it would prepare itself. Faster in scenes with many draws; uses one
+// more CPU core.
+bool SpeculativeDrawsEnabled();
+// Changes it while running.
+void SetSpeculativeDrawsEnabled(bool enabled);
+// The render thread queues its Vulkan commands for the submit thread, which records and submits
+// them. Faster in scenes with many draws; uses one more CPU core. Read at start.
+bool RecordThreadEnabled();
+// Storage buffer range checks are left to the device where it defines out-of-range dword
+// accesses (robustBufferAccess2), instead of being compiled into every shader. Read at start.
+bool HardwareBufferBoundsEnabled();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif

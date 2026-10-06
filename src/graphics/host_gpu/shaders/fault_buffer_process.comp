@@ -19,7 +19,8 @@ layout(std430, binding = 1) buffer output_buf32 {
 
 // The fault buffer holds two page bitmaps: pages any DMA access found uncached, then pages a DMA
 // store found uncached and dropped. A dropped store's page is reported with bit 0 set.
-const uint ACCESS_WORDS = (1u << (40u - CACHING_PAGEBITS)) / 32u;
+// Each bitmap covers the lower 2^40 bytes and the 2^39 bytes of extended memory packed after them.
+const uint ACCESS_WORDS = ((1u << (40u - CACHING_PAGEBITS)) + (1u << (39u - CACHING_PAGEBITS))) / 32u;
 
 void main() {
     const uint id = gl_GlobalInvocationID.x;

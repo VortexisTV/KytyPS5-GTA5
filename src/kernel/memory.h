@@ -24,6 +24,8 @@ struct Lifecycle {
 using callback_func_t = void (*)(uintptr_t addr, size_t size);
 
 constexpr uint32_t KERNEL_MAXIMUM_NAME_LENGTH = 32;
+constexpr uint64_t kExtendedMemoryBase       = 0x080000000000ull;
+constexpr uint64_t kExtendedMemorySize       = 512ull * 1024 * 1024 * 1024;
 
 struct VirtualQueryInfo {
 	uintptr_t start;
@@ -107,9 +109,18 @@ static_assert(sizeof(KernelMemoryPoolBlockStats) == 16,
 
 void                   RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func);
 void                   SetFlexibleMemorySize(uint64_t size);
+int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, size_t alignment,
+                         int memory_type, int64_t* phys_addr_out, bool automatic = false);
+int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
+// Reads guest memory for Thread_Gpu's own use. Bytes the GPU has not written are read without
+// faulting even when GPU writes elsewhere protect their page; GPU-written bytes still read back.
+void                   ReadGuestOnGpuThread(uint64_t vaddr, void* data, uint64_t size);
+// Copies a range within one page when ReadGuestOnGpuThread would read it as a plain copy (no
+// GPU-dirty hint on the page); false otherwise, and nothing is read.
+bool                   TryReadGuestPlainOnGpuThread(uint64_t vaddr, void* data, uint64_t size);
 // As TryReadGpuCleanBacking, but on the GPU thread bytes the GPU has written to a buffer are read
 // back first, which waits for the GPU work that writes them.
 bool                   TryReadGpuBackingWithReadback(uint64_t vaddr, void* data, uint64_t size);
