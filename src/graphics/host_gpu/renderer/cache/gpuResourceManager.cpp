@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/perfStats.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
